@@ -1,0 +1,21 @@
+# Open refactoring issues from what lands on main, so pull requests stay
+# free of "consider extracting this" noise.
+name: Refactor sweep
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  refactor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: keunwoo/hawky@v1
+        with:
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          mode: refactor
+          max-issues: 2

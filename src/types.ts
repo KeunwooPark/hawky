@@ -1,0 +1,80 @@
+export type Severity = 'low' | 'medium' | 'high' | 'critical';
+export type Effort = 'S' | 'M' | 'L';
+
+export const SEVERITY_ORDER: Record<Severity, number> = {
+  low: 0,
+  medium: 1,
+  high: 2,
+  critical: 3,
+};
+
+/** One inline comment the model wants to leave on a changed line. */
+export interface Finding {
+  path: string;
+  line: number;
+  end_line?: number | null;
+  severity: Severity;
+  confidence: number;
+  category: string;
+  title: string;
+  body: string;
+  /** Replacement source for lines [line, end_line], rendered as a GitHub suggestion block. */
+  suggestion?: string | null;
+}
+
+/** A repo-level refactoring opportunity, posted as an issue rather than a comment. */
+export interface Refactor {
+  title: string;
+  rationale: string;
+  files: string[];
+  effort: Effort;
+  body: string;
+}
+
+export interface ModelResult {
+  summary: string;
+  findings: Finding[];
+  refactors: Refactor[];
+}
+
+export interface Usage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+}
+
+export interface CompleteRequest {
+  system: string;
+  user: string;
+  /** JSON Schema the response must conform to. */
+  schema: Record<string, unknown>;
+  schemaName: string;
+  maxTokens: number;
+  /** True when `system` is byte-identical across calls and worth caching. */
+  cacheSystem: boolean;
+}
+
+export interface CompleteResponse<T> {
+  data: T;
+  usage: Usage;
+}
+
+export interface Provider {
+  readonly name: string;
+  readonly model: string;
+  complete<T>(req: CompleteRequest): Promise<CompleteResponse<T>>;
+}
+
+/** A file in the diff, reduced to what the reviewer needs. */
+export interface DiffFile {
+  path: string;
+  previousPath?: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  patch: string;
+  /** Line numbers in the head revision that a RIGHT-side review comment may anchor to. */
+  commentableLines: Set<number>;
+  /** The patch re-rendered with head line numbers so the model can anchor precisely. */
+  annotated: string;
+}

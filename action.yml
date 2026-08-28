@@ -1,0 +1,87 @@
+name: 'Hawky — LLM Pull Request Review'
+description: 'Reviews pull requests with an LLM and opens refactoring issues. Works with Anthropic and any OpenAI-compatible API.'
+author: 'keunwoo'
+branding:
+  icon: 'eye'
+  color: 'purple'
+
+inputs:
+  api-key:
+    description: 'API key for the LLM provider. Store it in a repository secret.'
+    required: true
+  provider:
+    description: 'LLM provider: "anthropic" or "openai". "openai" covers any OpenAI-compatible endpoint (Azure, OpenRouter, Together, Groq, vLLM, Ollama) via base-url. Default: anthropic.'
+    required: false
+    default: ''
+  model:
+    description: 'Model id. Default: claude-opus-5 (anthropic) or gpt-4.1 (openai).'
+    required: false
+    default: ''
+  base-url:
+    description: 'Override the API base URL. Required for OpenAI-compatible providers other than OpenAI itself.'
+    required: false
+    default: ''
+  mode:
+    description: 'What to do: "review" (inline PR feedback), "refactor" (open refactoring issues), or "both". Default: review.'
+    required: false
+    default: ''
+  github-token:
+    description: 'Token used to read the diff and write comments/issues.'
+    required: false
+    default: ${{ github.token }}
+  config-path:
+    description: 'Path to the YAML config file. Default: .github/hawky.yml'
+    required: false
+    default: '.github/hawky.yml'
+  max-comments:
+    description: 'Maximum inline comments to post in one run. Default: 15.'
+    required: false
+    default: ''
+  min-severity:
+    description: 'Drop findings below this severity: low | medium | high | critical. Default: medium.'
+    required: false
+    default: ''
+  min-confidence:
+    description: 'Drop findings below this model-reported confidence, 0-1. Default: 0.6.'
+    required: false
+    default: ''
+  exclude:
+    description: 'Newline- or comma-separated globs to skip, in addition to the built-in defaults.'
+    required: false
+    default: ''
+  include:
+    description: 'Newline- or comma-separated globs to restrict review to. Empty means all files.'
+    required: false
+    default: ''
+  guidelines:
+    description: 'Project-specific review guidelines injected into the prompt.'
+    required: false
+    default: ''
+  fail-on-severity:
+    description: 'Fail the check if a finding at or above this severity is posted: low | medium | high | critical | none. Default: none.'
+    required: false
+    default: ''
+  max-issues:
+    description: 'Maximum refactoring issues to open in one run. Default: 3.'
+    required: false
+    default: ''
+  issue-labels:
+    description: 'Comma-separated labels applied to refactoring issues. Default: hawky,refactor.'
+    required: false
+    default: ''
+  dry-run:
+    description: 'Compute everything and log it, but do not post comments or open issues.'
+    required: false
+    default: 'false'
+
+outputs:
+  findings-count:
+    description: 'Number of inline findings posted.'
+  issues-created:
+    description: 'Number of refactoring issues opened.'
+  summary:
+    description: 'The review summary text.'
+
+runs:
+  using: 'node24'
+  main: 'dist/index.js'

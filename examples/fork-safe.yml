@@ -1,0 +1,59 @@
+# Reviewing pull requests from forks without exposing secrets.
+#
+# A `pull_request` run from a fork gets a read-only token and no secrets, so it
+# cannot call the LLM or post comments. The usual workaround, `pull_request_target`,
+# runs with a write token AND your secrets while the fork's code is checked out —
+# a PR that edits a build script can read your API key.
+#
+# This pair avoids that: the first workflow never touches secrets, and the second
+# never checks out fork code.
+
+# ---------------------------------------------------------------- 1: collect.yml
+name: Collect PR
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ github.event.number }}" > pr-number.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-number
+          path: pr-number.txt
+
+# ----------------------------------------------------------------- 2: review.yml
+# name: Review
+#
+# on:
+#   workflow_run:
+#     workflows: [Collect PR]
+#     types: [completed]
+#
+# permissions:
+#   contents: read
+#   pull-requests: write
+#
+# jobs:
+#   review:
+#     if: github.event.workflow_run.conclusion == 'success'
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/download-artifact@v4
+#         with:
+#           name: pr-number
+#           run-id: ${{ github.event.workflow_run.id }}
+#           github-token: ${{ secrets.GITHUB_TOKEN }}
+#       - id: pr
+#         run: echo "number=$(cat pr-number.txt)" >> "$GITHUB_OUTPUT"
+#       - uses: keunwoo/hawky@v1
+#         env:
+#           HAWKY_PR_NUMBER: ${{ steps.pr.outputs.number }}
+#         with:
+#           api-key: ${{ secrets.ANTHROPIC_API_KEY }}

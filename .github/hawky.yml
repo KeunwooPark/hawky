@@ -1,0 +1,22 @@
+# Optional. Action inputs override anything set here; this file supplies defaults
+# so a repository can keep its review policy in version control.
+
+provider: anthropic
+model: claude-opus-5
+
+max_comments: 15
+min_severity: medium
+min_confidence: 0.6
+
+max_issues: 2
+issue_labels:
+  - hawky
+  - refactor
+
+exclude:
+  - "docs/**"
+
+guidelines: |
+  This is a GitHub Action, so a crash means a red check on someone's pull request.
+  Flag any code path that can throw without a user-facing explanation of what to fix.
+  Every GitHub API write must tolerate being retried: the action re-runs on every push.
