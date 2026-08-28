@@ -26,12 +26,35 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: keunwoo/hawky@v1
+      - uses: KeunwooPark/hawky@v1
         with:
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
 That is the whole setup. No checkout step is needed — the diff comes from the API.
+
+Two things to do first:
+
+1. **Add the API key as a secret.** In the repository you want reviewed, go to
+   Settings → Secrets and variables → Actions → New repository secret. Name it
+   `ANTHROPIC_API_KEY` (or whatever you reference in `api-key`). Organization-level
+   secrets work too, if you are rolling this out across several repositories.
+2. **Pin a version.** `@v1` tracks the latest v1.x release and is what most people want.
+   `@v1.2.3` pins exactly. `@main` is the development branch and will break you.
+
+### Permissions
+
+The job needs different permissions depending on what you asked for, and a missing one
+fails at the point of posting — after the LLM call is already paid for.
+
+| `mode` | Required `permissions` |
+| --- | --- |
+| `review` | `contents: read`, `pull-requests: write` |
+| `refactor` | `contents: read`, `issues: write` |
+| `both` | `contents: read`, `pull-requests: write`, `issues: write` |
+
+If your repository or organization sets the default workflow token to read-only, the
+`permissions:` block above is required, not optional.
 
 ## Choosing a provider
 
@@ -205,6 +228,48 @@ npm run build      # bundles src/ into dist/index.js — commit the result
 ```
 
 `dist/` is what the action executes, so it is committed and CI fails if it is out of date.
+
+### Releasing
+
+```bash
+npm run build && git add dist && git commit -m "Build" && git push
+git tag v1.0.0 && git push origin v1.0.0
+gh release create v1.0.0 --generate-notes
+```
+
+Publishing the release triggers `.github/workflows/release.yml`, which re-runs the tests,
+rebuilds the bundle to confirm `dist/` at that tag matches `src/`, and then force-moves
+the `v1` tag onto the release commit. Consumers pinned to `@v1` pick it up on their next
+run with no change on their side.
+
+Breaking changes go to `v2.0.0`, which creates a new `v2` alias and leaves everyone on
+`@v1` where they are.
+
+To list on the GitHub Marketplace, tick "Publish this Action to the GitHub Marketplace"
+when drafting the release in the web UI. That is a one-time manual step; the `name`,
+`description`, and `branding` fields in `action.yml` are what it validates against.
+
+## Troubleshooting
+
+**The workflow ran but nothing was posted.** Most often the pull request came from a fork,
+where the token is read-only and secrets are unavailable — see the fork section above. Also
+check `permissions:` against the table in Quick start.
+
+**"Resource not accessible by integration".** The job is missing `pull-requests: write` or
+`issues: write`, or the repository default token is read-only.
+
+**Comments appear in the summary instead of inline.** The model anchored to a line that is
+not part of the diff, so the finding was folded into the summary rather than dropped. This
+is expected occasionally; if it is most of them, the model is likely too small for the job.
+
+**The same comments keep reappearing on every push.** Fingerprints live in a hidden HTML
+comment on each posted comment. Deleting or editing those comments loses the record.
+
+**Nothing happens on draft pull requests.** By design in the example workflow — remove the
+`if: github.event.pull_request.draft == false` guard if you want them reviewed.
+
+**Want to see what it would do without posting?** Set `dry-run: true`. It logs the full
+review, including every inline comment, and writes nothing.
 
 ## License
 

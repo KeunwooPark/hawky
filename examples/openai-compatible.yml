@@ -13,7 +13,7 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
-      - uses: keunwoo/hawky@v1
+      - uses: KeunwooPark/hawky@v1
         with:
           provider: openai
           base-url: https://openrouter.ai/api/v1

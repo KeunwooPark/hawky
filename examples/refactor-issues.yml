@@ -14,7 +14,7 @@ jobs:
   refactor:
     runs-on: ubuntu-latest
     steps:
-      - uses: keunwoo/hawky@v1
+      - uses: KeunwooPark/hawky@v1
         with:
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           mode: refactor

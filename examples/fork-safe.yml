@@ -52,7 +52,7 @@ jobs:
 #           github-token: ${{ secrets.GITHUB_TOKEN }}
 #       - id: pr
 #         run: echo "number=$(cat pr-number.txt)" >> "$GITHUB_OUTPUT"
-#       - uses: keunwoo/hawky@v1
+#       - uses: KeunwooPark/hawky@v1
 #         env:
 #           HAWKY_PR_NUMBER: ${{ steps.pr.outputs.number }}
 #         with:

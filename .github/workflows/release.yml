@@ -1,0 +1,72 @@
+name: Release
+
+# Publishing a release tagged v1.2.3 moves the v1 tag to the same commit, so
+# consumers pinned to `keunwoo/hawky@v1` pick up the release without editing
+# their workflow. The bundle is re-verified at the tag first: dist/ is what the
+# action executes, and a release built from a stale bundle is a silently broken
+# release for every consumer at once.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to re-point the major alias at (e.g. v1.2.3)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          RAW_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          if [[ ! "$RAW_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$RAW_TAG' is not of the form vMAJOR.MINOR.PATCH."
+            exit 1
+          fi
+          echo "tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+          echo "major=${RAW_TAG%%.*}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+      - name: Verify dist/ matches src/ at this tag
+        run: |
+          npm run build
+          if [ -n "$(git status --porcelain dist/)" ]; then
+            echo "::error::dist/ at ${{ steps.tag.outputs.tag }} does not match src/."
+            echo "Run 'npm run build', commit, and cut a new release."
+            git diff --stat dist/
+            exit 1
+          fi
+
+      - name: Move the major version tag
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          MAJOR: ${{ steps.tag.outputs.major }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -f -a "$MAJOR" -m "Release $TAG"
+          git push -f origin "refs/tags/$MAJOR"
+          echo "### Released \`$TAG\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$MAJOR\` now points at \`$TAG\`. Consumers on \`@$MAJOR\` get it on their next run." >> "$GITHUB_STEP_SUMMARY"
