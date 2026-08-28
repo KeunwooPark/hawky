@@ -1,0 +1,34 @@
+# Block a pull request until the review comes back clean.
+#
+# Make this job a required status check under
+# Settings -> Branches -> Branch protection rules, and merging is blocked while
+# any high or critical finding is still reported.
+name: Review gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: KeunwooPark/hawky@v1
+        id: hawky
+        with:
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          fail-on-severity: high
+          # A diff that was only partly reviewed is not a pass.
+          fail-on-incomplete: true
+
+      # Outputs are written even when the step above fails the job.
+      - name: Verdict
+        if: always()
+        run: |
+          echo "passed=${{ steps.hawky.outputs.review-passed }}"
+          echo "highest=${{ steps.hawky.outputs.highest-severity }}"

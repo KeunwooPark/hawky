@@ -39904,6 +39904,7 @@ function loadConfig() {
         exclude,
         guidelines: pick('guidelines', 'guidelines') ?? '',
         failOnSeverity: SEVERITIES.includes(failRaw) ? failRaw : 'none',
+        failOnIncomplete: (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
         maxIssues: num('max-issues', 'max_issues', 3),
         issueLabels: (() => {
             const l = [...splitList(input('issue-labels')), ...asStringList(file.issue_labels)];
@@ -40543,12 +40544,13 @@ async function postReview(octokit, owner, repo, pull_number, commit_id, summary,
         ? new Set()
         : await existingFindingFingerprints(octokit, owner, repo, pull_number);
     const before = findings.length;
-    const kept = findings
+    const qualified = findings
         .filter((f) => byPath.has(f.path))
         .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
         .filter((f) => (f.confidence ?? 0) >= cfg.minConfidence)
+        .sort((a, b) => types_js_1.SEVERITY_ORDER[b.severity] - types_js_1.SEVERITY_ORDER[a.severity] || (b.confidence ?? 0) - (a.confidence ?? 0));
+    const kept = qualified
         .filter((f) => !alreadyPosted.has((0, fingerprint_js_1.findingFingerprint)(f.path, f.category, f.title)))
-        .sort((a, b) => types_js_1.SEVERITY_ORDER[b.severity] - types_js_1.SEVERITY_ORDER[a.severity] || (b.confidence ?? 0) - (a.confidence ?? 0))
         .slice(0, cfg.maxComments);
     const posted = [];
     const unanchored = [];
@@ -40571,9 +40573,10 @@ async function postReview(octokit, owner, repo, pull_number, commit_id, summary,
     }
     const dropped = before - posted.length - unanchored.length;
     const summaryBody = renderSummary(summary, posted, unanchored, cfg, dropped);
-    // Gate on everything that survived filtering, whether or not GitHub let us
-    // anchor it inline — an unanchored critical finding is still a critical finding.
-    const highestSeverity = kept.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
+    // Gate on everything that survived the quality filters, whether or not GitHub
+    // let us anchor it inline and whether or not an earlier run already commented
+    // on it: an unresolved critical finding is still critical on the second push.
+    const highestSeverity = qualified.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
     if (cfg.dryRun) {
         core.info('[dry-run] Would post the following review:');
         core.info(summaryBody);
@@ -41025,7 +41028,16 @@ function logUsage(total, calls) {
         `(${total.cachedInputTokens.toLocaleString()} cached), ` +
         `${total.outputTokens.toLocaleString()} output tokens.`);
 }
+/**
+ * Written before anything that can throw so a job that gates on these outputs
+ * reads a definite verdict even when the run dies early.
+ */
+function setVerdict(passed, highest) {
+    core.setOutput('review-passed', String(passed));
+    core.setOutput('highest-severity', highest ?? 'none');
+}
 async function run() {
+    setVerdict(false, null);
     const cfg = (0, config_js_1.loadConfig)();
     const octokit = (0, client_js_1.makeOctokit)(cfg.githubToken);
     const target = await (0, client_js_1.resolveTarget)(octokit);
@@ -41041,6 +41053,7 @@ async function run() {
         core.setOutput('findings-count', 0);
         core.setOutput('issues-created', 0);
         core.setOutput('summary', 'No reviewable changes.');
+        setVerdict(true, null);
         return;
     }
     const provider = (0, index_js_1.makeProvider)(cfg);
@@ -41051,6 +41064,7 @@ async function run() {
     const refactors = [];
     const summaries = [];
     const total = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+    let failedBatches = 0;
     for (const [index, batch] of batches.entries()) {
         core.startGroup(`Batch ${index + 1}/${batches.length} (${batch.map((f) => f.path).join(', ')})`);
         try {
@@ -41074,6 +41088,7 @@ async function run() {
         }
         catch (err) {
             // One failed batch should not throw away the batches that succeeded.
+            failedBatches++;
             core.warning(`Batch ${index + 1} failed: ${err.message}`);
         }
         finally {
@@ -41099,20 +41114,29 @@ async function run() {
     if (cfg.mode !== 'review') {
         issuesCreated = await (0, issues_js_1.postRefactorIssues)(octokit, target.owner, target.repo, refactors, cfg, target.pullNumber ? { number: target.pullNumber, sha: target.headSha } : undefined);
     }
+    // A run that only reviewed part of the diff cannot honestly report a pass.
+    const incomplete = failedBatches > 0 && cfg.failOnIncomplete;
+    const gated = cfg.failOnSeverity !== 'none' && highest !== null && types_js_1.SEVERITY_ORDER[highest] >= types_js_1.SEVERITY_ORDER[cfg.failOnSeverity];
     core.setOutput('findings-count', findingsPosted);
     core.setOutput('issues-created', issuesCreated);
     core.setOutput('summary', summary);
+    setVerdict(!gated && !incomplete, highest);
     await core.summary
         .addHeading('Hawky', 3)
         .addRaw(summary)
         .addList([
         `${findingsPosted} finding(s) reported`,
+        `Highest severity: ${highest ?? 'none'}`,
         `${issuesCreated} refactoring issue(s) opened`,
         `${provider.name}/${provider.model}, ${total.inputTokens + total.outputTokens} tokens`,
     ])
         .write();
-    if (cfg.failOnSeverity !== 'none' && highest && types_js_1.SEVERITY_ORDER[highest] >= types_js_1.SEVERITY_ORDER[cfg.failOnSeverity]) {
+    if (gated) {
         core.setFailed(`Found a ${highest}-severity issue and fail-on-severity is set to ${cfg.failOnSeverity}.`);
+    }
+    else if (incomplete) {
+        core.setFailed(`${failedBatches} of ${batches.length} batch(es) failed, so the diff was only partly reviewed ` +
+            'and the result cannot be trusted as a gate. Set fail-on-incomplete: false to allow partial reviews.');
     }
 }
 run().catch((err) => {

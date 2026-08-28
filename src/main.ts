@@ -25,7 +25,17 @@ function logUsage(total: Usage, calls: number): void {
   );
 }
 
+/**
+ * Written before anything that can throw so a job that gates on these outputs
+ * reads a definite verdict even when the run dies early.
+ */
+function setVerdict(passed: boolean, highest: Severity | null): void {
+  core.setOutput('review-passed', String(passed));
+  core.setOutput('highest-severity', highest ?? 'none');
+}
+
 async function run(): Promise<void> {
+  setVerdict(false, null);
   const cfg = loadConfig();
   const octokit = makeOctokit(cfg.githubToken);
   const target = await resolveTarget(octokit);
@@ -46,6 +56,7 @@ async function run(): Promise<void> {
     core.setOutput('findings-count', 0);
     core.setOutput('issues-created', 0);
     core.setOutput('summary', 'No reviewable changes.');
+    setVerdict(true, null);
     return;
   }
 
@@ -58,6 +69,7 @@ async function run(): Promise<void> {
   const refactors: Refactor[] = [];
   const summaries: string[] = [];
   const total: Usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  let failedBatches = 0;
 
   for (const [index, batch] of batches.entries()) {
     core.startGroup(`Batch ${index + 1}/${batches.length} (${batch.map((f) => f.path).join(', ')})`);
@@ -82,6 +94,7 @@ async function run(): Promise<void> {
       core.info(`${data.findings?.length ?? 0} finding(s), ${data.refactors?.length ?? 0} refactor(s).`);
     } catch (err) {
       // One failed batch should not throw away the batches that succeeded.
+      failedBatches++;
       core.warning(`Batch ${index + 1} failed: ${(err as Error).message}`);
     } finally {
       core.endGroup();
@@ -128,22 +141,34 @@ async function run(): Promise<void> {
     );
   }
 
+  // A run that only reviewed part of the diff cannot honestly report a pass.
+  const incomplete = failedBatches > 0 && cfg.failOnIncomplete;
+  const gated =
+    cfg.failOnSeverity !== 'none' && highest !== null && SEVERITY_ORDER[highest] >= SEVERITY_ORDER[cfg.failOnSeverity];
+
   core.setOutput('findings-count', findingsPosted);
   core.setOutput('issues-created', issuesCreated);
   core.setOutput('summary', summary);
+  setVerdict(!gated && !incomplete, highest);
 
   await core.summary
     .addHeading('Hawky', 3)
     .addRaw(summary)
     .addList([
       `${findingsPosted} finding(s) reported`,
+      `Highest severity: ${highest ?? 'none'}`,
       `${issuesCreated} refactoring issue(s) opened`,
       `${provider.name}/${provider.model}, ${total.inputTokens + total.outputTokens} tokens`,
     ])
     .write();
 
-  if (cfg.failOnSeverity !== 'none' && highest && SEVERITY_ORDER[highest] >= SEVERITY_ORDER[cfg.failOnSeverity]) {
+  if (gated) {
     core.setFailed(`Found a ${highest}-severity issue and fail-on-severity is set to ${cfg.failOnSeverity}.`);
+  } else if (incomplete) {
+    core.setFailed(
+      `${failedBatches} of ${batches.length} batch(es) failed, so the diff was only partly reviewed ` +
+        'and the result cannot be trusted as a gate. Set fail-on-incomplete: false to allow partial reviews.',
+    );
   }
 }
 

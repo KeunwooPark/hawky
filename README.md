@@ -146,11 +146,55 @@ Every input is optional except `api-key`.
 | `exclude` | — | Globs to skip, added to the built-in list. |
 | `guidelines` | — | Project conventions injected into the prompt. |
 | `fail-on-severity` | `none` | Fail the check at or above this severity. |
+| `fail-on-incomplete` | `false` | Fail the check if part of the diff could not be reviewed. |
 | `max-issues` | `3` | Cap on refactoring issues per run. |
 | `issue-labels` | `hawky,refactor` | Labels applied to refactoring issues. |
 | `dry-run` | `false` | Log what would be posted without posting it. |
 
-Outputs: `findings-count`, `issues-created`, `summary`.
+Outputs: `review-passed`, `highest-severity`, `findings-count`, `issues-created`, `summary`.
+
+### Blocking pull requests
+
+`fail-on-severity` turns the review into a merge gate: the step fails when any finding at
+or above that severity survives filtering, so the job goes red and a required status check
+blocks the pull request.
+
+```yaml
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: KeunwooPark/hawky@v1
+        with:
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          fail-on-severity: high
+          fail-on-incomplete: true
+```
+
+Then make it required: **Settings → Branches → Branch protection rules →
+Require status checks to pass**, and select the job (`review` above). Merging is blocked
+until a push produces a run with no finding at or above the threshold.
+
+Three details matter if you rely on this:
+
+- The gate looks at every finding that clears `min-severity` and `min-confidence`,
+  including ones an earlier run already commented on. Pushing again does not clear a
+  finding the model still reports — fixing the code does.
+- `fail-on-incomplete: true` also fails the check when an LLM call errors out and part of
+  the diff went unreviewed. Without it, a partly-reviewed diff can report a pass.
+- The step still posts its comments before failing, so authors see what to fix.
+
+To report the verdict without blocking, leave `fail-on-severity` at `none` and read the
+outputs instead. They are written even when the step fails, so pair them with `if: always()`:
+
+```yaml
+      - uses: KeunwooPark/hawky@v1
+        id: hawky
+        with:
+          api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+      - if: always() && steps.hawky.outputs.review-passed != 'true'
+        run: echo "Highest severity: ${{ steps.hawky.outputs.highest-severity }}"
+```
 
 ### Config file
 

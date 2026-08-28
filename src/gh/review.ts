@@ -18,6 +18,11 @@ export interface PostedReview {
   posted: Finding[];
   /** Findings whose anchor GitHub would reject; folded into the summary instead. */
   unanchored: Finding[];
+  /**
+   * Highest severity among findings that cleared the quality bar on this run,
+   * including ones suppressed as duplicates. This is what gating reads, so it
+   * must not depend on whether a comment happened to be new.
+   */
   highestSeverity: Severity | null;
 }
 
@@ -170,15 +175,17 @@ export async function postReview(
     : await existingFindingFingerprints(octokit, owner, repo, pull_number);
 
   const before = findings.length;
-  const kept = findings
+  const qualified = findings
     .filter((f) => byPath.has(f.path))
     .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
     .filter((f) => (f.confidence ?? 0) >= cfg.minConfidence)
-    .filter((f) => !alreadyPosted.has(findingFingerprint(f.path, f.category, f.title)))
     .sort(
       (a, b) =>
         SEVERITY_ORDER[b.severity] - SEVERITY_ORDER[a.severity] || (b.confidence ?? 0) - (a.confidence ?? 0),
-    )
+    );
+
+  const kept = qualified
+    .filter((f) => !alreadyPosted.has(findingFingerprint(f.path, f.category, f.title)))
     .slice(0, cfg.maxComments);
 
   const posted: Finding[] = [];
@@ -205,9 +212,10 @@ export async function postReview(
   const dropped = before - posted.length - unanchored.length;
   const summaryBody = renderSummary(summary, posted, unanchored, cfg, dropped);
 
-  // Gate on everything that survived filtering, whether or not GitHub let us
-  // anchor it inline — an unanchored critical finding is still a critical finding.
-  const highestSeverity = kept.reduce<Severity | null>(
+  // Gate on everything that survived the quality filters, whether or not GitHub
+  // let us anchor it inline and whether or not an earlier run already commented
+  // on it: an unresolved critical finding is still critical on the second push.
+  const highestSeverity = qualified.reduce<Severity | null>(
     (acc, f) => (acc === null || SEVERITY_ORDER[f.severity] > SEVERITY_ORDER[acc] ? f.severity : acc),
     null,
   );

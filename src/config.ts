@@ -21,6 +21,8 @@ export interface Config {
   exclude: string[];
   guidelines: string;
   failOnSeverity: Severity | 'none';
+  /** Fail the check when some of the diff could not be reviewed at all. */
+  failOnIncomplete: boolean;
   maxIssues: number;
   issueLabels: string[];
   dryRun: boolean;
@@ -161,6 +163,8 @@ export function loadConfig(): Config {
     exclude,
     guidelines: pick('guidelines', 'guidelines') ?? '',
     failOnSeverity: (SEVERITIES as string[]).includes(failRaw) ? (failRaw as Severity) : 'none',
+    failOnIncomplete:
+      (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
     maxIssues: num('max-issues', 'max_issues', 3),
     issueLabels: (() => {
       const l = [...splitList(input('issue-labels')), ...asStringList(file.issue_labels)];

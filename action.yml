@@ -58,7 +58,11 @@ inputs:
     required: false
     default: ''
   fail-on-severity:
-    description: 'Fail the check if a finding at or above this severity is posted: low | medium | high | critical | none. Default: none.'
+    description: 'Fail the check if a finding at or above this severity is found: low | medium | high | critical | none. Default: none. Set this to block pull requests via a required status check.'
+    required: false
+    default: ''
+  fail-on-incomplete:
+    description: 'Fail the check if part of the diff could not be reviewed (an LLM call errored out). Recommended when using fail-on-severity as a merge gate. Default: false.'
     required: false
     default: ''
   max-issues:
@@ -75,6 +79,10 @@ inputs:
     default: 'false'
 
 outputs:
+  review-passed:
+    description: '"true" when nothing crossed the fail-on-severity threshold, "false" otherwise. Set even when the run fails, so a later step can read it with `if: always()`.'
+  highest-severity:
+    description: 'Highest severity found on this run: low | medium | high | critical | none.'
   findings-count:
     description: 'Number of inline findings posted.'
   issues-created:
