@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 import * as core from '@actions/core';
 import type { CompleteRequest, CompleteResponse, Provider } from '../types.js';
 import { parseJsonObject, schemaInstruction } from './json.js';
+import { assertMatchesSchema, SchemaViolationError } from './validate.js';
 
 type Variant = 'json_schema' | 'json_object' | 'plain';
 
@@ -37,11 +38,31 @@ export class OpenAIProvider implements Provider {
       try {
         return await this.attempt<T>(req);
       } catch (err) {
-        const next = this.degrade(err);
+        const next = err instanceof SchemaViolationError ? this.degradeAfterViolation(err) : this.degrade(err);
         if (!next) throw err;
         core.warning(next);
       }
     }
+  }
+
+  /**
+   * The server accepted a request carrying the schema and then answered with
+   * something that does not satisfy it, so it is not enforcing the schema at
+   * all. Step down exactly as if it had rejected the request, which at least
+   * puts the schema somewhere the model itself can read it.
+   */
+  private degradeAfterViolation(err: SchemaViolationError): string | null {
+    const why = `${err.violations[0]}${err.violations.length > 1 ? ` (+${err.violations.length - 1} more)` : ''}`;
+    if (this.variant === 'json_schema') {
+      this.variant = 'json_object';
+      return `${this.model} accepted a json_schema request but did not honour it: ${why}. Retrying with JSON mode and the schema in the prompt.`;
+    }
+    if (this.variant === 'json_object') {
+      this.variant = 'plain';
+      return `${this.model} returned JSON that does not match the schema: ${why}. Retrying with a prompted JSON instruction.`;
+    }
+    // Out of variants to try: fail the batch with a message naming the field.
+    return null;
   }
 
   /** Returns a log line when it changed something to retry, or null to give up. */
@@ -103,8 +124,10 @@ export class OpenAIProvider implements Provider {
     }
 
     const text = choice?.message.content ?? '';
+    const data = parseJsonObject<T>(text);
+    assertMatchesSchema(data, req.schema);
     return {
-      data: parseJsonObject<T>(text),
+      data,
       usage: {
         inputTokens: res.usage?.prompt_tokens ?? 0,
         outputTokens: res.usage?.completion_tokens ?? 0,

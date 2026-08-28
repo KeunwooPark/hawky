@@ -40660,6 +40660,7 @@ exports.AnthropicProvider = void 0;
 const sdk_1 = __importDefault(__nccwpck_require__(121));
 const core = __importStar(__nccwpck_require__(7484));
 const json_js_1 = __nccwpck_require__(9585);
+const validate_js_1 = __nccwpck_require__(1769);
 function isBadRequestAbout(err, needle) {
     return (err instanceof sdk_1.default.APIError &&
         err.status === 400 &&
@@ -40699,6 +40700,14 @@ class AnthropicProvider {
                     this.supportsSchema = false;
                     continue;
                 }
+                // The endpoint took the schema and then ignored it, so stop relying on
+                // it and put the schema in the prompt instead.
+                if (this.supportsSchema && err instanceof validate_js_1.SchemaViolationError) {
+                    core.warning(`${this.model} accepted a structured-output request but did not honour it: ${err.violations[0]}. ` +
+                        'Falling back to prompted JSON.');
+                    this.supportsSchema = false;
+                    continue;
+                }
                 throw err;
             }
         }
@@ -40734,9 +40743,11 @@ class AnthropicProvider {
             .filter((b) => b.type === 'text')
             .map((b) => b.text)
             .join('');
+        const data = (0, json_js_1.parseJsonObject)(text);
+        (0, validate_js_1.assertMatchesSchema)(data, req.schema);
         const usage = res.usage;
         return {
-            data: (0, json_js_1.parseJsonObject)(text),
+            data,
             usage: {
                 inputTokens: usage.input_tokens ?? 0,
                 outputTokens: usage.output_tokens ?? 0,
@@ -40867,6 +40878,7 @@ exports.OpenAIProvider = void 0;
 const openai_1 = __importDefault(__nccwpck_require__(2583));
 const core = __importStar(__nccwpck_require__(7484));
 const json_js_1 = __nccwpck_require__(9585);
+const validate_js_1 = __nccwpck_require__(1769);
 /**
  * "OpenAI-compatible" covers a wide range of servers — Azure, OpenRouter,
  * Together, Groq, vLLM, llama.cpp, Ollama — and they implement different subsets
@@ -40896,12 +40908,31 @@ class OpenAIProvider {
                 return await this.attempt(req);
             }
             catch (err) {
-                const next = this.degrade(err);
+                const next = err instanceof validate_js_1.SchemaViolationError ? this.degradeAfterViolation(err) : this.degrade(err);
                 if (!next)
                     throw err;
                 core.warning(next);
             }
         }
+    }
+    /**
+     * The server accepted a request carrying the schema and then answered with
+     * something that does not satisfy it, so it is not enforcing the schema at
+     * all. Step down exactly as if it had rejected the request, which at least
+     * puts the schema somewhere the model itself can read it.
+     */
+    degradeAfterViolation(err) {
+        const why = `${err.violations[0]}${err.violations.length > 1 ? ` (+${err.violations.length - 1} more)` : ''}`;
+        if (this.variant === 'json_schema') {
+            this.variant = 'json_object';
+            return `${this.model} accepted a json_schema request but did not honour it: ${why}. Retrying with JSON mode and the schema in the prompt.`;
+        }
+        if (this.variant === 'json_object') {
+            this.variant = 'plain';
+            return `${this.model} returned JSON that does not match the schema: ${why}. Retrying with a prompted JSON instruction.`;
+        }
+        // Out of variants to try: fail the batch with a message naming the field.
+        return null;
     }
     /** Returns a log line when it changed something to retry, or null to give up. */
     degrade(err) {
@@ -40952,8 +40983,10 @@ class OpenAIProvider {
             throw new Error(`The model refused to review this diff: ${choice.message.refusal}`);
         }
         const text = choice?.message.content ?? '';
+        const data = (0, json_js_1.parseJsonObject)(text);
+        (0, validate_js_1.assertMatchesSchema)(data, req.schema);
         return {
-            data: (0, json_js_1.parseJsonObject)(text),
+            data,
             usage: {
                 inputTokens: res.usage?.prompt_tokens ?? 0,
                 outputTokens: res.usage?.completion_tokens ?? 0,
@@ -40963,6 +40996,99 @@ class OpenAIProvider {
     }
 }
 exports.OpenAIProvider = OpenAIProvider;
+
+
+/***/ }),
+
+/***/ 1769:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * A small validator for the subset of JSON Schema this action actually sends.
+ *
+ * The endpoint is asked to enforce the schema, but "OpenAI-compatible" servers
+ * differ in whether they honour strict mode, forward it to the backend, or
+ * quietly ignore it — and a response that omits a required field is accepted,
+ * parsed, and only fails much later, far from its cause. So the client checks
+ * the response itself rather than trusting the server did.
+ *
+ * Covers `type` (including nullable unions), `required`, `properties`, `items`
+ * and `enum`. `additionalProperties` is deliberately not enforced: unexpected
+ * keys are ignored downstream and harmless, and rejecting them would fail runs
+ * over a model quirk that costs nothing.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.SchemaViolationError = void 0;
+exports.schemaViolations = schemaViolations;
+exports.assertMatchesSchema = assertMatchesSchema;
+/** Thrown when a parsed response does not match the schema the request declared. */
+class SchemaViolationError extends Error {
+    violations;
+    constructor(violations) {
+        super(`Response did not match the requested schema: ${violations.join('; ')}`);
+        this.violations = violations;
+        this.name = 'SchemaViolationError';
+    }
+}
+exports.SchemaViolationError = SchemaViolationError;
+function typeOf(value) {
+    if (value === null)
+        return 'null';
+    if (Array.isArray(value))
+        return 'array';
+    if (Number.isInteger(value))
+        return 'integer';
+    return typeof value;
+}
+function matchesType(value, type) {
+    const actual = typeOf(value);
+    if (type === 'number')
+        return actual === 'number' || actual === 'integer';
+    return actual === type;
+}
+function check(value, schema, path, out) {
+    const declared = schema.type;
+    if (typeof declared === 'string' || Array.isArray(declared)) {
+        const types = (Array.isArray(declared) ? declared : [declared]);
+        if (!types.some((t) => matchesType(value, t))) {
+            out.push(`${path} should be ${types.join(' or ')}, got ${typeOf(value)}`);
+            return; // Nothing below can be meaningful once the type is wrong.
+        }
+    }
+    const values = schema.enum;
+    if (Array.isArray(values) && !values.includes(value)) {
+        out.push(`${path} should be one of ${values.join(', ')}, got ${JSON.stringify(value)}`);
+    }
+    if (typeOf(value) === 'object') {
+        const object = value;
+        const properties = (schema.properties ?? {});
+        for (const key of (schema.required ?? [])) {
+            if (!(key in object))
+                out.push(`${path}.${key} is missing`);
+        }
+        for (const [key, sub] of Object.entries(properties)) {
+            if (key in object)
+                check(object[key], sub, `${path}.${key}`, out);
+        }
+    }
+    else if (Array.isArray(value) && schema.items) {
+        value.forEach((item, i) => check(item, schema.items, `${path}[${i}]`, out));
+    }
+}
+/** Returns every way `data` violates `schema`, most-specific first, or an empty list. */
+function schemaViolations(data, schema) {
+    const out = [];
+    check(data, schema, 'response', out);
+    return out;
+}
+/** Throws `SchemaViolationError` when `data` does not conform to `schema`. */
+function assertMatchesSchema(data, schema) {
+    const violations = schemaViolations(data, schema);
+    if (violations.length)
+        throw new SchemaViolationError(violations);
+}
 
 
 /***/ }),

@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import * as core from '@actions/core';
 import type { CompleteRequest, CompleteResponse, Provider } from '../types.js';
 import { parseJsonObject, schemaInstruction } from './json.js';
+import { assertMatchesSchema, SchemaViolationError } from './validate.js';
 
 function isBadRequestAbout(err: unknown, needle: string): boolean {
   return (
@@ -45,6 +46,16 @@ export class AnthropicProvider implements Provider {
         }
         if (this.supportsSchema && (isBadRequestAbout(err, 'output_config') || isBadRequestAbout(err, 'json_schema'))) {
           core.warning(`${this.model} rejected structured outputs; falling back to prompted JSON.`);
+          this.supportsSchema = false;
+          continue;
+        }
+        // The endpoint took the schema and then ignored it, so stop relying on
+        // it and put the schema in the prompt instead.
+        if (this.supportsSchema && err instanceof SchemaViolationError) {
+          core.warning(
+            `${this.model} accepted a structured-output request but did not honour it: ${err.violations[0]}. ` +
+              'Falling back to prompted JSON.',
+          );
           this.supportsSchema = false;
           continue;
         }
@@ -93,9 +104,12 @@ export class AnthropicProvider implements Provider {
       .map((b) => b.text)
       .join('');
 
+    const data = parseJsonObject<T>(text);
+    assertMatchesSchema(data, req.schema);
+
     const usage = res.usage as Anthropic.Usage & { cache_read_input_tokens?: number | null };
     return {
-      data: parseJsonObject<T>(text),
+      data,
       usage: {
         inputTokens: usage.input_tokens ?? 0,
         outputTokens: usage.output_tokens ?? 0,

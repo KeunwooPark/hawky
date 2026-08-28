@@ -82,6 +82,11 @@ structured output and steps down to JSON mode, then to a prompted JSON instructi
 based on what the server rejects. You do not have to declare your endpoint's
 capabilities; it works them out on the first call and remembers them for the run.
 
+Enforcement quality varies too, so the response is checked against the schema on the
+client rather than assumed to have been enforced. An endpoint that accepts a schema and
+then answers with something that does not match it steps down the same way a rejection
+does, and the log names the offending field.
+
 ## Modes
 
 `mode` decides what the action does; **you** decide when it runs, from your workflow's
@@ -255,7 +260,8 @@ sent.
 2. Filter out excluded, binary, and deleted files.
 3. Re-render each hunk with head-revision line numbers in the gutter, so the model
    anchors to real, addressable lines.
-4. Pack files into batches and send each with a JSON schema the response must satisfy.
+4. Pack files into batches and send each with a JSON schema the response must satisfy,
+   then check the response against that schema before using it.
 5. Validate every anchor against the lines actually present in the diff. GitHub rejects an
    entire review with a 422 if one comment points outside the diff, so findings that
    cannot be anchored are folded into the summary rather than dropped.
