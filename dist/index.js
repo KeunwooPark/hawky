@@ -41017,10 +41017,10 @@ const diff_js_1 = __nccwpck_require__(164);
 const review_js_1 = __nccwpck_require__(3199);
 const issues_js_1 = __nccwpck_require__(8859);
 const MAX_RESPONSE_TOKENS = 16_000;
-function mergeSummaries(summaries) {
+function mergeSummaries(summaries, fallback) {
     const clean = summaries.map((s) => s.trim()).filter(Boolean);
     if (clean.length <= 1)
-        return clean[0] ?? 'No reviewable changes found.';
+        return clean[0] ?? fallback;
     return clean.map((s) => `- ${s}`).join('\n');
 }
 function logUsage(total, calls) {
@@ -41096,10 +41096,14 @@ async function run() {
         }
     }
     logUsage(total, batches.length);
-    if (!summaries.length && !findings.length && !refactors.length) {
-        throw new Error('Every batch failed. See the warnings above for the underlying error.');
+    // Counted, not inferred from empty output: a clean diff legitimately produces
+    // no findings and no refactors, and that is a pass, not a failure.
+    if (failedBatches === batches.length) {
+        throw new Error(`Every batch failed (${failedBatches} of ${batches.length}). See the warnings above for the underlying error.`);
     }
-    const summary = mergeSummaries(summaries);
+    const summary = mergeSummaries(summaries, findings.length || refactors.length
+        ? 'The model returned no summary; see the individual findings below.'
+        : 'No defects found in the reviewed diff.');
     let findingsPosted = 0;
     let issuesCreated = 0;
     let highest = null;

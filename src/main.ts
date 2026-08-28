@@ -11,9 +11,9 @@ import { postRefactorIssues } from './gh/issues.js';
 
 const MAX_RESPONSE_TOKENS = 16_000;
 
-function mergeSummaries(summaries: string[]): string {
+function mergeSummaries(summaries: string[], fallback: string): string {
   const clean = summaries.map((s) => s.trim()).filter(Boolean);
-  if (clean.length <= 1) return clean[0] ?? 'No reviewable changes found.';
+  if (clean.length <= 1) return clean[0] ?? fallback;
   return clean.map((s) => `- ${s}`).join('\n');
 }
 
@@ -103,11 +103,20 @@ async function run(): Promise<void> {
 
   logUsage(total, batches.length);
 
-  if (!summaries.length && !findings.length && !refactors.length) {
-    throw new Error('Every batch failed. See the warnings above for the underlying error.');
+  // Counted, not inferred from empty output: a clean diff legitimately produces
+  // no findings and no refactors, and that is a pass, not a failure.
+  if (failedBatches === batches.length) {
+    throw new Error(
+      `Every batch failed (${failedBatches} of ${batches.length}). See the warnings above for the underlying error.`,
+    );
   }
 
-  const summary = mergeSummaries(summaries);
+  const summary = mergeSummaries(
+    summaries,
+    findings.length || refactors.length
+      ? 'The model returned no summary; see the individual findings below.'
+      : 'No defects found in the reviewed diff.',
+  );
   let findingsPosted = 0;
   let issuesCreated = 0;
   let highest: Severity | null = null;
