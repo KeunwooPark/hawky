@@ -21,6 +21,14 @@ inputs:
     description: 'Override the API base URL. Required for OpenAI-compatible providers other than OpenAI itself.'
     required: false
     default: ''
+  reasoning:
+    description: 'How much the model should think before answering: none | minimal | low | medium | high. Default: the endpoint default. Reasoning tokens are billed against the same output cap as the answer, so set "none" if replies are being truncated.'
+    required: false
+    default: ''
+  max-response-tokens:
+    description: 'Starting output budget for one LLM call, reasoning included. Doubles automatically (up to 3 times) when a reply is truncated. Default: 16000.'
+    required: false
+    default: ''
   mode:
     description: 'What to do: "review" (inline PR feedback), "refactor" (open refactoring issues), or "both". Default: review.'
     required: false

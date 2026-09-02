@@ -1,33 +1,75 @@
 import OpenAI from 'openai';
 import * as core from '@actions/core';
+import type { Config } from '../config.js';
 import type { CompleteRequest, CompleteResponse, Provider } from '../types.js';
-import { parseJsonObject, schemaInstruction } from './json.js';
+import { containsReasoning, parseJsonObject, schemaInstruction, stripReasoning } from './json.js';
+import {
+  CHARS_PER_TOKEN,
+  isBudgetOutOfRange,
+  OutputBudget,
+  type ReasoningEvidence,
+  TruncatedError,
+} from './budget.js';
 import { assertMatchesSchema, SchemaViolationError } from './validate.js';
 
 type Variant = 'json_schema' | 'json_object' | 'plain';
 
 /**
+ * Reasoning models return two things in one response: the chain of thought and
+ * the answer. Both are billed against the same output cap, and depending on the
+ * server the thinking arrives either in a `reasoning_content` field or inline in
+ * `content` wrapped in `<think>` tags. Either way it is not the answer, so it is
+ * dropped before parsing — and when it is what ate the cap, asking for less code
+ * per batch cannot help, because the thinking scales with the question, not the
+ * answer.
+ */
+export function readMessage(message: Record<string, unknown> | undefined): {
+  content: string;
+  reasoning: string;
+  hasAnswer: boolean;
+} {
+  const content = typeof message?.content === 'string' ? message.content : '';
+  // Servers disagree on the field name; OpenRouter uses `reasoning`, most
+  // vLLM/SGLang-derived ones (Fireworks, Together, DeepSeek) use `reasoning_content`.
+  const separate = [message?.reasoning_content, message?.reasoning].find((v) => typeof v === 'string' && v.trim());
+  return {
+    content,
+    reasoning: (separate as string | undefined) ?? (containsReasoning(content) ? content : ''),
+    // Whether anything is left once the thinking is taken out. The parser does
+    // its own stripping; this only decides which error the user gets to read.
+    hasAnswer: stripReasoning(content).trim().length > 0,
+  };
+}
+
+/**
  * "OpenAI-compatible" covers a wide range of servers — Azure, OpenRouter,
- * Together, Groq, vLLM, llama.cpp, Ollama — and they implement different subsets
- * of the API. Rather than making the user declare what their endpoint supports,
- * we start with the strictest request and step down one capability at a time
- * whenever the server answers 4xx. The working combination is remembered for the
- * rest of the run.
+ * Together, Fireworks, Groq, vLLM, llama.cpp, Ollama — and they implement
+ * different subsets of the API. Rather than making the user declare what their
+ * endpoint supports, we start with the strictest request and step down one
+ * capability at a time whenever the server answers 4xx. The working combination
+ * is remembered for the rest of the run.
  */
 export class OpenAIProvider implements Provider {
   readonly name = 'openai';
+  readonly model: string;
   private readonly client: OpenAI;
+  private readonly requestOptions: Record<string, unknown>;
+  private readonly budget: OutputBudget;
   private variant: Variant = 'json_schema';
   private useLegacyMaxTokens = false;
+  /** null once the endpoint rejects the parameter, or when the user picked `auto`. */
+  private reasoningEffort: string | null;
+  /** Set after a truncated reply made us turn thinking off, so we only try once. */
+  private forcedReasoningOff = false;
 
-  constructor(
-    readonly model: string,
-    apiKey: string,
-    baseUrl?: string,
-  ) {
+  constructor(cfg: Config) {
+    this.model = cfg.model;
+    this.requestOptions = cfg.requestOptions;
+    this.budget = new OutputBudget(cfg.maxResponseTokens);
+    this.reasoningEffort = cfg.reasoning === 'auto' ? null : cfg.reasoning;
     this.client = new OpenAI({
-      apiKey,
-      ...(baseUrl ? { baseURL: baseUrl } : {}),
+      apiKey: cfg.apiKey,
+      ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}),
       maxRetries: 4,
       timeout: 10 * 60 * 1000,
     });
@@ -38,11 +80,84 @@ export class OpenAIProvider implements Provider {
       try {
         return await this.attempt<T>(req);
       } catch (err) {
-        const next = err instanceof SchemaViolationError ? this.degradeAfterViolation(err) : this.degrade(err);
-        if (!next) throw err;
+        const next =
+          err instanceof TruncatedError
+            ? this.degradeAfterTruncation(err)
+            : err instanceof SchemaViolationError
+              ? this.degradeAfterViolation(err)
+              : this.degrade(err);
+        if (!next) throw err instanceof TruncatedError ? new Error(this.truncationAdvice(err)) : err;
         core.warning(next);
       }
     }
+  }
+
+  /**
+   * The answer was cut off. Free up room for it in the cheapest order: stop the
+   * model thinking if that is where the budget went, and otherwise just buy more
+   * budget. Shrinking the batch is not on this list — the thinking scales with
+   * the question, not the answer, so the same question asked about less code
+   * gets the same long deliberation.
+   */
+  private degradeAfterTruncation(err: TruncatedError): string | null {
+    if (err.evidence !== 'none' && !this.forcedReasoningOff && this.reasoningEffort !== 'none') {
+      this.forcedReasoningOff = true;
+      this.reasoningEffort = 'none';
+      const spent = err.reasoningTokens
+        ? `${err.reasoningTokens.toLocaleString()} of them on reasoning`
+        : 'most of it on reasoning';
+      return `${this.model} used its whole ${err.cap}-token output budget, ${spent}, and never finished the JSON. Retrying with reasoning_effort: none.`;
+    }
+    const raised = this.budget.raise();
+    if (raised !== null) {
+      return `${this.model} still did not finish the JSON within ${err.cap} tokens. Retrying with a ${raised.toLocaleString()}-token budget.`;
+    }
+    return null;
+  }
+
+  /**
+   * What to tell the user when the reply was cut off and there is nothing left
+   * to try. Shrinking the batch is the right advice only when the answer itself
+   * was too long; when the thinking ate the budget it is what sent this user
+   * down a fruitless 120k -> 8k chase in the first place.
+   */
+  private truncationAdvice(err: TruncatedError): string {
+    const cap = err.cap.toLocaleString();
+    // Name the wall we actually hit, so the next thing the user tries is the
+    // thing that can move it.
+    const wall = this.budget.capped
+      ? `${cap} output tokens, the most ${this.model} will accept`
+      : this.budget.raised
+        ? `${cap} output tokens, raised from ${this.budget.start.toLocaleString()}`
+        : `${cap} output tokens`;
+
+    if (err.evidence === 'none') {
+      // A genuinely long answer: less to report on, or more room to report it.
+      return (
+        `The review was still unfinished within ${wall}, with nothing left to try. ` +
+        (this.budget.capped
+          ? 'Lower `max_chars_per_batch` so each batch has less to report on, or use a model with a longer output limit.'
+          : 'Raise `max_response_tokens`, or lower `max_chars_per_batch` so each batch has less to report on.')
+      );
+    }
+
+    const spent =
+      err.evidence === 'counted'
+        ? `spent ${err.reasoningTokens.toLocaleString()} of them on reasoning`
+        : err.evidence === 'returned'
+          ? 'spent most of them on reasoning'
+          : 'spent them on something it did not return, almost certainly reasoning';
+
+    // Batch size is deliberately not offered here: the thinking scales with the
+    // question, not the answer, so a smaller batch buys nothing.
+    return (
+      `${this.model} never finished the JSON answer within ${wall}, and ${spent}` +
+      (this.forcedReasoningOff ? ', even with reasoning_effort: none' : '') +
+      '. Reasoning shares the output budget with the answer, so a smaller `max_chars_per_batch` will not help. ' +
+      'Turn thinking off with the knob this endpoint documents (via `request_options`, e.g. ' +
+      '`chat_template_kwargs: { thinking: false }`)' +
+      (this.budget.capped ? ', or switch to a model that does not reason.' : ', or raise `max_response_tokens` further.')
+    );
   }
 
   /**
@@ -72,9 +187,25 @@ export class OpenAIProvider implements Provider {
     }
     const message = String(err.message).toLowerCase();
 
+    // Checked before the legacy-name fallback: "max_completion_tokens must be at
+    // most N" is the model's hard ceiling, not a complaint about the field name,
+    // and switching names would retry the same too-large value under a new label.
+    if (isBudgetOutOfRange(message)) {
+      const lowered = this.budget.lower();
+      if (lowered === null) return null;
+      return `${this.model} will not accept an output budget this large; retrying with ${lowered.toLocaleString()} tokens.`;
+    }
     if (!this.useLegacyMaxTokens && message.includes('max_completion_tokens')) {
       this.useLegacyMaxTokens = true;
       return `${this.model} does not accept max_completion_tokens; retrying with max_tokens.`;
+    }
+    if (this.reasoningEffort !== null && message.includes('reasoning_effort')) {
+      const asked = this.reasoningEffort;
+      this.reasoningEffort = null;
+      return (
+        `${this.model} does not accept reasoning_effort: ${asked}; retrying without it. ` +
+        'If this model reasons by default, turn it off with the knob your endpoint documents, via `request_options`.'
+      );
     }
     if (this.variant === 'json_schema' && (message.includes('response_format') || message.includes('json_schema') || message.includes('schema'))) {
       this.variant = 'json_object';
@@ -97,7 +228,7 @@ export class OpenAIProvider implements Provider {
         { role: 'system', content: req.system },
         { role: 'user', content: user },
       ],
-      [this.useLegacyMaxTokens ? 'max_tokens' : 'max_completion_tokens']: req.maxTokens,
+      [this.useLegacyMaxTokens ? 'max_tokens' : 'max_completion_tokens']: this.budget.tokens,
     };
 
     if (this.variant === 'json_schema') {
@@ -109,22 +240,48 @@ export class OpenAIProvider implements Provider {
       params.response_format = { type: 'json_object' };
     }
 
+    if (this.reasoningEffort !== null) {
+      params.reasoning_effort = this.reasoningEffort;
+    }
+    // Last, so an endpoint-specific override wins over what we chose above.
+    Object.assign(params, this.requestOptions);
+
     const res = await this.client.chat.completions.create(
       params as unknown as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
     );
 
     const choice = res.choices[0];
+    const { content, reasoning, hasAnswer } = readMessage(
+      choice?.message as unknown as Record<string, unknown> | undefined,
+    );
+    const reasoningTokens = res.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
+
     if (choice?.finish_reason === 'length') {
-      throw new Error(
-        `The response hit the ${req.maxTokens}-token cap and was truncated. Lower \`max_chars_per_batch\` so each batch asks for less.`,
-      );
+      // An endpoint that neither counts reasoning tokens nor returns the thinking
+      // still leaves a trace: the budget is gone and hardly any answer arrived.
+      const evidence: ReasoningEvidence =
+        reasoningTokens > 0
+          ? 'counted'
+          : reasoning
+            ? 'returned'
+            : content.length < this.budget.tokens * CHARS_PER_TOKEN * 0.5
+              ? 'inferred'
+              : 'none';
+      throw new TruncatedError(this.budget.tokens, reasoningTokens, evidence);
     }
     if (choice?.message.refusal) {
       throw new Error(`The model refused to review this diff: ${choice.message.refusal}`);
     }
+    // A reply that is nothing but thinking is not an answer, and the parser's
+    // error would blame the JSON rather than name the cause.
+    if (!hasAnswer && reasoning) {
+      throw new Error(
+        `${this.model} returned only reasoning and no answer. Set \`reasoning: none\` in .github/hawky.yml, ` +
+          'or disable thinking with the knob your endpoint documents, via `request_options`.',
+      );
+    }
 
-    const text = choice?.message.content ?? '';
-    const data = parseJsonObject<T>(text);
+    const data = parseJsonObject<T>(content);
     assertMatchesSchema(data, req.schema);
     return {
       data,
@@ -132,6 +289,7 @@ export class OpenAIProvider implements Provider {
         inputTokens: res.usage?.prompt_tokens ?? 0,
         outputTokens: res.usage?.completion_tokens ?? 0,
         cachedInputTokens: res.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+        reasoningTokens,
       },
     };
   }

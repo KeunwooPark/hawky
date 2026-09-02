@@ -39820,6 +39820,7 @@ const DEFAULT_EXCLUDES = [
     '**/*.pb.go',
 ];
 const SEVERITIES = ['low', 'medium', 'high', 'critical'];
+const REASONING_LEVELS = ['auto', 'none', 'minimal', 'low', 'medium', 'high'];
 function splitList(value) {
     if (!value)
         return [];
@@ -39834,6 +39835,18 @@ function asStringList(value) {
     if (typeof value === 'string')
         return splitList(value);
     return [];
+}
+function pickReasoning(value) {
+    const v = String(value ?? '').toLowerCase();
+    if (!v)
+        return 'auto';
+    if (REASONING_LEVELS.includes(v))
+        return v;
+    // 'off'/'false'/'disabled' are what people reach for first; accept them.
+    if (['off', 'false', 'no', 'disabled'].includes(v))
+        return 'none';
+    core.warning(`Unknown reasoning level "${v}"; leaving the endpoint default in place.`);
+    return 'auto';
 }
 function pickSeverity(value, fallback) {
     const v = String(value ?? '').toLowerCase();
@@ -39913,6 +39926,11 @@ function loadConfig() {
         dryRun: (input('dry-run') || String(file.dry_run ?? 'false')).toLowerCase() === 'true',
         maxCharsPerBatch: num('', 'max_chars_per_batch', 120_000),
         maxFiles: num('', 'max_files', 60),
+        reasoning: pickReasoning(pick('reasoning', 'reasoning')),
+        maxResponseTokens: num('max-response-tokens', 'max_response_tokens', 16_000),
+        requestOptions: file.request_options && typeof file.request_options === 'object' && !Array.isArray(file.request_options)
+            ? file.request_options
+            : {},
     };
 }
 
@@ -40660,6 +40678,7 @@ exports.AnthropicProvider = void 0;
 const sdk_1 = __importDefault(__nccwpck_require__(121));
 const core = __importStar(__nccwpck_require__(7484));
 const json_js_1 = __nccwpck_require__(9585);
+const budget_js_1 = __nccwpck_require__(4646);
 const validate_js_1 = __nccwpck_require__(1769);
 function isBadRequestAbout(err, needle) {
     return (err instanceof sdk_1.default.APIError &&
@@ -40667,17 +40686,22 @@ function isBadRequestAbout(err, needle) {
         String(err.message).toLowerCase().includes(needle));
 }
 class AnthropicProvider {
-    model;
     name = 'anthropic';
+    model;
     client;
+    budget;
     /** Set once a 400 tells us this model does not accept a knob, so we stop sending it. */
-    supportsThinking = true;
+    supportsThinking;
     supportsSchema = true;
-    constructor(model, apiKey, baseUrl) {
-        this.model = model;
+    constructor(cfg) {
+        this.model = cfg.model;
+        this.budget = new budget_js_1.OutputBudget(cfg.maxResponseTokens);
+        // Extended thinking is billed against `max_tokens` alongside the answer, so
+        // `reasoning: none` turns it off rather than merely asking for less of it.
+        this.supportsThinking = cfg.reasoning !== 'none';
         this.client = new sdk_1.default({
-            apiKey,
-            ...(baseUrl ? { baseURL: baseUrl } : {}),
+            apiKey: cfg.apiKey,
+            ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}),
             maxRetries: 4,
             timeout: 10 * 60 * 1000,
         });
@@ -40688,6 +40712,26 @@ class AnthropicProvider {
                 return await this.attempt(req);
             }
             catch (err) {
+                // A cut-off answer is recoverable: stop the model thinking if that is
+                // where `max_tokens` went, and otherwise just buy more of it.
+                if (err instanceof budget_js_1.TruncatedError) {
+                    const next = this.degradeAfterTruncation(err);
+                    if (next) {
+                        core.warning(next);
+                        continue;
+                    }
+                    throw new Error(this.truncationAdvice(err));
+                }
+                // The model's hard ceiling, discovered by asking past it. Fall back to a
+                // value it will take rather than failing the batch.
+                if (err instanceof sdk_1.default.APIError && err.status === 400 && (0, budget_js_1.isBudgetOutOfRange)(String(err.message).toLowerCase())) {
+                    const lowered = this.budget.lower();
+                    if (lowered !== null) {
+                        core.warning(`${this.model} will not accept an output budget this large; retrying with ${lowered.toLocaleString()} tokens.`);
+                        continue;
+                    }
+                    throw err;
+                }
                 // Adaptive thinking and structured outputs are unavailable on older
                 // Claude models. Drop them and retry rather than failing the run.
                 if (this.supportsThinking && isBadRequestAbout(err, 'thinking')) {
@@ -40712,10 +40756,34 @@ class AnthropicProvider {
             }
         }
     }
+    degradeAfterTruncation(err) {
+        if (err.evidence !== 'none' && this.supportsThinking) {
+            this.supportsThinking = false;
+            return `${this.model} spent its whole ${err.cap}-token output budget thinking and never finished the JSON. Retrying without extended thinking.`;
+        }
+        const raised = this.budget.raise();
+        if (raised !== null) {
+            return `${this.model} still did not finish the JSON within ${err.cap} tokens. Retrying with a ${raised.toLocaleString()}-token budget.`;
+        }
+        return null;
+    }
+    truncationAdvice(err) {
+        const tried = this.budget.capped
+            ? ` — the most ${this.model} will accept`
+            : this.budget.raised
+                ? ` (raised from ${this.budget.start.toLocaleString()})`
+                : '';
+        const moreRoom = this.budget.capped
+            ? 'lower `max_chars_per_batch` so each batch has less to report on, or use a model with a longer output limit'
+            : 'raise `max_response_tokens`, or lower `max_chars_per_batch` so each batch has less to report on';
+        return (`The answer was still unfinished at ${err.cap.toLocaleString()} output tokens${tried}` +
+            (err.evidence !== 'none' ? ', even with extended thinking off' : '') +
+            `. ${moreRoom[0].toUpperCase()}${moreRoom.slice(1)}.`);
+    }
     async attempt(req) {
         const params = {
             model: this.model,
-            max_tokens: req.maxTokens,
+            max_tokens: this.budget.tokens,
             // A single cache breakpoint on the system prompt: it is byte-identical
             // across every batch in a run, so batches 2..n read it at cache rates.
             system: req.cacheSystem
@@ -40736,8 +40804,13 @@ class AnthropicProvider {
         if (res.stop_reason === 'refusal') {
             throw new Error('The model declined to review this diff (stop_reason: refusal). This usually means the diff tripped a safety classifier; narrow the reviewed paths with `exclude` or switch models.');
         }
+        // Thinking is billed against the same `max_tokens` as the answer, so when it
+        // is what filled the budget, a smaller batch does not help. The API does not
+        // break thinking out of `output_tokens`, so all we can tell is whether the
+        // model thought at all, which is enough to give the right advice.
+        const thought = res.content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking');
         if (res.stop_reason === 'max_tokens') {
-            throw new Error(`The response hit the ${req.maxTokens}-token cap and was truncated. Lower \`max_chars_per_batch\` so each batch asks for less.`);
+            throw new budget_js_1.TruncatedError(this.budget.tokens, 0, thought ? 'returned' : 'none');
         }
         const text = res.content
             .filter((b) => b.type === 'text')
@@ -40752,11 +40825,110 @@ class AnthropicProvider {
                 inputTokens: usage.input_tokens ?? 0,
                 outputTokens: usage.output_tokens ?? 0,
                 cachedInputTokens: usage.cache_read_input_tokens ?? 0,
+                // Anthropic bills thinking inside `output_tokens` without breaking it out.
+                reasoningTokens: 0,
             },
         };
     }
 }
 exports.AnthropicProvider = AnthropicProvider;
+
+
+/***/ }),
+
+/***/ 4646:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.CHARS_PER_TOKEN = exports.TruncatedError = exports.OutputBudget = void 0;
+exports.isBudgetOutOfRange = isBudgetOutOfRange;
+/**
+ * The output cap is a guillotine, not a target: the model emits thinking first
+ * and the answer after it, and when the counter runs out generation stops
+ * mid-token — no closing brace, nothing parseable. Since you are billed for the
+ * tokens actually generated and not for the ceiling you asked for, the right
+ * response to a cut-off reply is to ask for more room and try again.
+ *
+ * The budget is provider state rather than a per-call argument: a raise earned
+ * by one batch carries to the next, so a run does not rediscover the same
+ * ceiling once per file.
+ */
+class OutputBudget {
+    start;
+    maxRaises;
+    current;
+    /** Set once the endpoint refuses a value, which is the model's own hard limit. */
+    refusedAt = null;
+    raises = 0;
+    constructor(start, maxRaises = 3) {
+        this.start = start;
+        this.maxRaises = maxRaises;
+        this.current = start;
+    }
+    get tokens() {
+        return this.current;
+    }
+    /** True once the budget has been raised at least once during this run. */
+    get raised() {
+        return this.current > this.start;
+    }
+    /** True once the endpoint refused a raise: this model's own ceiling is in the way. */
+    get capped() {
+        return this.refusedAt !== null;
+    }
+    /** Doubles the ask after a truncated reply. Returns the new ceiling, or null when there is no room left. */
+    raise() {
+        const next = this.current * 2;
+        if (this.raises >= this.maxRaises)
+            return null;
+        if (this.refusedAt !== null && next >= this.refusedAt)
+            return null;
+        this.raises++;
+        this.current = next;
+        return next;
+    }
+    /**
+     * The endpoint rejected the current ask as larger than the model allows.
+     * Returns the value to fall back to, or null when even the configured
+     * starting budget was refused — which is a config error, not something to
+     * retry around.
+     */
+    lower() {
+        this.refusedAt = this.current;
+        if (this.current <= this.start)
+            return null;
+        this.current = Math.max(this.start, Math.floor(this.current / 2));
+        return this.current;
+    }
+}
+exports.OutputBudget = OutputBudget;
+/** A reply that ran out of output budget, with what the model spent it on. */
+class TruncatedError extends Error {
+    cap;
+    reasoningTokens;
+    evidence;
+    constructor(cap, reasoningTokens, evidence) {
+        super(`The response hit the ${cap}-token cap and was truncated.`);
+        this.cap = cap;
+        this.reasoningTokens = reasoningTokens;
+        this.evidence = evidence;
+        this.name = 'TruncatedError';
+    }
+}
+exports.TruncatedError = TruncatedError;
+/**
+ * Roughly how many characters of answer a full output budget buys, at the ~3.5
+ * characters per token this action assumes elsewhere. Used only to tell "the
+ * answer was too long" apart from "something invisible ate the budget".
+ */
+exports.CHARS_PER_TOKEN = 3.5;
+/** A 4xx about the output cap: is the parameter unsupported, or the value too big? */
+function isBudgetOutOfRange(message) {
+    return (/max_(?:completion_)?tokens/.test(message) &&
+        /too large|too high|exceed|maximum|at most|greater than|less than or equal|must be (?:<|less)/.test(message));
+}
 
 
 /***/ }),
@@ -40771,9 +40943,7 @@ exports.makeProvider = makeProvider;
 const anthropic_js_1 = __nccwpck_require__(5815);
 const openai_js_1 = __nccwpck_require__(709);
 function makeProvider(cfg) {
-    return cfg.provider === 'openai'
-        ? new openai_js_1.OpenAIProvider(cfg.model, cfg.apiKey, cfg.baseUrl)
-        : new anthropic_js_1.AnthropicProvider(cfg.model, cfg.apiKey, cfg.baseUrl);
+    return cfg.provider === 'openai' ? new openai_js_1.OpenAIProvider(cfg) : new anthropic_js_1.AnthropicProvider(cfg);
 }
 
 
@@ -40784,45 +40954,118 @@ function makeProvider(cfg) {
 
 "use strict";
 
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.parseJsonObject = parseJsonObject;
-exports.schemaInstruction = schemaInstruction;
 /**
  * Pull a JSON object out of a model response.
  *
- * With structured outputs the whole body is already JSON, but OpenAI-compatible
- * servers that do not implement `response_format` fall back to plain text, which
- * may arrive wrapped in a code fence or trailed by a sentence of commentary.
+ * With structured outputs the whole body is already JSON, but two things get in
+ * the way. OpenAI-compatible servers that do not implement `response_format`
+ * fall back to plain text, which may arrive wrapped in a code fence or trailed
+ * by a sentence of commentary. And reasoning models often emit their chain of
+ * thought in the same `content` field, either fenced in `<think>` tags or as a
+ * bare preamble, which is prose that happens to contain braces.
  */
-function parseJsonObject(text) {
-    const trimmed = text.trim();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.stripReasoning = stripReasoning;
+exports.containsReasoning = containsReasoning;
+exports.parseJsonObject = parseJsonObject;
+exports.schemaInstruction = schemaInstruction;
+/** Tags reasoning models wrap their chain of thought in, in the content field. */
+const REASONING_TAGS = ['think', 'thinking', 'reason', 'reasoning', 'thought'];
+const CLOSED_REASONING = new RegExp(`<(${REASONING_TAGS.join('|')})\\b[^>]*>[\\s\\S]*?<\\/\\1\\s*>`, 'gi');
+const UNCLOSED_REASONING = new RegExp(`<(${REASONING_TAGS.join('|')})\\b[^>]*>[\\s\\S]*$`, 'i');
+/**
+ * Remove a reasoning model's chain of thought from a response body.
+ *
+ * An unclosed opening tag means the reply was cut off mid-thought, so everything
+ * after it is dropped too: there is no answer behind it to recover, and leaving
+ * it in gives the parser braces to latch onto.
+ */
+function stripReasoning(text) {
+    return text.replace(CLOSED_REASONING, '').replace(UNCLOSED_REASONING, '').trim();
+}
+/** True when the body carried a chain of thought, closed or truncated. */
+function containsReasoning(text) {
+    return new RegExp(`<(${REASONING_TAGS.join('|')})\\b[^>]*>`, 'i').test(text);
+}
+/**
+ * Yield every balanced `{...}` span in the text, outermost first.
+ *
+ * `indexOf('{')` to `lastIndexOf('}')` is not good enough: a reply padded with
+ * prose can open a brace inside the padding and close one after the JSON, and
+ * the resulting slice parses as nothing at all. Tracking depth and string
+ * literals finds the spans that could actually be objects.
+ */
+function* balancedObjects(text, maxCandidates = 50) {
+    let found = 0;
+    for (let i = 0; i < text.length && found < maxCandidates; i++) {
+        if (text[i] !== '{')
+            continue;
+        let depth = 0;
+        let inString = false;
+        let escaped = false;
+        for (let j = i; j < text.length; j++) {
+            const c = text[j];
+            if (escaped) {
+                escaped = false;
+            }
+            else if (c === '\\') {
+                escaped = inString;
+            }
+            else if (c === '"') {
+                inString = !inString;
+            }
+            else if (!inString && c === '{') {
+                depth++;
+            }
+            else if (!inString && c === '}' && --depth === 0) {
+                found++;
+                yield text.slice(i, j + 1);
+                break;
+            }
+        }
+    }
+}
+function tryParseObject(candidate) {
     try {
-        return JSON.parse(trimmed);
+        const parsed = JSON.parse(candidate);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed))
+            return parsed;
     }
     catch {
-        // fall through
+        // Not JSON; the caller moves on to the next candidate.
     }
+    return undefined;
+}
+function parseJsonObject(text) {
+    // Try the body as it stands before repairing it. Stripping reasoning is a
+    // repair, and a valid response that merely quotes a `<think>` tag inside one
+    // of its own strings does not need repairing — it needs leaving alone.
+    const direct = tryParseObject(text.trim());
+    if (direct !== undefined)
+        return direct;
+    const hadReasoning = containsReasoning(text);
+    const trimmed = stripReasoning(text);
     const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(trimmed);
     if (fenced) {
-        try {
-            return JSON.parse(fenced[1].trim());
-        }
-        catch {
-            // fall through
-        }
+        const parsed = tryParseObject(fenced[1].trim());
+        if (parsed !== undefined)
+            return parsed;
     }
-    const start = trimmed.indexOf('{');
-    const end = trimmed.lastIndexOf('}');
-    if (start !== -1 && end > start) {
-        return JSON.parse(trimmed.slice(start, end + 1));
+    for (const candidate of balancedObjects(trimmed)) {
+        const parsed = tryParseObject(candidate);
+        if (parsed !== undefined)
+            return parsed;
     }
-    throw new Error(`Model did not return JSON. First 300 characters: ${trimmed.slice(0, 300)}`);
+    const why = hadReasoning
+        ? ' The reply was mostly the model\'s own reasoning; set `reasoning: none` so it answers directly.'
+        : '';
+    throw new Error(`Model did not return JSON.${why} First 300 characters: ${trimmed.slice(0, 300)}`);
 }
 /** Appended to the prompt when the endpoint cannot enforce a schema itself. */
 function schemaInstruction(schema) {
     return [
         '',
-        'Respond with a single JSON object and nothing else — no prose, no code fence.',
+        'Respond with a single JSON object and nothing else — no prose, no code fence, no reasoning.',
         'It must conform to this JSON Schema:',
         '',
         JSON.stringify(schema),
@@ -40875,29 +41118,62 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.OpenAIProvider = void 0;
+exports.readMessage = readMessage;
 const openai_1 = __importDefault(__nccwpck_require__(2583));
 const core = __importStar(__nccwpck_require__(7484));
 const json_js_1 = __nccwpck_require__(9585);
+const budget_js_1 = __nccwpck_require__(4646);
 const validate_js_1 = __nccwpck_require__(1769);
 /**
+ * Reasoning models return two things in one response: the chain of thought and
+ * the answer. Both are billed against the same output cap, and depending on the
+ * server the thinking arrives either in a `reasoning_content` field or inline in
+ * `content` wrapped in `<think>` tags. Either way it is not the answer, so it is
+ * dropped before parsing — and when it is what ate the cap, asking for less code
+ * per batch cannot help, because the thinking scales with the question, not the
+ * answer.
+ */
+function readMessage(message) {
+    const content = typeof message?.content === 'string' ? message.content : '';
+    // Servers disagree on the field name; OpenRouter uses `reasoning`, most
+    // vLLM/SGLang-derived ones (Fireworks, Together, DeepSeek) use `reasoning_content`.
+    const separate = [message?.reasoning_content, message?.reasoning].find((v) => typeof v === 'string' && v.trim());
+    return {
+        content,
+        reasoning: separate ?? ((0, json_js_1.containsReasoning)(content) ? content : ''),
+        // Whether anything is left once the thinking is taken out. The parser does
+        // its own stripping; this only decides which error the user gets to read.
+        hasAnswer: (0, json_js_1.stripReasoning)(content).trim().length > 0,
+    };
+}
+/**
  * "OpenAI-compatible" covers a wide range of servers — Azure, OpenRouter,
- * Together, Groq, vLLM, llama.cpp, Ollama — and they implement different subsets
- * of the API. Rather than making the user declare what their endpoint supports,
- * we start with the strictest request and step down one capability at a time
- * whenever the server answers 4xx. The working combination is remembered for the
- * rest of the run.
+ * Together, Fireworks, Groq, vLLM, llama.cpp, Ollama — and they implement
+ * different subsets of the API. Rather than making the user declare what their
+ * endpoint supports, we start with the strictest request and step down one
+ * capability at a time whenever the server answers 4xx. The working combination
+ * is remembered for the rest of the run.
  */
 class OpenAIProvider {
-    model;
     name = 'openai';
+    model;
     client;
+    requestOptions;
+    budget;
     variant = 'json_schema';
     useLegacyMaxTokens = false;
-    constructor(model, apiKey, baseUrl) {
-        this.model = model;
+    /** null once the endpoint rejects the parameter, or when the user picked `auto`. */
+    reasoningEffort;
+    /** Set after a truncated reply made us turn thinking off, so we only try once. */
+    forcedReasoningOff = false;
+    constructor(cfg) {
+        this.model = cfg.model;
+        this.requestOptions = cfg.requestOptions;
+        this.budget = new budget_js_1.OutputBudget(cfg.maxResponseTokens);
+        this.reasoningEffort = cfg.reasoning === 'auto' ? null : cfg.reasoning;
         this.client = new openai_1.default({
-            apiKey,
-            ...(baseUrl ? { baseURL: baseUrl } : {}),
+            apiKey: cfg.apiKey,
+            ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}),
             maxRetries: 4,
             timeout: 10 * 60 * 1000,
         });
@@ -40908,12 +41184,74 @@ class OpenAIProvider {
                 return await this.attempt(req);
             }
             catch (err) {
-                const next = err instanceof validate_js_1.SchemaViolationError ? this.degradeAfterViolation(err) : this.degrade(err);
+                const next = err instanceof budget_js_1.TruncatedError
+                    ? this.degradeAfterTruncation(err)
+                    : err instanceof validate_js_1.SchemaViolationError
+                        ? this.degradeAfterViolation(err)
+                        : this.degrade(err);
                 if (!next)
-                    throw err;
+                    throw err instanceof budget_js_1.TruncatedError ? new Error(this.truncationAdvice(err)) : err;
                 core.warning(next);
             }
         }
+    }
+    /**
+     * The answer was cut off. Free up room for it in the cheapest order: stop the
+     * model thinking if that is where the budget went, and otherwise just buy more
+     * budget. Shrinking the batch is not on this list — the thinking scales with
+     * the question, not the answer, so the same question asked about less code
+     * gets the same long deliberation.
+     */
+    degradeAfterTruncation(err) {
+        if (err.evidence !== 'none' && !this.forcedReasoningOff && this.reasoningEffort !== 'none') {
+            this.forcedReasoningOff = true;
+            this.reasoningEffort = 'none';
+            const spent = err.reasoningTokens
+                ? `${err.reasoningTokens.toLocaleString()} of them on reasoning`
+                : 'most of it on reasoning';
+            return `${this.model} used its whole ${err.cap}-token output budget, ${spent}, and never finished the JSON. Retrying with reasoning_effort: none.`;
+        }
+        const raised = this.budget.raise();
+        if (raised !== null) {
+            return `${this.model} still did not finish the JSON within ${err.cap} tokens. Retrying with a ${raised.toLocaleString()}-token budget.`;
+        }
+        return null;
+    }
+    /**
+     * What to tell the user when the reply was cut off and there is nothing left
+     * to try. Shrinking the batch is the right advice only when the answer itself
+     * was too long; when the thinking ate the budget it is what sent this user
+     * down a fruitless 120k -> 8k chase in the first place.
+     */
+    truncationAdvice(err) {
+        const cap = err.cap.toLocaleString();
+        // Name the wall we actually hit, so the next thing the user tries is the
+        // thing that can move it.
+        const wall = this.budget.capped
+            ? `${cap} output tokens, the most ${this.model} will accept`
+            : this.budget.raised
+                ? `${cap} output tokens, raised from ${this.budget.start.toLocaleString()}`
+                : `${cap} output tokens`;
+        if (err.evidence === 'none') {
+            // A genuinely long answer: less to report on, or more room to report it.
+            return (`The review was still unfinished within ${wall}, with nothing left to try. ` +
+                (this.budget.capped
+                    ? 'Lower `max_chars_per_batch` so each batch has less to report on, or use a model with a longer output limit.'
+                    : 'Raise `max_response_tokens`, or lower `max_chars_per_batch` so each batch has less to report on.'));
+        }
+        const spent = err.evidence === 'counted'
+            ? `spent ${err.reasoningTokens.toLocaleString()} of them on reasoning`
+            : err.evidence === 'returned'
+                ? 'spent most of them on reasoning'
+                : 'spent them on something it did not return, almost certainly reasoning';
+        // Batch size is deliberately not offered here: the thinking scales with the
+        // question, not the answer, so a smaller batch buys nothing.
+        return (`${this.model} never finished the JSON answer within ${wall}, and ${spent}` +
+            (this.forcedReasoningOff ? ', even with reasoning_effort: none' : '') +
+            '. Reasoning shares the output budget with the answer, so a smaller `max_chars_per_batch` will not help. ' +
+            'Turn thinking off with the knob this endpoint documents (via `request_options`, e.g. ' +
+            '`chat_template_kwargs: { thinking: false }`)' +
+            (this.budget.capped ? ', or switch to a model that does not reason.' : ', or raise `max_response_tokens` further.'));
     }
     /**
      * The server accepted a request carrying the schema and then answered with
@@ -40940,9 +41278,24 @@ class OpenAIProvider {
             return null;
         }
         const message = String(err.message).toLowerCase();
+        // Checked before the legacy-name fallback: "max_completion_tokens must be at
+        // most N" is the model's hard ceiling, not a complaint about the field name,
+        // and switching names would retry the same too-large value under a new label.
+        if ((0, budget_js_1.isBudgetOutOfRange)(message)) {
+            const lowered = this.budget.lower();
+            if (lowered === null)
+                return null;
+            return `${this.model} will not accept an output budget this large; retrying with ${lowered.toLocaleString()} tokens.`;
+        }
         if (!this.useLegacyMaxTokens && message.includes('max_completion_tokens')) {
             this.useLegacyMaxTokens = true;
             return `${this.model} does not accept max_completion_tokens; retrying with max_tokens.`;
+        }
+        if (this.reasoningEffort !== null && message.includes('reasoning_effort')) {
+            const asked = this.reasoningEffort;
+            this.reasoningEffort = null;
+            return (`${this.model} does not accept reasoning_effort: ${asked}; retrying without it. ` +
+                'If this model reasons by default, turn it off with the knob your endpoint documents, via `request_options`.');
         }
         if (this.variant === 'json_schema' && (message.includes('response_format') || message.includes('json_schema') || message.includes('schema'))) {
             this.variant = 'json_object';
@@ -40963,7 +41316,7 @@ class OpenAIProvider {
                 { role: 'system', content: req.system },
                 { role: 'user', content: user },
             ],
-            [this.useLegacyMaxTokens ? 'max_tokens' : 'max_completion_tokens']: req.maxTokens,
+            [this.useLegacyMaxTokens ? 'max_tokens' : 'max_completion_tokens']: this.budget.tokens,
         };
         if (this.variant === 'json_schema') {
             params.response_format = {
@@ -40974,16 +41327,37 @@ class OpenAIProvider {
         else if (this.variant === 'json_object') {
             params.response_format = { type: 'json_object' };
         }
+        if (this.reasoningEffort !== null) {
+            params.reasoning_effort = this.reasoningEffort;
+        }
+        // Last, so an endpoint-specific override wins over what we chose above.
+        Object.assign(params, this.requestOptions);
         const res = await this.client.chat.completions.create(params);
         const choice = res.choices[0];
+        const { content, reasoning, hasAnswer } = readMessage(choice?.message);
+        const reasoningTokens = res.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
         if (choice?.finish_reason === 'length') {
-            throw new Error(`The response hit the ${req.maxTokens}-token cap and was truncated. Lower \`max_chars_per_batch\` so each batch asks for less.`);
+            // An endpoint that neither counts reasoning tokens nor returns the thinking
+            // still leaves a trace: the budget is gone and hardly any answer arrived.
+            const evidence = reasoningTokens > 0
+                ? 'counted'
+                : reasoning
+                    ? 'returned'
+                    : content.length < this.budget.tokens * budget_js_1.CHARS_PER_TOKEN * 0.5
+                        ? 'inferred'
+                        : 'none';
+            throw new budget_js_1.TruncatedError(this.budget.tokens, reasoningTokens, evidence);
         }
         if (choice?.message.refusal) {
             throw new Error(`The model refused to review this diff: ${choice.message.refusal}`);
         }
-        const text = choice?.message.content ?? '';
-        const data = (0, json_js_1.parseJsonObject)(text);
+        // A reply that is nothing but thinking is not an answer, and the parser's
+        // error would blame the JSON rather than name the cause.
+        if (!hasAnswer && reasoning) {
+            throw new Error(`${this.model} returned only reasoning and no answer. Set \`reasoning: none\` in .github/hawky.yml, ` +
+                'or disable thinking with the knob your endpoint documents, via `request_options`.');
+        }
+        const data = (0, json_js_1.parseJsonObject)(content);
         (0, validate_js_1.assertMatchesSchema)(data, req.schema);
         return {
             data,
@@ -40991,6 +41365,7 @@ class OpenAIProvider {
                 inputTokens: res.usage?.prompt_tokens ?? 0,
                 outputTokens: res.usage?.completion_tokens ?? 0,
                 cachedInputTokens: res.usage?.prompt_tokens_details?.cached_tokens ?? 0,
+                reasoningTokens,
             },
         };
     }
@@ -41142,7 +41517,6 @@ const client_js_1 = __nccwpck_require__(7780);
 const diff_js_1 = __nccwpck_require__(164);
 const review_js_1 = __nccwpck_require__(3199);
 const issues_js_1 = __nccwpck_require__(8859);
-const MAX_RESPONSE_TOKENS = 16_000;
 function mergeSummaries(summaries, fallback) {
     const clean = summaries.map((s) => s.trim()).filter(Boolean);
     if (clean.length <= 1)
@@ -41152,7 +41526,10 @@ function mergeSummaries(summaries, fallback) {
 function logUsage(total, calls) {
     core.info(`LLM: ${calls} call(s), ${total.inputTokens.toLocaleString()} input tokens ` +
         `(${total.cachedInputTokens.toLocaleString()} cached), ` +
-        `${total.outputTokens.toLocaleString()} output tokens.`);
+        `${total.outputTokens.toLocaleString()} output tokens` +
+        // Worth surfacing: it is the usual reason an output budget runs out.
+        (total.reasoningTokens ? ` (${total.reasoningTokens.toLocaleString()} on reasoning)` : '') +
+        '.');
 }
 /**
  * Written before anything that can throw so a job that gates on these outputs
@@ -41189,7 +41566,7 @@ async function run() {
     const findings = [];
     const refactors = [];
     const summaries = [];
-    const total = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+    const total = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
     let failedBatches = 0;
     for (const [index, batch] of batches.entries()) {
         core.startGroup(`Batch ${index + 1}/${batches.length} (${batch.map((f) => f.path).join(', ')})`);
@@ -41199,7 +41576,6 @@ async function run() {
                 user: (0, prompts_js_1.buildUserPrompt)(target, batch, index, batches.length),
                 schema: schema_js_1.REVIEW_SCHEMA,
                 schemaName: 'code_review',
-                maxTokens: MAX_RESPONSE_TOKENS,
                 // The system prompt is identical for every batch, so cache it once.
                 cacheSystem: batches.length > 1,
             });
@@ -41210,6 +41586,7 @@ async function run() {
             total.inputTokens += usage.inputTokens;
             total.outputTokens += usage.outputTokens;
             total.cachedInputTokens += usage.cachedInputTokens;
+            total.reasoningTokens += usage.reasoningTokens;
             core.info(`${data.findings?.length ?? 0} finding(s), ${data.refactors?.length ?? 0} refactor(s).`);
         }
         catch (err) {
@@ -41304,7 +41681,7 @@ function buildSystemPrompt(cfg, mode) {
     if (wantsRefactors) {
         parts.push(`Report structural problems the change exposes: duplicated logic, a function or module that has outgrown its`, `responsibility, an abstraction that is leaking, a pattern being copied for the third time. These become`, `tracked issues, not inline comments, so only raise ones worth a separate piece of work.`, ``);
     }
-    parts.push(`## Rules`, ``, `- Anchor every finding to a line marked \`+\` in the diff. The number in the left gutter is the line number to use.`, `  Never anchor to an unchanged context line, and never invent a line number.`, `- You are reading a partial view of the codebase. If a symbol, import, or caller is not shown, assume it exists and`, `  is correct. Do not report something as missing or undefined when it is simply outside the diff.`, `- Report a problem only if you can name the input or state that triggers it and the resulting behaviour. If you`, `  cannot, drop it.`, `- Set \`confidence\` honestly. Below 0.6 means you are guessing; that finding will be discarded, which is the`, `  correct outcome for a guess.`, `- No style, formatting, naming, or comment-density opinions unless the project guidelines below ask for them.`, `  Linters and formatters already handle those and the author does not want them from you.`, `- No praise, no summary of what the code does, no "consider adding tests" boilerplate. If a specific untested`, `  branch will break, say which branch and why.`, `- One finding per distinct problem. Do not repeat the same issue across several lines; report it once at the`, `  clearest location.`, `- Prefer few high-signal findings over many. An empty \`findings\` array is a perfectly good review of a clean change.`, `- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`, `  keeping the surrounding indentation, so it can be applied directly.`);
+    parts.push(`## Rules`, ``, `- Anchor every finding to a line marked \`+\` in the diff. The number in the left gutter is the line number to use.`, `  Never anchor to an unchanged context line, and never invent a line number.`, `- You are reading a partial view of the codebase. If a symbol, import, or caller is not shown, assume it exists and`, `  is correct. Do not report something as missing or undefined when it is simply outside the diff.`, `- Report a problem only if you can name the input or state that triggers it and the resulting behaviour. If you`, `  cannot, drop it.`, `- Set \`confidence\` honestly. Below 0.6 means you are guessing; that finding will be discarded, which is the`, `  correct outcome for a guess.`, `- No style, formatting, naming, or comment-density opinions unless the project guidelines below ask for them.`, `  Linters and formatters already handle those and the author does not want them from you.`, `- No praise, no summary of what the code does, no "consider adding tests" boilerplate. If a specific untested`, `  branch will break, say which branch and why.`, `- One finding per distinct problem. Do not repeat the same issue across several lines; report it once at the`, `  clearest location.`, `- Every field holds a finished answer, not your working-out. Do not narrate your deliberation, weigh options`, `  against each other, or trail off mid-thought inside a \`body\`. If you have not reached a conclusion, the`, `  finding does not go in.`, `- Prefer few high-signal findings over many. An empty \`findings\` array is a perfectly good review of a clean change.`, `- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`, `  keeping the surrounding indentation, so it can be applied directly.`);
     if (cfg.guidelines.trim()) {
         parts.push(``, `## Project guidelines`, ``, `These come from the repository maintainers and take precedence over your defaults:`, ``, cfg.guidelines.trim());
     }

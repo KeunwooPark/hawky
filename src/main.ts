@@ -9,8 +9,6 @@ import { batchFiles, getCompareDiff, getPullRequestDiff } from './gh/diff.js';
 import { postReview } from './gh/review.js';
 import { postRefactorIssues } from './gh/issues.js';
 
-const MAX_RESPONSE_TOKENS = 16_000;
-
 function mergeSummaries(summaries: string[], fallback: string): string {
   const clean = summaries.map((s) => s.trim()).filter(Boolean);
   if (clean.length <= 1) return clean[0] ?? fallback;
@@ -21,7 +19,10 @@ function logUsage(total: Usage, calls: number): void {
   core.info(
     `LLM: ${calls} call(s), ${total.inputTokens.toLocaleString()} input tokens ` +
       `(${total.cachedInputTokens.toLocaleString()} cached), ` +
-      `${total.outputTokens.toLocaleString()} output tokens.`,
+      `${total.outputTokens.toLocaleString()} output tokens` +
+      // Worth surfacing: it is the usual reason an output budget runs out.
+      (total.reasoningTokens ? ` (${total.reasoningTokens.toLocaleString()} on reasoning)` : '') +
+      '.',
   );
 }
 
@@ -68,7 +69,7 @@ async function run(): Promise<void> {
   const findings: Finding[] = [];
   const refactors: Refactor[] = [];
   const summaries: string[] = [];
-  const total: Usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 };
+  const total: Usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
   let failedBatches = 0;
 
   for (const [index, batch] of batches.entries()) {
@@ -79,7 +80,6 @@ async function run(): Promise<void> {
         user: buildUserPrompt(target, batch, index, batches.length),
         schema: REVIEW_SCHEMA,
         schemaName: 'code_review',
-        maxTokens: MAX_RESPONSE_TOKENS,
         // The system prompt is identical for every batch, so cache it once.
         cacheSystem: batches.length > 1,
       });
@@ -91,6 +91,7 @@ async function run(): Promise<void> {
       total.inputTokens += usage.inputTokens;
       total.outputTokens += usage.outputTokens;
       total.cachedInputTokens += usage.cachedInputTokens;
+      total.reasoningTokens += usage.reasoningTokens;
       core.info(`${data.findings?.length ?? 0} finding(s), ${data.refactors?.length ?? 0} refactor(s).`);
     } catch (err) {
       // One failed batch should not throw away the batches that succeeded.

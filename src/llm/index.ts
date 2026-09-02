@@ -4,7 +4,5 @@ import { AnthropicProvider } from './anthropic.js';
 import { OpenAIProvider } from './openai.js';
 
 export function makeProvider(cfg: Config): Provider {
-  return cfg.provider === 'openai'
-    ? new OpenAIProvider(cfg.model, cfg.apiKey, cfg.baseUrl)
-    : new AnthropicProvider(cfg.model, cfg.apiKey, cfg.baseUrl);
+  return cfg.provider === 'openai' ? new OpenAIProvider(cfg) : new AnthropicProvider(cfg);
 }

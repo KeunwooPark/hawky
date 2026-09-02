@@ -41,6 +41,8 @@ export interface Usage {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
+  /** Part of `outputTokens` the model spent thinking before it answered. */
+  reasoningTokens: number;
 }
 
 export interface CompleteRequest {
@@ -49,7 +51,6 @@ export interface CompleteRequest {
   /** JSON Schema the response must conform to. */
   schema: Record<string, unknown>;
   schemaName: string;
-  maxTokens: number;
   /** True when `system` is byte-identical across calls and worth caching. */
   cacheSystem: boolean;
 }

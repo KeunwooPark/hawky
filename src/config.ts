@@ -6,6 +6,15 @@ import type { Severity } from './types.js';
 
 export type Mode = 'review' | 'refactor' | 'both';
 export type ProviderName = 'anthropic' | 'openai';
+/**
+ * How much thinking the model should do before answering. `auto` sends nothing
+ * and leaves the endpoint's own default in place; every other value is passed
+ * through as `reasoning_effort` (and turns Anthropic's adaptive thinking off at
+ * `none`). Reasoning tokens are billed against the same output cap as the
+ * answer, so a model that thinks at length can truncate its own JSON no matter
+ * how small the batch is.
+ */
+export type Reasoning = 'auto' | 'none' | 'minimal' | 'low' | 'medium' | 'high';
 
 export interface Config {
   provider: ProviderName;
@@ -29,6 +38,15 @@ export interface Config {
   /** Rough character budget per LLM call; ~3.5 chars per token. */
   maxCharsPerBatch: number;
   maxFiles: number;
+  reasoning: Reasoning;
+  /** Output-token ceiling for one LLM call. Reasoning tokens count against it. */
+  maxResponseTokens: number;
+  /**
+   * Extra top-level fields merged into the OpenAI-compatible request body, for
+   * endpoint-specific knobs this action does not model. Config file only: it is
+   * a passthrough, so a typo here reaches the server verbatim.
+   */
+  requestOptions: Record<string, unknown>;
 }
 
 const DEFAULT_MODELS: Record<ProviderName, string> = {
@@ -74,6 +92,7 @@ const DEFAULT_EXCLUDES = [
 ];
 
 const SEVERITIES: Severity[] = ['low', 'medium', 'high', 'critical'];
+const REASONING_LEVELS: Reasoning[] = ['auto', 'none', 'minimal', 'low', 'medium', 'high'];
 
 function splitList(value: string | undefined): string[] {
   if (!value) return [];
@@ -87,6 +106,16 @@ function asStringList(value: unknown): string[] {
   if (Array.isArray(value)) return value.map(String).map((s) => s.trim()).filter(Boolean);
   if (typeof value === 'string') return splitList(value);
   return [];
+}
+
+function pickReasoning(value: unknown): Reasoning {
+  const v = String(value ?? '').toLowerCase();
+  if (!v) return 'auto';
+  if ((REASONING_LEVELS as string[]).includes(v)) return v as Reasoning;
+  // 'off'/'false'/'disabled' are what people reach for first; accept them.
+  if (['off', 'false', 'no', 'disabled'].includes(v)) return 'none';
+  core.warning(`Unknown reasoning level "${v}"; leaving the endpoint default in place.`);
+  return 'auto';
 }
 
 function pickSeverity(value: unknown, fallback: Severity): Severity {
@@ -173,5 +202,11 @@ export function loadConfig(): Config {
     dryRun: (input('dry-run') || String(file.dry_run ?? 'false')).toLowerCase() === 'true',
     maxCharsPerBatch: num('', 'max_chars_per_batch', 120_000),
     maxFiles: num('', 'max_files', 60),
+    reasoning: pickReasoning(pick('reasoning', 'reasoning')),
+    maxResponseTokens: num('max-response-tokens', 'max_response_tokens', 16_000),
+    requestOptions:
+      file.request_options && typeof file.request_options === 'object' && !Array.isArray(file.request_options)
+        ? (file.request_options as Record<string, unknown>)
+        : {},
   };
 }

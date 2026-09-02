@@ -87,6 +87,76 @@ client rather than assumed to have been enforced. An endpoint that accepts a sch
 then answers with something that does not match it steps down the same way a rejection
 does, and the log names the offending field.
 
+### Reasoning models
+
+A reasoning model thinks before it answers, and both halves come out of the same output
+budget. Hawky asks for one JSON object per batch and caps the reply at
+`max-response-tokens` (16,000 by default), so a model that spends 15,000 tokens
+deliberating has nothing left to answer with — the JSON is cut off mid-object and the
+batch fails. **Shrinking `max_chars_per_batch` does not help**: the thinking scales with
+the question, not with the size of the answer, so one small file gets the same long
+deliberation as ten.
+
+Turn it off:
+
+```yaml
+with:
+  provider: openai
+  base-url: https://api.fireworks.ai/inference/v1
+  model: accounts/fireworks/models/glm-5p2
+  api-key: ${{ secrets.FIREWORKS_API_KEY }}
+  reasoning: none
+```
+
+That sends `reasoning_effort: none`. Endpoints that do not implement the parameter
+answer 4xx; hawky logs that and retries without it, so nothing breaks, but the model
+keeps thinking. Those servers usually expose the switch through the chat template
+instead, which `request_options` passes through verbatim:
+
+```yaml
+# .github/hawky.yml
+request_options:
+  chat_template_kwargs:
+    thinking: false
+```
+
+Check your provider's docs for the exact key — `request_options` is merged into the
+request body as-is, and it overrides anything hawky set itself.
+
+If you would rather let the model think and pay for it, raise the ceiling instead:
+`max-response-tokens: 48000`.
+
+### Truncated replies fix themselves
+
+`max_response_tokens` is a guillotine, not a target: the model emits its thinking first
+and the answer after it, and when the counter runs out generation stops mid-token — no
+closing brace, nothing parseable. Rather than failing the batch, hawky treats that as a
+budget problem and works its way out of it:
+
+1. **Stop the thinking**, if that is where the budget went — one retry with
+   `reasoning_effort: none`. Cheapest fix, and usually the only one needed.
+2. **Buy more room.** The budget doubles and the call is retried, up to three times
+   (16k → 32k → 64k → 128k by default). You are billed for tokens generated, not for the
+   ceiling you ask for, so a raise costs nothing on batches that already fit.
+3. **Back off the model's own limit.** If the endpoint refuses a budget that large, hawky
+   falls back to the biggest value it will take instead of failing on a 400.
+
+A raise earned by one batch carries to the rest of the run, so a large pull request does
+not rediscover the same ceiling once per file. Only when every rung is spent does the
+batch fail, and the message then names the wall it hit — your configured budget or the
+model's hard ceiling — rather than guessing at batch size.
+
+### Reasoning never reaches a comment
+
+Chain of thought is stripped out of the reply before the JSON is parsed, whether it
+arrives in a `reasoning_content` field (Fireworks, Together, DeepSeek, vLLM) or inline in
+`<think>` tags, and an unclosed tag drops everything after it rather than letting the
+parser latch onto braces inside the deliberation. Stripping runs only as a repair, after
+the raw body fails to parse, so a review that legitimately quotes `<think>` in its own
+text survives untouched. The prompt also tells the model that every field holds a
+finished answer and not its working-out — the one path stripping cannot reach is
+deliberation written *into* a finding's body.
+
 ## Modes
 
 `mode` decides what the action does; **you** decide when it runs, from your workflow's
@@ -141,6 +211,8 @@ Every input is optional except `api-key`.
 | `provider` | `anthropic` | `anthropic` or `openai`. |
 | `model` | `claude-opus-5` / `gpt-4.1` | Model id. |
 | `base-url` | — | Override the API base URL. |
+| `reasoning` | endpoint default | `none`, `minimal`, `low`, `medium`, or `high`. See [Reasoning models](#reasoning-models). |
+| `max-response-tokens` | `16000` | Starting output budget per call, reasoning included. Raised automatically when a reply is cut off. |
 | `mode` | `review` | `review`, `refactor`, or `both`. |
 | `github-token` | `${{ github.token }}` | Token used to read the diff and write comments and issues. |
 | `config-path` | `.github/hawky.yml` | YAML config file. |
@@ -219,6 +291,10 @@ exclude:
 # Set to false to review lockfiles, dist/, minified output, and so on.
 exclude_defaults: true
 
+# Extra fields merged into the request body, for endpoint-specific knobs.
+# Passed through verbatim, so a typo here reaches the server.
+request_options: {}
+
 guidelines: |
   Every database write goes through the repository layer; flag direct SQL in handlers.
   Public API changes need a changeset entry.
@@ -251,6 +327,10 @@ full price for the prompt once and cache rates after that.
 
 Large pull requests are split into batches of roughly 120,000 characters (about 34k
 tokens); `max_files` and `max_chars_per_batch` in the config file bound the worst case.
+On the output side, `max_response_tokens` is the starting budget per reply, doubling on a
+truncated answer up to three times. Only generated tokens are billed, so the ceiling
+itself is free; on a reasoning model, though, the thinking is generated and billed too,
+and is usually the larger half.
 Lockfiles, generated code, minified bundles, and binaries are excluded before anything is
 sent.
 
@@ -311,6 +391,17 @@ check `permissions:` against the table in Quick start.
 **Comments appear in the summary instead of inline.** The model anchored to a line that is
 not part of the diff, so the finding was folded into the summary rather than dropped. This
 is expected occasionally; if it is most of them, the model is likely too small for the job.
+
+**"never finished the JSON answer within N output tokens".** Every rung of the retry
+ladder was spent: thinking off, budget doubled three times, and the reply was still cut
+off. The message names which wall it hit. If it went on reasoning, lowering
+`max_chars_per_batch` will not fix it — set `reasoning: none`, or use `request_options`
+if your endpoint ignores `reasoning_effort`. See [Reasoning models](#reasoning-models).
+
+**A finding trails off mid-sentence, or the summary asks you to paste the code.** The
+model's chain of thought reached the reply instead of its answer. Hawky strips `<think>`
+blocks and `reasoning_content` before parsing, so an older version is the likely cause;
+`reasoning: none` removes it at the source.
 
 **The same comments keep reappearing on every push.** Fingerprints live in a hidden HTML
 comment on each posted comment. Deleting or editing those comments loses the record.
