@@ -8,8 +8,16 @@ import type { DiffFile, Finding, Severity } from '../src/types.js';
 const LIST_REVIEW_COMMENTS = Symbol('pulls.listReviewComments');
 const LIST_ISSUE_COMMENTS = Symbol('issues.listComments');
 
+interface ReviewCommentStub {
+  body: string;
+  id?: number;
+  in_reply_to_id?: number;
+  author_association?: string;
+  user?: { login: string };
+}
+
 /** Minimal Octokit stand-in: only the calls postReview actually makes. */
-function stubOctokit(existingReviewComments: Array<{ body: string }>) {
+function stubOctokit(existingReviewComments: ReviewCommentStub[]) {
   return {
     paginate: async (route: unknown) => {
       if (route === LIST_REVIEW_COMMENTS) return existingReviewComments;
@@ -35,6 +43,7 @@ const cfg = {
   maxComments: 15,
   dryRun: false,
   failOnSeverity: 'none',
+  dismissals: 'command',
 } as Config;
 
 function file(path: string): DiffFile {
@@ -61,7 +70,7 @@ function finding(severity: Severity, title: string, confidence = 0.9): Finding {
   };
 }
 
-const post = (findings: Finding[], existing: Array<{ body: string }> = []) =>
+const post = (findings: Finding[], existing: ReviewCommentStub[] = []) =>
   postReview(stubOctokit(existing), 'o', 'r', 1, 'sha', 'summary', findings, [file('src/a.ts')], cfg);
 
 test('gating severity reflects the highest finding that cleared the filters', async () => {
@@ -80,6 +89,45 @@ test('gating severity survives a finding already commented on by an earlier run'
   assert.equal(result.highestSeverity, 'critical');
 });
 
+/** The finding comment hawky left, plus a maintainer's reply waiving it. */
+function waived(f: Finding, reason = 'x is validated in the caller'): ReviewCommentStub[] {
+  return [
+    { id: 10, body: marker('finding', findingFingerprint(f.path, f.category, f.title)) },
+    {
+      id: 11,
+      in_reply_to_id: 10,
+      body: `@hawky ignore ${reason}`,
+      author_association: 'COLLABORATOR',
+      user: { login: 'alice' },
+    },
+  ];
+}
+
+test('a finding a reviewer waived stops gating', async () => {
+  // The deadlock this exists to break: without a waiver the gate re-reads the
+  // same false positive on every push, and only a code change clears it.
+  const f = finding('critical', 'b');
+
+  const result = await post([f], waived(f));
+
+  assert.equal(result.highestSeverity, null);
+  assert.equal(result.dismissed.length, 1);
+  assert.equal(result.dismissed[0].dismissal.by, 'alice');
+});
+
+test('a waived finding is not reposted either', async () => {
+  const f = finding('critical', 'b');
+  const result = await post([f], waived(f));
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.unanchored.length, 0);
+});
+
+test('waiving one finding leaves the rest gating', async () => {
+  const f = finding('high', 'b');
+  const result = await post([f, finding('critical', 'c')], waived(f));
+  assert.equal(result.highestSeverity, 'critical');
+});
+
 test('findings below the severity or confidence floor do not gate', async () => {
   const result = await post([finding('low', 'a'), finding('critical', 'b', 0.1)]);
   assert.equal(result.highestSeverity, null);
@@ -92,11 +140,11 @@ test('a finding outside the reviewed diff does not gate', async () => {
 });
 
 /** Same stand-in, but keeps whatever body the sticky summary comment was given. */
-function capturingOctokit() {
+function capturingOctokit(existingReviewComments: ReviewCommentStub[] = []) {
   const bodies: string[] = [];
   const octokit = {
     paginate: async (route: unknown) => {
-      if (route === LIST_REVIEW_COMMENTS) return [];
+      if (route === LIST_REVIEW_COMMENTS) return existingReviewComments;
       if (route === LIST_ISSUE_COMMENTS) return [];
       throw new Error('unexpected paginate route');
     },
@@ -158,4 +206,27 @@ test('a partly reviewed diff is reported as a failure, not a pass', async () => 
   const body = await postWith({ failOnSeverity: 'high' }, [finding('medium', 'a')], true);
   assert.match(body, /\*\*Failed\.\*\*/);
   assert.match(body, /could not be reviewed/);
+});
+
+test('the summary names who waived a finding and why', async () => {
+  const f = finding('critical', 'b');
+  const { octokit, bodies } = capturingOctokit(waived(f, 'the caller already checks this'));
+  await postReview(octokit, 'o', 'r', 1, 'sha', 'summary', [f], [file('src/a.ts')], {
+    ...cfg,
+    failOnSeverity: 'high',
+  } as Config);
+
+  const body = bodies[0] ?? '';
+  assert.match(body, /\*\*Passed\.\*\*/);
+  // A check that is green only because of a waiver has to say so where the
+  // person clicking merge will see it.
+  assert.match(body, /1 finding waived by a reviewer/);
+  assert.match(body, /@alice waived it: the caller already checks this/);
+});
+
+test('the summary prints an id for findings that could not be anchored', async () => {
+  // There is no thread to reply in for these, so the id is the only way to waive one.
+  const stray = { ...finding('high', 'a'), line: 99 };
+  const body = await postWith({}, [stray]);
+  assert.match(body, new RegExp(findingFingerprint(stray.path, stray.category, stray.title)));
 });

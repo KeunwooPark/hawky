@@ -1,4 +1,5 @@
 import * as core from '@actions/core';
+import * as github from '@actions/github';
 import { loadConfig } from './config.js';
 import { makeProvider } from './llm/index.js';
 import { buildSystemPrompt, buildUserPrompt } from './prompts.js';
@@ -8,6 +9,7 @@ import { makeOctokit, resolveTarget } from './gh/client.js';
 import { batchFiles, getCompareDiff, getPullRequestDiff } from './gh/diff.js';
 import { postReview } from './gh/review.js';
 import { postRefactorIssues } from './gh/issues.js';
+import { isHawkyComment } from './util/fingerprint.js';
 
 function mergeSummaries(summaries: string[], fallback: string): string {
   const clean = summaries.map((s) => s.trim()).filter(Boolean);
@@ -27,6 +29,22 @@ function logUsage(total: Usage, calls: number): void {
 }
 
 /**
+ * True when this run was set off by a comment this action itself wrote.
+ *
+ * Wiring `issue_comment` or `pull_request_review_comment` as a trigger — which is
+ * what you do so a dismissal takes effect without a push — otherwise loops: every
+ * review comment and every summary update fires the workflow again, at the price
+ * of a full re-review each time.
+ */
+function selfTriggered(): boolean {
+  const comment = github.context.payload.comment as
+    | { body?: string; user?: { type?: string } }
+    | undefined;
+  if (!comment) return false;
+  return comment.user?.type === 'Bot' || isHawkyComment(comment.body);
+}
+
+/**
  * Written before anything that can throw so a job that gates on these outputs
  * reads a definite verdict even when the run dies early.
  */
@@ -37,6 +55,15 @@ function setVerdict(passed: boolean, highest: Severity | null): void {
 
 async function run(): Promise<void> {
   setVerdict(false, null);
+  if (selfTriggered()) {
+    core.info('Triggered by one of this action\'s own comments; nothing to do.');
+    core.setOutput('findings-count', 0);
+    core.setOutput('dismissed-count', 0);
+    core.setOutput('issues-created', 0);
+    core.setOutput('summary', 'Skipped: triggered by this action\'s own comment.');
+    setVerdict(true, null);
+    return;
+  }
   const cfg = loadConfig();
   const octokit = makeOctokit(cfg.githubToken);
   const target = await resolveTarget(octokit);
@@ -55,6 +82,7 @@ async function run(): Promise<void> {
   if (!files.length) {
     core.info('Nothing to review after filtering. Exiting.');
     core.setOutput('findings-count', 0);
+    core.setOutput('dismissed-count', 0);
     core.setOutput('issues-created', 0);
     core.setOutput('summary', 'No reviewable changes.');
     setVerdict(true, null);
@@ -119,6 +147,7 @@ async function run(): Promise<void> {
       : 'No defects found in the reviewed diff.',
   );
   let findingsPosted = 0;
+  let dismissedCount = 0;
   let issuesCreated = 0;
   let highest: Severity | null = null;
   // A run that only reviewed part of the diff cannot honestly report a pass.
@@ -138,7 +167,16 @@ async function run(): Promise<void> {
       incomplete,
     );
     findingsPosted = result.posted.length + result.unanchored.length;
+    dismissedCount = result.dismissed.length;
     highest = result.highestSeverity;
+    for (const { finding, dismissal } of result.dismissed) {
+      // In the log as well as on the pull request: a check that went green on a
+      // waiver should be answerable from the run alone.
+      core.info(
+        `Waived by @${dismissal.by} (${dismissal.via}): ${finding.severity} ${finding.path}:${finding.line} ` +
+          `— ${finding.title} — ${dismissal.reason}`,
+      );
+    }
   } else if (cfg.mode !== 'refactor') {
     core.warning('mode includes review but this event is not attached to a pull request; skipping inline comments.');
   }
@@ -162,10 +200,12 @@ async function run(): Promise<void> {
   core.info(
     cfg.failOnSeverity === 'none'
       ? `Gate: off (fail-on-severity is not set). Highest severity found: ${highest ?? 'none'}. This run cannot fail on findings.`
-      : `Gate: fail-on-severity=${cfg.failOnSeverity}, highest severity found=${highest ?? 'none'} -> ${gated ? 'FAIL' : 'pass'}.`,
+      : `Gate: fail-on-severity=${cfg.failOnSeverity}, highest severity found=${highest ?? 'none'} -> ${gated ? 'FAIL' : 'pass'}` +
+        (dismissedCount ? `, after ${dismissedCount} waived by a reviewer.` : '.'),
   );
 
   core.setOutput('findings-count', findingsPosted);
+  core.setOutput('dismissed-count', dismissedCount);
   core.setOutput('issues-created', issuesCreated);
   core.setOutput('summary', summary);
   setVerdict(!gated && !incomplete, highest);
@@ -175,6 +215,7 @@ async function run(): Promise<void> {
     .addRaw(summary)
     .addList([
       `${findingsPosted} finding(s) reported`,
+      `${dismissedCount} finding(s) waived by a reviewer`,
       `Highest severity: ${highest ?? 'none'}`,
       cfg.failOnSeverity === 'none'
         ? 'Gate: off (fail-on-severity is not set)'
@@ -185,7 +226,12 @@ async function run(): Promise<void> {
     .write();
 
   if (gated) {
-    core.setFailed(`Found a ${highest}-severity issue and fail-on-severity is set to ${cfg.failOnSeverity}.`);
+    core.setFailed(
+      `Found a ${highest}-severity issue and fail-on-severity is set to ${cfg.failOnSeverity}.` +
+        (cfg.dismissals === 'off'
+          ? ''
+          : ' If it is wrong, reply `@hawky ignore <reason>` in its thread and re-run this check.'),
+    );
   } else if (incomplete) {
     core.setFailed(
       `${failedBatches} of ${batches.length} batch(es) failed, so the diff was only partly reviewed ` +

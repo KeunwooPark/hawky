@@ -224,11 +224,13 @@ Every input is optional except `api-key`.
 | `guidelines` | — | Project conventions injected into the prompt. |
 | `fail-on-severity` | `none` | Fail the check at or above this severity. |
 | `fail-on-incomplete` | `false` | Fail the check if part of the diff could not be reviewed. |
+| `dismissals` | `all` | How a reviewer waives a false positive: `all`, `command`, or `off`. See [Waiving a false positive](#waiving-a-false-positive). |
 | `max-issues` | `3` | Cap on refactoring issues per run. |
 | `issue-labels` | `hawky,refactor` | Labels applied to refactoring issues. |
 | `dry-run` | `false` | Log what would be posted without posting it. |
 
-Outputs: `review-passed`, `highest-severity`, `findings-count`, `issues-created`, `summary`.
+Outputs: `review-passed`, `highest-severity`, `findings-count`, `dismissed-count`,
+`issues-created`, `summary`.
 
 ### Blocking pull requests
 
@@ -256,7 +258,8 @@ Three details matter if you rely on this:
 
 - The gate looks at every finding that clears `min-severity` and `min-confidence`,
   including ones an earlier run already commented on. Pushing again does not clear a
-  finding the model still reports — fixing the code does.
+  finding the model still reports — fixing the code does, or waiving it does when the
+  model is wrong.
 - `fail-on-incomplete: true` also fails the check when an LLM call errors out and part of
   the diff went unreviewed. Without it, a partly-reviewed diff can report a pass.
 - The step still posts its comments before failing, so authors see what to fix.
@@ -272,6 +275,59 @@ Two ways to set the threshold and get nothing: a value that is not
 `low`/`medium`/`high`/`critical`/`none`, and `fail-on-severity` written in kebab case in
 `.github/hawky.yml`, which takes `fail_on_severity`. Both used to fall back to `none` in
 silence; both now warn in the run log.
+
+### Waiving a false positive
+
+A gate with no way past it is a deadlock the first time the model is wrong: the gate
+re-reads every finding on every push, so pushing more commits does not clear one — only
+changing code the reviewer has already decided is correct would, and that is the wrong
+fix.
+
+So a maintainer can waive a finding. Reply in its thread:
+
+```
+@hawky ignore the caller already validates this, see auth.ts:88
+```
+
+Or resolve the review thread, which means the same thing. Either way the next run drops
+that finding: it stops gating, and it is not reposted.
+
+Findings that could not be anchored to a changed line live in the summary comment instead
+of a thread, so the summary prints an id for each one. Name it in a comment on the pull
+request:
+
+```
+@hawky ignore 4f2c9a1b7e0d3c56 generated file, not hand-edited
+```
+
+**The check does not turn green on its own.** A required status check belongs to the head
+commit, and a comment does not produce a new one. After waiving, re-run the job:
+Actions -> the failed run -> **Re-run failed jobs**. Same number of clicks as an admin
+override, and unlike an override it leaves a record.
+
+Three things keep this from being a hole in the gate:
+
+- **Only people who could merge anyway.** The command is honoured from repository owners,
+  members, and collaborators. A drive-by comment on a public pull request is logged and
+  ignored. Resolving a thread is open to the pull request author too, so that route is
+  permission-checked separately — and if the token cannot answer the permission question,
+  the resolution does not count and the run says so.
+- **It is on the record.** The summary comment lists every waived finding with who waived
+  it and why, the verdict line says the check is only green because of them, and the same
+  goes to the run log and the job summary. `dismissed-count` is available as an output.
+- **It is reversible.** Delete the comment that waived a finding (or unresolve its thread)
+  and it gates again on the next run.
+
+Narrow or remove the escape hatch with `dismissals`:
+
+| Value | Waives a finding |
+| --- | --- |
+| `all` (default) | An `@hawky ignore` reply, or resolving the thread |
+| `command` | The reply only — resolving a thread is a weaker signal, and people resolve threads casually |
+| `off` | Nothing. The gate is absolute. |
+
+An unrecognised value here falls back to `off`, not to the default: a typo should not open
+a route past the gate.
 
 To report the verdict without blocking, leave `fail-on-severity` at `none` and read the
 outputs instead. They are written even when the step fails, so pair them with `if: always()`:
@@ -303,6 +359,11 @@ exclude:
 # Set to false to review lockfiles, dist/, minified output, and so on.
 exclude_defaults: true
 
+# How a reviewer waives a false positive so it stops blocking the merge:
+# "all" (an `@hawky ignore` reply, or resolving the thread), "command" (the
+# reply only), or "off" (nothing waives a finding).
+dismissals: all
+
 # Extra fields merged into the request body, for endpoint-specific knobs.
 # Passed through verbatim, so a typo here reaches the server.
 request_options: {}
@@ -327,6 +388,9 @@ The defaults are tuned so a reviewer reads the comments rather than muting the b
   file above it is still recognised as the same finding on the next push.
 - **Closed issues stay closed.** A refactoring issue you close is a decision; it is never
   reopened or refiled.
+- **A waived finding stays waived.** `@hawky ignore` in a thread is a decision too; the
+  finding stops gating and is not reposted. See
+  [Waiving a false positive](#waiving-a-false-positive).
 
 If the reviews are still too chatty, raise `min_severity` to `high` before lowering
 `max_comments` — you want fewer *kinds* of comment, not a truncated list.

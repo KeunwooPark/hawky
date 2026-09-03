@@ -39821,6 +39821,7 @@ const DEFAULT_EXCLUDES = [
 ];
 const SEVERITIES = ['low', 'medium', 'high', 'critical'];
 const REASONING_LEVELS = ['auto', 'none', 'minimal', 'low', 'medium', 'high'];
+const DISMISSAL_MODES = ['all', 'command', 'off'];
 /**
  * Every key `loadConfig` reads out of the YAML file. A key that is not here was
  * silently ignored before, which is indistinguishable from the feature not
@@ -39841,6 +39842,7 @@ const KNOWN_FILE_KEYS = [
     'guidelines',
     'fail_on_severity',
     'fail_on_incomplete',
+    'dismissals',
     'max_issues',
     'issue_labels',
     'dry_run',
@@ -39889,6 +39891,25 @@ function pickReasoning(value) {
         return 'none';
     core.warning(`Unknown reasoning level "${v}"; leaving the endpoint default in place.`);
     return 'auto';
+}
+/**
+ * Unknown values degrade to `off` rather than to the default. This is the one
+ * setting whose fallback should be the stricter behaviour: a typo that quietly
+ * opened a route past the merge gate is worse than one that leaves it shut and
+ * says so.
+ */
+function pickDismissals(value) {
+    const v = (value ?? '').toLowerCase();
+    if (!v)
+        return 'all';
+    if (DISMISSAL_MODES.includes(v))
+        return v;
+    if (['true', 'yes', 'on'].includes(v))
+        return 'all';
+    if (['false', 'no', 'none'].includes(v))
+        return 'off';
+    core.warning(`Unknown dismissals mode "${v}"; no finding can be waived on this run. Use one of: ${DISMISSAL_MODES.join(' | ')}.`);
+    return 'off';
 }
 function pickSeverity(value, fallback, label) {
     const v = String(value ?? '').toLowerCase();
@@ -39976,6 +39997,7 @@ function loadConfig() {
         guidelines: pick('guidelines', 'guidelines') ?? '',
         failOnSeverity,
         failOnIncomplete: (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
+        dismissals: pickDismissals(pick('dismissals', 'dismissals')),
         maxIssues: num('max-issues', 'max_issues', 3),
         issueLabels: (() => {
             const l = [...splitList(input('issue-labels')), ...asStringList(file.issue_labels)];
@@ -40298,6 +40320,248 @@ function batchFiles(files, maxChars) {
 
 /***/ }),
 
+/***/ 3069:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.readThreadState = readThreadState;
+const core = __importStar(__nccwpck_require__(7484));
+const fingerprint_js_1 = __nccwpck_require__(7284);
+/**
+ * Author associations trusted to waive a finding. Anyone can comment on a public
+ * pull request, so the command is only honoured from people who could have
+ * merged it anyway — otherwise the merge gate is bypassable by a stranger.
+ */
+const AUTHORIZED = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+/** `@hawky ignore <optional finding id> <optional reason>`, on a line of its own. */
+const COMMAND = /^[ \t>]*[@/]hawky[ \t]+(?:ignore|dismiss|false[- ]?positive)\b[ \t:,-]*(.*)$/im;
+/** The 16-hex finding id, when the command names one instead of replying in a thread. */
+const EXPLICIT_ID = /^([0-9a-f]{16})\b[ \t:,-]*(.*)$/;
+const NO_REASON = 'no reason given';
+function parseCommand(body) {
+    if (!body)
+        return null;
+    const m = COMMAND.exec(body);
+    if (!m)
+        return null;
+    const rest = (m[1] ?? '').trim();
+    const explicit = EXPLICIT_ID.exec(rest);
+    if (explicit)
+        return { id: explicit[1], reason: explicit[2].trim() || NO_REASON };
+    return { reason: rest || NO_REASON };
+}
+function authorized(comment) {
+    return AUTHORIZED.has((comment.author_association ?? '').toUpperCase());
+}
+function login(comment) {
+    return comment.user?.login ?? 'unknown';
+}
+/**
+ * Threads GitHub reports as resolved, with the login that resolved them.
+ *
+ * REST does not expose `isResolved`, so this is the one GraphQL call in the
+ * action. It is best-effort: an endpoint or token that refuses the query costs
+ * the resolve gesture, not the run, and the `@hawky ignore` command still works.
+ */
+async function resolvedThreads(octokit, owner, repo, pullNumber) {
+    const query = `
+    query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $number) {
+          reviewThreads(first: 100, after: $cursor) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              isResolved
+              resolvedBy { login }
+              comments(first: 5) { nodes { body } }
+            }
+          }
+        }
+      }
+    }`;
+    const out = [];
+    let cursor = null;
+    // Bounded so a pathological pull request cannot spin here.
+    for (let page = 0; page < 10; page++) {
+        const data = await octokit.graphql(query, { owner, repo, number: pullNumber, cursor });
+        const threads = data.repository?.pullRequest?.reviewThreads;
+        if (!threads)
+            break;
+        for (const thread of threads.nodes) {
+            if (!thread.isResolved || !thread.resolvedBy)
+                continue;
+            const fingerprints = thread.comments.nodes.flatMap((c) => (0, fingerprint_js_1.extractFingerprints)(c.body, 'finding'));
+            if (fingerprints.length)
+                out.push({ by: thread.resolvedBy.login, fingerprints });
+        }
+        if (!threads.pageInfo.hasNextPage)
+            break;
+        cursor = threads.pageInfo.endCursor;
+    }
+    return out;
+}
+/**
+ * Can this login merge? Resolving a thread is open to the pull request's author
+ * as well as to maintainers, and on a fork that author is a stranger, so the
+ * resolve gesture needs a permission check the `@hawky ignore` command gets for
+ * free from `author_association`.
+ *
+ * Degrades closed: a token that cannot answer the question does not get to waive
+ * the gate. It says so once, rather than quietly weakening the check.
+ */
+function writeAccessChecker(octokit, owner, repo) {
+    const cache = new Map();
+    let warned = false;
+    return (username) => {
+        let hit = cache.get(username);
+        if (!hit) {
+            hit = octokit.rest.repos
+                .getCollaboratorPermissionLevel({ owner, repo, username })
+                .then(({ data }) => ['admin', 'write', 'maintain'].includes(data.permission))
+                .catch((err) => {
+                if (!warned) {
+                    warned = true;
+                    core.warning(`Could not check repository permissions (${err.message}), so resolving a thread ` +
+                        'will not waive a finding on this run. Reply `@hawky ignore <reason>` in the thread instead.');
+                }
+                return false;
+            });
+            cache.set(username, hit);
+        }
+        return hit;
+    };
+}
+/**
+ * What the pull request's existing comments say about findings from earlier runs:
+ * which ones have been reported, and which ones a reviewer has since waived.
+ *
+ * Without the second half a false positive is a deadlock — the gate re-reads every
+ * finding on every push, so the only way to turn the check green is to change code
+ * the reviewer has already decided is correct.
+ */
+async function readThreadState(octokit, owner, repo, pullNumber, issueComments, mode) {
+    const reviewComments = (await octokit.paginate(octokit.rest.pulls.listReviewComments, {
+        owner,
+        repo,
+        pull_number: pullNumber,
+        per_page: 100,
+    }));
+    const seen = new Set();
+    const byComment = new Map();
+    for (const c of reviewComments) {
+        const fingerprints = (0, fingerprint_js_1.extractFingerprints)(c.body, 'finding');
+        if (fingerprints.length)
+            byComment.set(c.id, fingerprints);
+        for (const fp of fingerprints)
+            seen.add(fp);
+    }
+    core.debug(`Found ${seen.size} finding(s) already commented on this PR.`);
+    const dismissed = new Map();
+    if (mode === 'off')
+        return { seen, dismissed };
+    const record = (fingerprints, dismissal) => {
+        for (const fp of fingerprints)
+            if (!dismissed.has(fp))
+                dismissed.set(fp, dismissal);
+    };
+    for (const c of reviewComments) {
+        // Our own comments explain the command, so they contain it. Skip them outright
+        // rather than relying on the explanation never looking like an invocation.
+        if ((0, fingerprint_js_1.isHawkyComment)(c.body))
+            continue;
+        const cmd = parseCommand(c.body);
+        if (!cmd)
+            continue;
+        if (!authorized(c)) {
+            core.warning(`Ignoring "@hawky ignore" from @${login(c)}: only a repository owner, member, or collaborator ` +
+                'can waive a finding.');
+            continue;
+        }
+        const targets = cmd.id ? [cmd.id] : (c.in_reply_to_id ? byComment.get(c.in_reply_to_id) : undefined);
+        if (!targets?.length) {
+            core.warning(`Ignoring "@hawky ignore" from @${login(c)}: reply inside the thread of the finding you want ` +
+                'waived, or name its id from the summary comment.');
+            continue;
+        }
+        record(targets, { by: login(c), reason: cmd.reason, via: 'command' });
+    }
+    // Pull-request-level comments have no thread to attach to, so they must name the
+    // finding. That is the only route for a finding GitHub would not let us anchor.
+    for (const c of issueComments) {
+        if ((0, fingerprint_js_1.isHawkyComment)(c.body))
+            continue;
+        const cmd = parseCommand(c.body);
+        if (!cmd)
+            continue;
+        if (!authorized(c)) {
+            core.warning(`Ignoring "@hawky ignore" from @${login(c)}: only a repository owner, member, or collaborator ` +
+                'can waive a finding.');
+            continue;
+        }
+        if (!cmd.id) {
+            core.warning(`Ignoring "@hawky ignore" from @${login(c)}: a pull request comment has to name the finding id ` +
+                'listed in the summary, e.g. `@hawky ignore 0123456789abcdef not reachable here`.');
+            continue;
+        }
+        record([cmd.id], { by: login(c), reason: cmd.reason, via: 'command' });
+    }
+    if (mode === 'all') {
+        try {
+            const canWrite = writeAccessChecker(octokit, owner, repo);
+            for (const thread of await resolvedThreads(octokit, owner, repo, pullNumber)) {
+                if (!(await canWrite(thread.by)))
+                    continue;
+                record(thread.fingerprints, { by: thread.by, reason: 'thread resolved', via: 'resolved' });
+            }
+        }
+        catch (err) {
+            core.warning(`Could not read resolved review threads (${err.message}); ` +
+                'only `@hawky ignore` comments will waive a finding on this run.');
+        }
+    }
+    if (dismissed.size)
+        core.info(`${dismissed.size} finding(s) waived by a reviewer.`);
+    return { seen, dismissed };
+}
+
+
+/***/ }),
+
 /***/ 8859:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -40507,6 +40771,7 @@ exports.postReview = postReview;
 const core = __importStar(__nccwpck_require__(7484));
 const types_js_1 = __nccwpck_require__(8522);
 const fingerprint_js_1 = __nccwpck_require__(7284);
+const dismissals_js_1 = __nccwpck_require__(3069);
 const SEVERITY_LABEL = {
     critical: 'Critical',
     high: 'High',
@@ -40559,27 +40824,32 @@ function renderComment(finding) {
  * summary, so a gate that was never switched on looked identical to one that
  * was switched on and found nothing.
  */
-function renderVerdict(highest, cfg, incomplete) {
+function renderVerdict(highest, cfg, incomplete, dismissed) {
     const found = highest ? `Highest severity found: **${SEVERITY_LABEL[highest]}**.` : 'Nothing found.';
+    // A check that is only green because someone waived a finding has to say so on
+    // the pull request, or the waiver is invisible to whoever approves it.
+    const waived = dismissed.length
+        ? ` ${dismissed.length} finding${dismissed.length === 1 ? '' : 's'} waived by a reviewer, listed below.`
+        : '';
     if (cfg.failOnSeverity === 'none') {
-        return `${found} Not gating — \`fail-on-severity\` is not set, so this check passes whatever is found.`;
+        return `${found} Not gating — \`fail-on-severity\` is not set, so this check passes whatever is found.${waived}`;
     }
     if (highest && severityAtLeast(highest, cfg.failOnSeverity)) {
-        return `❌ **Failed.** ${found} At or above the \`${cfg.failOnSeverity}\` threshold.`;
+        return `❌ **Failed.** ${found} At or above the \`${cfg.failOnSeverity}\` threshold.${waived}`;
     }
     if (incomplete) {
-        return `❌ **Failed.** ${found} Part of the diff could not be reviewed, so the result cannot be trusted as a gate.`;
+        return `❌ **Failed.** ${found} Part of the diff could not be reviewed, so the result cannot be trusted as a gate.${waived}`;
     }
-    return `✅ **Passed.** ${found} Below the \`${cfg.failOnSeverity}\` threshold.`;
+    return `✅ **Passed.** ${found} Below the \`${cfg.failOnSeverity}\` threshold.${waived}`;
 }
-function renderSummary(summary, posted, unanchored, cfg, dropped, highest, incomplete) {
+function renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, highest, incomplete) {
     const lines = [
         fingerprint_js_1.SUMMARY_MARKER,
         '## Hawky review',
         '',
         summary.trim(),
         '',
-        renderVerdict(highest, cfg, incomplete),
+        renderVerdict(highest, cfg, incomplete, dismissed),
         '',
     ];
     if (posted.length) {
@@ -40598,39 +40868,44 @@ function renderSummary(summary, posted, unanchored, cfg, dropped, highest, incom
     if (unanchored.length) {
         lines.push('<details><summary>Findings that could not be anchored to a changed line</summary>', '');
         for (const f of unanchored) {
-            lines.push(`- **${f.path}:${f.line}** — ${SEVERITY_LABEL[f.severity]} · ${f.title}`, '', `  ${f.body.trim().replace(/\n/g, '\n  ')}`, '');
+            // The id is the only handle on these: there is no thread to reply in, so a
+            // false positive here can only be waived by naming it.
+            const id = (0, fingerprint_js_1.findingFingerprint)(f.path, f.category, f.title);
+            lines.push(`- **${f.path}:${f.line}** — ${SEVERITY_LABEL[f.severity]} · ${f.title} \`${id}\``, '', `  ${f.body.trim().replace(/\n/g, '\n  ')}`, '');
         }
         lines.push('</details>', '');
+    }
+    if (dismissed.length) {
+        lines.push(`<details><summary>${dismissed.length} finding${dismissed.length === 1 ? '' : 's'} waived by a reviewer</summary>`, '');
+        for (const { finding: f, dismissal: d } of dismissed) {
+            const how = d.via === 'resolved' ? 'resolved the thread' : 'waived it';
+            lines.push(`- **${f.path}:${f.line}** — ${SEVERITY_LABEL[f.severity]} · ${f.title}` +
+                ` — @${d.by} ${how}: ${d.reason}`);
+        }
+        lines.push('', 'These do not gate the merge. Reverse one by deleting the comment that waived it ' +
+            '(or unresolving its thread) and re-running this check.', '', '</details>', '');
     }
     if (dropped) {
         lines.push(`_${dropped} lower-signal finding${dropped === 1 ? '' : 's'} filtered out ` +
             `(below \`${cfg.minSeverity}\` severity or \`${cfg.minConfidence}\` confidence, or already commented on)._`, '');
     }
+    if (cfg.dismissals !== 'off') {
+        lines.push('<sub>Wrong about something? Reply `@hawky ignore <reason>` in its thread' +
+            (cfg.dismissals === 'all' ? ', or resolve the thread,' : '') +
+            ' and re-run this check.</sub>', '');
+    }
     lines.push(`<sub>Reviewed by ${cfg.provider}/${cfg.model}. Re-run by pushing a commit.</sub>`);
     return lines.join('\n');
 }
-async function existingFindingFingerprints(octokit, owner, repo, pull_number) {
-    const comments = await octokit.paginate(octokit.rest.pulls.listReviewComments, {
-        owner,
-        repo,
-        pull_number,
-        per_page: 100,
-    });
-    const seen = new Set();
-    for (const c of comments) {
-        for (const fp of (0, fingerprint_js_1.extractFingerprints)(c.body, 'finding'))
-            seen.add(fp);
-    }
-    core.debug(`Found ${seen.size} finding(s) already commented on this PR.`);
-    return seen;
-}
-async function upsertSummary(octokit, owner, repo, issue_number, body) {
-    const comments = await octokit.paginate(octokit.rest.issues.listComments, {
+async function listIssueComments(octokit, owner, repo, issue_number) {
+    return (await octokit.paginate(octokit.rest.issues.listComments, {
         owner,
         repo,
         issue_number,
         per_page: 100,
-    });
+    }));
+}
+async function upsertSummary(octokit, owner, repo, issue_number, comments, body) {
     const existing = comments.find((c) => c.body?.includes(fingerprint_js_1.SUMMARY_MARKER));
     if (existing) {
         await octokit.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
@@ -40645,16 +40920,28 @@ async function postReview(octokit, owner, repo, pull_number, commit_id, summary,
 /** Some of the diff could not be reviewed and the run is configured to fail on that. */
 incomplete = false) {
     const byPath = new Map(files.map((f) => [f.path, f]));
-    const alreadyPosted = cfg.dryRun
-        ? new Set()
-        : await existingFindingFingerprints(octokit, owner, repo, pull_number);
+    const issueComments = cfg.dryRun ? [] : await listIssueComments(octokit, owner, repo, pull_number);
+    const { seen: alreadyPosted, dismissed: waived } = cfg.dryRun
+        ? { seen: new Set(), dismissed: new Map() }
+        : await (0, dismissals_js_1.readThreadState)(octokit, owner, repo, pull_number, issueComments, cfg.dismissals);
     const before = findings.length;
     const qualified = findings
         .filter((f) => byPath.has(f.path))
         .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
         .filter((f) => (f.confidence ?? 0) >= cfg.minConfidence)
         .sort((a, b) => types_js_1.SEVERITY_ORDER[b.severity] - types_js_1.SEVERITY_ORDER[a.severity] || (b.confidence ?? 0) - (a.confidence ?? 0));
-    const kept = qualified
+    // A waived finding leaves the run entirely: it does not gate, and it is not
+    // reposted either, so re-reviewing does not resurrect the argument.
+    const dismissed = [];
+    const active = [];
+    for (const f of qualified) {
+        const d = waived.get((0, fingerprint_js_1.findingFingerprint)(f.path, f.category, f.title));
+        if (d)
+            dismissed.push({ finding: f, dismissal: d });
+        else
+            active.push(f);
+    }
+    const kept = active
         .filter((f) => !alreadyPosted.has((0, fingerprint_js_1.findingFingerprint)(f.path, f.category, f.title)))
         .slice(0, cfg.maxComments);
     const posted = [];
@@ -40676,18 +40963,20 @@ incomplete = false) {
             ...(anchor.startLine ? { start_line: anchor.startLine, start_side: 'RIGHT' } : {}),
         });
     }
-    const dropped = before - posted.length - unanchored.length;
+    // Waived findings are reported in their own section, so they must not also be
+    // counted among the ones quietly filtered out.
+    const dropped = before - posted.length - unanchored.length - dismissed.length;
     // Gate on everything that survived the quality filters, whether or not GitHub
     // let us anchor it inline and whether or not an earlier run already commented
     // on it: an unresolved critical finding is still critical on the second push.
-    const highestSeverity = qualified.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
-    const summaryBody = renderSummary(summary, posted, unanchored, cfg, dropped, highestSeverity, incomplete);
+    const highestSeverity = active.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
+    const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, highestSeverity, incomplete);
     if (cfg.dryRun) {
         core.info('[dry-run] Would post the following review:');
         core.info(summaryBody);
         for (const c of comments)
             core.info(JSON.stringify(c, null, 2));
-        return { posted, unanchored, highestSeverity };
+        return { posted, unanchored, dismissed, highestSeverity };
     }
     if (comments.length) {
         try {
@@ -40708,12 +40997,12 @@ incomplete = false) {
             core.warning(`Could not post inline comments (${err.message}). Including them in the summary instead.`);
             unanchored.push(...posted);
             posted.length = 0;
-            await upsertSummary(octokit, owner, repo, pull_number, renderSummary(summary, [], unanchored, cfg, dropped, highestSeverity, incomplete));
-            return { posted, unanchored, highestSeverity };
+            await upsertSummary(octokit, owner, repo, pull_number, issueComments, renderSummary(summary, [], unanchored, dismissed, cfg, dropped, highestSeverity, incomplete));
+            return { posted, unanchored, dismissed, highestSeverity };
         }
     }
-    await upsertSummary(octokit, owner, repo, pull_number, summaryBody);
-    return { posted, unanchored, highestSeverity };
+    await upsertSummary(octokit, owner, repo, pull_number, issueComments, summaryBody);
+    return { posted, unanchored, dismissed, highestSeverity };
 }
 
 
@@ -41595,6 +41884,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core = __importStar(__nccwpck_require__(7484));
+const github = __importStar(__nccwpck_require__(3228));
 const config_js_1 = __nccwpck_require__(2973);
 const index_js_1 = __nccwpck_require__(6627);
 const prompts_js_1 = __nccwpck_require__(6224);
@@ -41604,6 +41894,7 @@ const client_js_1 = __nccwpck_require__(7780);
 const diff_js_1 = __nccwpck_require__(164);
 const review_js_1 = __nccwpck_require__(3199);
 const issues_js_1 = __nccwpck_require__(8859);
+const fingerprint_js_1 = __nccwpck_require__(7284);
 function mergeSummaries(summaries, fallback) {
     const clean = summaries.map((s) => s.trim()).filter(Boolean);
     if (clean.length <= 1)
@@ -41619,6 +41910,20 @@ function logUsage(total, calls) {
         '.');
 }
 /**
+ * True when this run was set off by a comment this action itself wrote.
+ *
+ * Wiring `issue_comment` or `pull_request_review_comment` as a trigger — which is
+ * what you do so a dismissal takes effect without a push — otherwise loops: every
+ * review comment and every summary update fires the workflow again, at the price
+ * of a full re-review each time.
+ */
+function selfTriggered() {
+    const comment = github.context.payload.comment;
+    if (!comment)
+        return false;
+    return comment.user?.type === 'Bot' || (0, fingerprint_js_1.isHawkyComment)(comment.body);
+}
+/**
  * Written before anything that can throw so a job that gates on these outputs
  * reads a definite verdict even when the run dies early.
  */
@@ -41628,6 +41933,15 @@ function setVerdict(passed, highest) {
 }
 async function run() {
     setVerdict(false, null);
+    if (selfTriggered()) {
+        core.info('Triggered by one of this action\'s own comments; nothing to do.');
+        core.setOutput('findings-count', 0);
+        core.setOutput('dismissed-count', 0);
+        core.setOutput('issues-created', 0);
+        core.setOutput('summary', 'Skipped: triggered by this action\'s own comment.');
+        setVerdict(true, null);
+        return;
+    }
     const cfg = (0, config_js_1.loadConfig)();
     const octokit = (0, client_js_1.makeOctokit)(cfg.githubToken);
     const target = await (0, client_js_1.resolveTarget)(octokit);
@@ -41641,6 +41955,7 @@ async function run() {
     if (!files.length) {
         core.info('Nothing to review after filtering. Exiting.');
         core.setOutput('findings-count', 0);
+        core.setOutput('dismissed-count', 0);
         core.setOutput('issues-created', 0);
         core.setOutput('summary', 'No reviewable changes.');
         setVerdict(true, null);
@@ -41695,6 +42010,7 @@ async function run() {
         ? 'The model returned no summary; see the individual findings below.'
         : 'No defects found in the reviewed diff.');
     let findingsPosted = 0;
+    let dismissedCount = 0;
     let issuesCreated = 0;
     let highest = null;
     // A run that only reviewed part of the diff cannot honestly report a pass.
@@ -41702,7 +42018,14 @@ async function run() {
     if (cfg.mode !== 'refactor' && target.pullNumber) {
         const result = await (0, review_js_1.postReview)(octokit, target.owner, target.repo, target.pullNumber, target.headSha, summary, findings, files, cfg, incomplete);
         findingsPosted = result.posted.length + result.unanchored.length;
+        dismissedCount = result.dismissed.length;
         highest = result.highestSeverity;
+        for (const { finding, dismissal } of result.dismissed) {
+            // In the log as well as on the pull request: a check that went green on a
+            // waiver should be answerable from the run alone.
+            core.info(`Waived by @${dismissal.by} (${dismissal.via}): ${finding.severity} ${finding.path}:${finding.line} ` +
+                `— ${finding.title} — ${dismissal.reason}`);
+        }
     }
     else if (cfg.mode !== 'refactor') {
         core.warning('mode includes review but this event is not attached to a pull request; skipping inline comments.');
@@ -41715,8 +42038,10 @@ async function run() {
     // answerable from the run log alone, without re-reading the workflow file.
     core.info(cfg.failOnSeverity === 'none'
         ? `Gate: off (fail-on-severity is not set). Highest severity found: ${highest ?? 'none'}. This run cannot fail on findings.`
-        : `Gate: fail-on-severity=${cfg.failOnSeverity}, highest severity found=${highest ?? 'none'} -> ${gated ? 'FAIL' : 'pass'}.`);
+        : `Gate: fail-on-severity=${cfg.failOnSeverity}, highest severity found=${highest ?? 'none'} -> ${gated ? 'FAIL' : 'pass'}` +
+            (dismissedCount ? `, after ${dismissedCount} waived by a reviewer.` : '.'));
     core.setOutput('findings-count', findingsPosted);
+    core.setOutput('dismissed-count', dismissedCount);
     core.setOutput('issues-created', issuesCreated);
     core.setOutput('summary', summary);
     setVerdict(!gated && !incomplete, highest);
@@ -41725,6 +42050,7 @@ async function run() {
         .addRaw(summary)
         .addList([
         `${findingsPosted} finding(s) reported`,
+        `${dismissedCount} finding(s) waived by a reviewer`,
         `Highest severity: ${highest ?? 'none'}`,
         cfg.failOnSeverity === 'none'
             ? 'Gate: off (fail-on-severity is not set)'
@@ -41734,7 +42060,10 @@ async function run() {
     ])
         .write();
     if (gated) {
-        core.setFailed(`Found a ${highest}-severity issue and fail-on-severity is set to ${cfg.failOnSeverity}.`);
+        core.setFailed(`Found a ${highest}-severity issue and fail-on-severity is set to ${cfg.failOnSeverity}.` +
+            (cfg.dismissals === 'off'
+                ? ''
+                : ' If it is wrong, reply `@hawky ignore <reason>` in its thread and re-run this check.'));
     }
     else if (incomplete) {
         core.setFailed(`${failedBatches} of ${batches.length} batch(es) failed, so the diff was only partly reviewed ` +
@@ -41937,6 +42266,7 @@ exports.findingFingerprint = findingFingerprint;
 exports.refactorFingerprint = refactorFingerprint;
 exports.marker = marker;
 exports.extractFingerprints = extractFingerprints;
+exports.isHawkyComment = isHawkyComment;
 const node_crypto_1 = __nccwpck_require__(7598);
 const MARKER = 'hawky';
 const VERSION = 'v1';
@@ -41968,6 +42298,10 @@ function extractFingerprints(body, kind) {
     return [...body.matchAll(re)].map((m) => m[1]);
 }
 exports.SUMMARY_MARKER = `<!-- ${MARKER}:${VERSION}:summary -->`;
+/** True for a comment this action wrote, marker and all. */
+function isHawkyComment(body) {
+    return Boolean(body?.includes(`<!-- ${MARKER}:${VERSION}:`));
+}
 
 
 /***/ }),

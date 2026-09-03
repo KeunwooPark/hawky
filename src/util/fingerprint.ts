@@ -36,3 +36,8 @@ export function extractFingerprints(body: string | null | undefined, kind: strin
 }
 
 export const SUMMARY_MARKER = `<!-- ${MARKER}:${VERSION}:summary -->`;
+
+/** True for a comment this action wrote, marker and all. */
+export function isHawkyComment(body: string | null | undefined): boolean {
+  return Boolean(body?.includes(`<!-- ${MARKER}:${VERSION}:`));
+}

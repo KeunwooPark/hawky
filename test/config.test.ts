@@ -102,3 +102,24 @@ test('an unrecognised config-file key is named rather than ignored', () => {
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /unknown key "fail_on_sevrity"/);
 });
+
+test('dismissals default to every gesture', () => {
+  const { cfg, warnings } = withInputs({});
+  assert.equal(cfg.dismissals, 'all');
+  assert.deepEqual(warnings, []);
+});
+
+test('dismissals can be narrowed to the command, or switched off', () => {
+  assert.equal(withInputs({ dismissals: 'command' }).cfg.dismissals, 'command');
+  assert.equal(withInputs({ dismissals: 'off' }).cfg.dismissals, 'off');
+  assert.equal(withInputs({}, 'dismissals: off\n').cfg.dismissals, 'off');
+});
+
+test('an unknown dismissals mode shuts the route off rather than opening it', () => {
+  // The opposite fallback to every other setting, and deliberately so: a typo
+  // that quietly opens a way past the merge gate is worse than one that leaves
+  // the gate shut and says why.
+  const { cfg, warnings } = withInputs({ dismissals: 'comand' });
+  assert.equal(cfg.dismissals, 'off');
+  assert.match(warnings.join('\n'), /Unknown dismissals mode "comand"/);
+});

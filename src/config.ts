@@ -15,6 +15,12 @@ export type ProviderName = 'anthropic' | 'openai';
  * how small the batch is.
  */
 export type Reasoning = 'auto' | 'none' | 'minimal' | 'low' | 'medium' | 'high';
+/**
+ * How a reviewer may waive a finding so it stops gating the merge. `command` is
+ * an `@hawky ignore` reply; `all` also accepts resolving the review thread;
+ * `off` makes the gate absolute, with no route past it but changing the code.
+ */
+export type Dismissals = 'all' | 'command' | 'off';
 
 export interface Config {
   provider: ProviderName;
@@ -32,6 +38,8 @@ export interface Config {
   failOnSeverity: Severity | 'none';
   /** Fail the check when some of the diff could not be reviewed at all. */
   failOnIncomplete: boolean;
+  /** Which reviewer gestures waive a finding for the purposes of the gate. */
+  dismissals: Dismissals;
   maxIssues: number;
   issueLabels: string[];
   dryRun: boolean;
@@ -93,6 +101,7 @@ const DEFAULT_EXCLUDES = [
 
 const SEVERITIES: Severity[] = ['low', 'medium', 'high', 'critical'];
 const REASONING_LEVELS: Reasoning[] = ['auto', 'none', 'minimal', 'low', 'medium', 'high'];
+const DISMISSAL_MODES: Dismissals[] = ['all', 'command', 'off'];
 
 /**
  * Every key `loadConfig` reads out of the YAML file. A key that is not here was
@@ -114,6 +123,7 @@ const KNOWN_FILE_KEYS = [
   'guidelines',
   'fail_on_severity',
   'fail_on_incomplete',
+  'dismissals',
   'max_issues',
   'issue_labels',
   'dry_run',
@@ -160,6 +170,24 @@ function pickReasoning(value: unknown): Reasoning {
   if (['off', 'false', 'no', 'disabled'].includes(v)) return 'none';
   core.warning(`Unknown reasoning level "${v}"; leaving the endpoint default in place.`);
   return 'auto';
+}
+
+/**
+ * Unknown values degrade to `off` rather than to the default. This is the one
+ * setting whose fallback should be the stricter behaviour: a typo that quietly
+ * opened a route past the merge gate is worse than one that leaves it shut and
+ * says so.
+ */
+function pickDismissals(value: string | undefined): Dismissals {
+  const v = (value ?? '').toLowerCase();
+  if (!v) return 'all';
+  if ((DISMISSAL_MODES as string[]).includes(v)) return v as Dismissals;
+  if (['true', 'yes', 'on'].includes(v)) return 'all';
+  if (['false', 'no', 'none'].includes(v)) return 'off';
+  core.warning(
+    `Unknown dismissals mode "${v}"; no finding can be waived on this run. Use one of: ${DISMISSAL_MODES.join(' | ')}.`,
+  );
+  return 'off';
 }
 
 function pickSeverity(value: unknown, fallback: Severity, label: string): Severity {
@@ -253,6 +281,7 @@ export function loadConfig(): Config {
     failOnSeverity,
     failOnIncomplete:
       (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
+    dismissals: pickDismissals(pick('dismissals', 'dismissals')),
     maxIssues: num('max-issues', 'max_issues', 3),
     issueLabels: (() => {
       const l = [...splitList(input('issue-labels')), ...asStringList(file.issue_labels)];

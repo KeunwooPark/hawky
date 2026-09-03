@@ -3,6 +3,10 @@
 # Make this job a required status check under
 # Settings -> Branches -> Branch protection rules, and merging is blocked while
 # any high or critical finding is still reported.
+#
+# When a finding is wrong, a maintainer replies `@hawky ignore <reason>` in its
+# thread (or resolves the thread) and re-runs this job from the Actions tab. The
+# waiver is recorded in the summary comment, so the merge is not a silent one.
 name: Review gate
 
 on:

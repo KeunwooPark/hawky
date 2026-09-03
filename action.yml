@@ -73,6 +73,10 @@ inputs:
     description: 'Fail the check if part of the diff could not be reviewed (an LLM call errored out). Recommended when using fail-on-severity as a merge gate. Default: false.'
     required: false
     default: ''
+  dismissals:
+    description: 'How a reviewer may waive a false positive so it stops blocking the merge: "all" (an `@hawky ignore` reply, or resolving the review thread), "command" (the reply only), or "off" (nothing waives a finding). Default: all.'
+    required: false
+    default: ''
   max-issues:
     description: 'Maximum refactoring issues to open in one run. Default: 3.'
     required: false
@@ -93,6 +97,8 @@ outputs:
     description: 'Highest severity found on this run: low | medium | high | critical | none.'
   findings-count:
     description: 'Number of inline findings posted.'
+  dismissed-count:
+    description: 'Number of findings a reviewer waived on this run. These are reported but excluded from the gate.'
   issues-created:
     description: 'Number of refactoring issues opened.'
   summary:
