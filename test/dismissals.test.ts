@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readThreadState } from '../src/gh/dismissals.js';
 import { findingFingerprint, marker, SUMMARY_MARKER } from '../src/util/fingerprint.js';
+import { captureWarnings } from './warnings.js';
 
 const LIST_REVIEW_COMMENTS = Symbol('pulls.listReviewComments');
 
@@ -66,7 +67,10 @@ const read = (
   mode: 'all' | 'command' | 'off' = 'command',
   threads?: { nodes: unknown[] },
   permissions?: Record<string, string>,
-) => readThreadState(stubOctokit(reviewComments, threads, permissions), 'o', 'r', 1, issueComments as never, mode);
+) =>
+  captureWarnings(() =>
+    readThreadState(stubOctokit(reviewComments, threads, permissions), 'o', 'r', 1, issueComments as never, mode),
+  ).then(({ result }) => result);
 
 test('a reply in the thread waives the finding it replies to', async () => {
   const { seen, dismissed } = await read([
