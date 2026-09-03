@@ -27,11 +27,17 @@ function withInputs(inputs: Record<string, string>, fileBody?: string) {
     fs.writeFileSync(path.join(workspace, '.github/hawky.yml'), fileBody);
   }
 
+  // Swallowed rather than forwarded: `core.warning` writes the workflow command
+  // that turns a line into a CI annotation, and these warnings are the point of
+  // the test, not a problem with the run that is executing it.
   const warnings: string[] = [];
   const write = process.stdout.write.bind(process.stdout);
   process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
     const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
-    if (text.startsWith('::warning::')) warnings.push(text.trim());
+    if (text.startsWith('::warning::')) {
+      warnings.push(text.trim());
+      return true;
+    }
     return write(chunk as never, ...(rest as []));
   }) as typeof process.stdout.write;
 
