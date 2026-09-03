@@ -65,14 +65,45 @@ function renderComment(finding: Finding): string {
   return parts.join('\n');
 }
 
+/**
+ * The one line that says whether this check passed, written where the reviewer
+ * already is. Without it the verdict lived only in step outputs and the job
+ * summary, so a gate that was never switched on looked identical to one that
+ * was switched on and found nothing.
+ */
+function renderVerdict(highest: Severity | null, cfg: Config, incomplete: boolean): string {
+  const found = highest ? `Highest severity found: **${SEVERITY_LABEL[highest]}**.` : 'Nothing found.';
+
+  if (cfg.failOnSeverity === 'none') {
+    return `${found} Not gating — \`fail-on-severity\` is not set, so this check passes whatever is found.`;
+  }
+  if (highest && severityAtLeast(highest, cfg.failOnSeverity)) {
+    return `❌ **Failed.** ${found} At or above the \`${cfg.failOnSeverity}\` threshold.`;
+  }
+  if (incomplete) {
+    return `❌ **Failed.** ${found} Part of the diff could not be reviewed, so the result cannot be trusted as a gate.`;
+  }
+  return `✅ **Passed.** ${found} Below the \`${cfg.failOnSeverity}\` threshold.`;
+}
+
 function renderSummary(
   summary: string,
   posted: Finding[],
   unanchored: Finding[],
   cfg: Config,
   dropped: number,
+  highest: Severity | null,
+  incomplete: boolean,
 ): string {
-  const lines = [SUMMARY_MARKER, '## Hawky review', '', summary.trim(), ''];
+  const lines = [
+    SUMMARY_MARKER,
+    '## Hawky review',
+    '',
+    summary.trim(),
+    '',
+    renderVerdict(highest, cfg, incomplete),
+    '',
+  ];
 
   if (posted.length) {
     const counts = new Map<Severity, number>();
@@ -168,6 +199,8 @@ export async function postReview(
   findings: Finding[],
   files: DiffFile[],
   cfg: Config,
+  /** Some of the diff could not be reviewed and the run is configured to fail on that. */
+  incomplete = false,
 ): Promise<PostedReview> {
   const byPath = new Map(files.map((f) => [f.path, f]));
   const alreadyPosted = cfg.dryRun
@@ -210,7 +243,6 @@ export async function postReview(
   }
 
   const dropped = before - posted.length - unanchored.length;
-  const summaryBody = renderSummary(summary, posted, unanchored, cfg, dropped);
 
   // Gate on everything that survived the quality filters, whether or not GitHub
   // let us anchor it inline and whether or not an earlier run already commented
@@ -219,6 +251,8 @@ export async function postReview(
     (acc, f) => (acc === null || SEVERITY_ORDER[f.severity] > SEVERITY_ORDER[acc] ? f.severity : acc),
     null,
   );
+
+  const summaryBody = renderSummary(summary, posted, unanchored, cfg, dropped, highestSeverity, incomplete);
 
   if (cfg.dryRun) {
     core.info('[dry-run] Would post the following review:');
@@ -247,7 +281,13 @@ export async function postReview(
       );
       unanchored.push(...posted);
       posted.length = 0;
-      await upsertSummary(octokit, owner, repo, pull_number, renderSummary(summary, [], unanchored, cfg, dropped));
+      await upsertSummary(
+        octokit,
+        owner,
+        repo,
+        pull_number,
+        renderSummary(summary, [], unanchored, cfg, dropped, highestSeverity, incomplete),
+      );
       return { posted, unanchored, highestSeverity };
     }
   }

@@ -261,6 +261,18 @@ Three details matter if you rely on this:
   the diff went unreviewed. Without it, a partly-reviewed diff can report a pass.
 - The step still posts its comments before failing, so authors see what to fix.
 
+**The gate is off until you set `fail-on-severity`.** Without it the default is `none`:
+Hawky leaves its High and Critical comments and the check still passes. Every run now says
+which it did, in three places — the run log (`Gate: off (fail-on-severity is not set)` or
+`Gate: fail-on-severity=high, highest severity found=high -> FAIL`), the job summary, and
+the sticky summary comment on the pull request itself. If a High comment sits on a green
+check, read that line first.
+
+Two ways to set the threshold and get nothing: a value that is not
+`low`/`medium`/`high`/`critical`/`none`, and `fail-on-severity` written in kebab case in
+`.github/hawky.yml`, which takes `fail_on_severity`. Both used to fall back to `none` in
+silence; both now warn in the run log.
+
 To report the verdict without blocking, leave `fail-on-severity` at `none` and read the
 outputs instead. They are written even when the step fails, so pair them with `if: always()`:
 

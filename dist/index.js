@@ -39821,6 +39821,48 @@ const DEFAULT_EXCLUDES = [
 ];
 const SEVERITIES = ['low', 'medium', 'high', 'critical'];
 const REASONING_LEVELS = ['auto', 'none', 'minimal', 'low', 'medium', 'high'];
+/**
+ * Every key `loadConfig` reads out of the YAML file. A key that is not here was
+ * silently ignored before, which is indistinguishable from the feature not
+ * working — `fail-on-severity` written in kebab case turned the merge gate off
+ * and said nothing.
+ */
+const KNOWN_FILE_KEYS = [
+    'provider',
+    'model',
+    'base_url',
+    'mode',
+    'max_comments',
+    'min_severity',
+    'min_confidence',
+    'include',
+    'exclude',
+    'exclude_defaults',
+    'guidelines',
+    'fail_on_severity',
+    'fail_on_incomplete',
+    'max_issues',
+    'issue_labels',
+    'dry_run',
+    'max_chars_per_batch',
+    'max_files',
+    'reasoning',
+    'max_response_tokens',
+    'request_options',
+];
+function warnUnknownFileKeys(file, configPath) {
+    for (const key of Object.keys(file)) {
+        if (KNOWN_FILE_KEYS.includes(key))
+            continue;
+        const snake = key.replace(/-/g, '_');
+        if (KNOWN_FILE_KEYS.includes(snake)) {
+            core.warning(`${configPath}: "${key}" is being ignored — this file uses snake_case. Did you mean "${snake}"?`);
+        }
+        else {
+            core.warning(`${configPath}: unknown key "${key}" is being ignored.`);
+        }
+    }
+}
 function splitList(value) {
     if (!value)
         return [];
@@ -39848,9 +39890,14 @@ function pickReasoning(value) {
     core.warning(`Unknown reasoning level "${v}"; leaving the endpoint default in place.`);
     return 'auto';
 }
-function pickSeverity(value, fallback) {
+function pickSeverity(value, fallback, label) {
     const v = String(value ?? '').toLowerCase();
-    return SEVERITIES.includes(v) ? v : fallback;
+    if (!v)
+        return fallback;
+    if (SEVERITIES.includes(v))
+        return v;
+    core.warning(`Unknown ${label} "${v}"; falling back to "${fallback}". Use one of: ${SEVERITIES.join(' | ')}.`);
+    return fallback;
 }
 function readFileConfig(configPath) {
     const abs = path.resolve(process.env.GITHUB_WORKSPACE ?? process.cwd(), configPath);
@@ -39875,7 +39922,9 @@ function readFileConfig(configPath) {
  * Action inputs default to '' in action.yml precisely so this ordering works.
  */
 function loadConfig() {
-    const file = readFileConfig(core.getInput('config-path') || '.github/hawky.yml');
+    const configPath = core.getInput('config-path') || '.github/hawky.yml';
+    const file = readFileConfig(configPath);
+    warnUnknownFileKeys(file, configPath);
     const input = (name) => core.getInput(name).trim();
     const pick = (inputName, fileKey) => {
         const fromInput = input(inputName);
@@ -39902,7 +39951,16 @@ function loadConfig() {
         ...splitList(input('exclude')),
         ...asStringList(file.exclude),
     ];
-    const failRaw = (pick('fail-on-severity', 'fail_on_severity') ?? 'none').toLowerCase();
+    // Anything unrecognised here used to become "none", so a typo turned the merge
+    // gate off and the run went green with a critical finding on it.
+    const failRaw = (pick('fail-on-severity', 'fail_on_severity') ?? '').toLowerCase();
+    let failOnSeverity = 'none';
+    if (SEVERITIES.includes(failRaw)) {
+        failOnSeverity = failRaw;
+    }
+    else if (failRaw && failRaw !== 'none') {
+        core.warning(`Unknown fail-on-severity "${failRaw}"; this run will not gate. Use one of: ${SEVERITIES.join(' | ')} | none.`);
+    }
     return {
         provider,
         model: pick('model', 'model') ?? DEFAULT_MODELS[provider],
@@ -39911,12 +39969,12 @@ function loadConfig() {
         githubToken: input('github-token') || process.env.GITHUB_TOKEN || '',
         mode,
         maxComments: num('max-comments', 'max_comments', 15),
-        minSeverity: pickSeverity(pick('min-severity', 'min_severity'), 'medium'),
+        minSeverity: pickSeverity(pick('min-severity', 'min_severity'), 'medium', 'min-severity'),
         minConfidence: num('min-confidence', 'min_confidence', 0.6),
         include: [...splitList(input('include')), ...asStringList(file.include)],
         exclude,
         guidelines: pick('guidelines', 'guidelines') ?? '',
-        failOnSeverity: SEVERITIES.includes(failRaw) ? failRaw : 'none',
+        failOnSeverity,
         failOnIncomplete: (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
         maxIssues: num('max-issues', 'max_issues', 3),
         issueLabels: (() => {
@@ -40495,8 +40553,35 @@ function renderComment(finding) {
     parts.push('', (0, fingerprint_js_1.marker)('finding', (0, fingerprint_js_1.findingFingerprint)(finding.path, finding.category, finding.title)));
     return parts.join('\n');
 }
-function renderSummary(summary, posted, unanchored, cfg, dropped) {
-    const lines = [fingerprint_js_1.SUMMARY_MARKER, '## Hawky review', '', summary.trim(), ''];
+/**
+ * The one line that says whether this check passed, written where the reviewer
+ * already is. Without it the verdict lived only in step outputs and the job
+ * summary, so a gate that was never switched on looked identical to one that
+ * was switched on and found nothing.
+ */
+function renderVerdict(highest, cfg, incomplete) {
+    const found = highest ? `Highest severity found: **${SEVERITY_LABEL[highest]}**.` : 'Nothing found.';
+    if (cfg.failOnSeverity === 'none') {
+        return `${found} Not gating — \`fail-on-severity\` is not set, so this check passes whatever is found.`;
+    }
+    if (highest && severityAtLeast(highest, cfg.failOnSeverity)) {
+        return `❌ **Failed.** ${found} At or above the \`${cfg.failOnSeverity}\` threshold.`;
+    }
+    if (incomplete) {
+        return `❌ **Failed.** ${found} Part of the diff could not be reviewed, so the result cannot be trusted as a gate.`;
+    }
+    return `✅ **Passed.** ${found} Below the \`${cfg.failOnSeverity}\` threshold.`;
+}
+function renderSummary(summary, posted, unanchored, cfg, dropped, highest, incomplete) {
+    const lines = [
+        fingerprint_js_1.SUMMARY_MARKER,
+        '## Hawky review',
+        '',
+        summary.trim(),
+        '',
+        renderVerdict(highest, cfg, incomplete),
+        '',
+    ];
     if (posted.length) {
         const counts = new Map();
         for (const f of posted)
@@ -40556,7 +40641,9 @@ async function upsertSummary(octokit, owner, repo, issue_number, body) {
         core.info('Posted summary comment.');
     }
 }
-async function postReview(octokit, owner, repo, pull_number, commit_id, summary, findings, files, cfg) {
+async function postReview(octokit, owner, repo, pull_number, commit_id, summary, findings, files, cfg, 
+/** Some of the diff could not be reviewed and the run is configured to fail on that. */
+incomplete = false) {
     const byPath = new Map(files.map((f) => [f.path, f]));
     const alreadyPosted = cfg.dryRun
         ? new Set()
@@ -40590,11 +40677,11 @@ async function postReview(octokit, owner, repo, pull_number, commit_id, summary,
         });
     }
     const dropped = before - posted.length - unanchored.length;
-    const summaryBody = renderSummary(summary, posted, unanchored, cfg, dropped);
     // Gate on everything that survived the quality filters, whether or not GitHub
     // let us anchor it inline and whether or not an earlier run already commented
     // on it: an unresolved critical finding is still critical on the second push.
     const highestSeverity = qualified.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
+    const summaryBody = renderSummary(summary, posted, unanchored, cfg, dropped, highestSeverity, incomplete);
     if (cfg.dryRun) {
         core.info('[dry-run] Would post the following review:');
         core.info(summaryBody);
@@ -40621,7 +40708,7 @@ async function postReview(octokit, owner, repo, pull_number, commit_id, summary,
             core.warning(`Could not post inline comments (${err.message}). Including them in the summary instead.`);
             unanchored.push(...posted);
             posted.length = 0;
-            await upsertSummary(octokit, owner, repo, pull_number, renderSummary(summary, [], unanchored, cfg, dropped));
+            await upsertSummary(octokit, owner, repo, pull_number, renderSummary(summary, [], unanchored, cfg, dropped, highestSeverity, incomplete));
             return { posted, unanchored, highestSeverity };
         }
     }
@@ -41610,8 +41697,10 @@ async function run() {
     let findingsPosted = 0;
     let issuesCreated = 0;
     let highest = null;
+    // A run that only reviewed part of the diff cannot honestly report a pass.
+    const incomplete = failedBatches > 0 && cfg.failOnIncomplete;
     if (cfg.mode !== 'refactor' && target.pullNumber) {
-        const result = await (0, review_js_1.postReview)(octokit, target.owner, target.repo, target.pullNumber, target.headSha, summary, findings, files, cfg);
+        const result = await (0, review_js_1.postReview)(octokit, target.owner, target.repo, target.pullNumber, target.headSha, summary, findings, files, cfg, incomplete);
         findingsPosted = result.posted.length + result.unanchored.length;
         highest = result.highestSeverity;
     }
@@ -41621,9 +41710,12 @@ async function run() {
     if (cfg.mode !== 'review') {
         issuesCreated = await (0, issues_js_1.postRefactorIssues)(octokit, target.owner, target.repo, refactors, cfg, target.pullNumber ? { number: target.pullNumber, sha: target.headSha } : undefined);
     }
-    // A run that only reviewed part of the diff cannot honestly report a pass.
-    const incomplete = failedBatches > 0 && cfg.failOnIncomplete;
     const gated = cfg.failOnSeverity !== 'none' && highest !== null && types_js_1.SEVERITY_ORDER[highest] >= types_js_1.SEVERITY_ORDER[cfg.failOnSeverity];
+    // Always logged, including when the gate is off: "why did this pass?" has to be
+    // answerable from the run log alone, without re-reading the workflow file.
+    core.info(cfg.failOnSeverity === 'none'
+        ? `Gate: off (fail-on-severity is not set). Highest severity found: ${highest ?? 'none'}. This run cannot fail on findings.`
+        : `Gate: fail-on-severity=${cfg.failOnSeverity}, highest severity found=${highest ?? 'none'} -> ${gated ? 'FAIL' : 'pass'}.`);
     core.setOutput('findings-count', findingsPosted);
     core.setOutput('issues-created', issuesCreated);
     core.setOutput('summary', summary);
@@ -41634,6 +41726,9 @@ async function run() {
         .addList([
         `${findingsPosted} finding(s) reported`,
         `Highest severity: ${highest ?? 'none'}`,
+        cfg.failOnSeverity === 'none'
+            ? 'Gate: off (fail-on-severity is not set)'
+            : `Gate: ${gated || incomplete ? 'FAIL' : 'pass'} (fail-on-severity: ${cfg.failOnSeverity})`,
         `${issuesCreated} refactoring issue(s) opened`,
         `${provider.name}/${provider.model}, ${total.inputTokens + total.outputTokens} tokens`,
     ])

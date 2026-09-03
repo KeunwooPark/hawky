@@ -1,0 +1,98 @@
+import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { afterEach, test } from 'node:test';
+import { loadConfig } from '../src/config.js';
+
+/**
+ * `loadConfig` reads action inputs from the environment and warns on stdout, so
+ * both sides are driven through those rather than through injected fakes.
+ */
+function withInputs(inputs: Record<string, string>, fileBody?: string) {
+  const saved = { ...process.env };
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'hawky-cfg-'));
+
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith('INPUT_')) delete process.env[key];
+  }
+  process.env.GITHUB_WORKSPACE = workspace;
+  process.env['INPUT_API-KEY'] = 'k';
+  process.env['INPUT_GITHUB-TOKEN'] = 't';
+  for (const [name, value] of Object.entries(inputs)) {
+    process.env[`INPUT_${name.toUpperCase()}`] = value;
+  }
+  if (fileBody !== undefined) {
+    fs.mkdirSync(path.join(workspace, '.github'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, '.github/hawky.yml'), fileBody);
+  }
+
+  const warnings: string[] = [];
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString();
+    if (text.startsWith('::warning::')) warnings.push(text.trim());
+    return write(chunk as never, ...(rest as []));
+  }) as typeof process.stdout.write;
+
+  try {
+    return { cfg: loadConfig(), warnings };
+  } finally {
+    process.stdout.write = write;
+    process.env = saved;
+    fs.rmSync(workspace, { recursive: true, force: true });
+  }
+}
+
+afterEach(() => {
+  delete process.env.GITHUB_WORKSPACE;
+});
+
+test('an unset fail-on-severity leaves the gate off without complaining', () => {
+  const { cfg, warnings } = withInputs({});
+  assert.equal(cfg.failOnSeverity, 'none');
+  assert.deepEqual(warnings, []);
+});
+
+test('a misspelled fail-on-severity warns instead of silently disabling the gate', () => {
+  const { cfg, warnings } = withInputs({ 'fail-on-severity': 'higb' });
+
+  // Silently falling back to "none" is what let a critical finding go green.
+  assert.equal(cfg.failOnSeverity, 'none');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /Unknown fail-on-severity "higb"/);
+  assert.match(warnings[0], /will not gate/);
+});
+
+test('a misspelled min-severity warns instead of silently widening the filter', () => {
+  const { cfg, warnings } = withInputs({ 'min-severity': 'hgih' });
+  assert.equal(cfg.minSeverity, 'medium');
+  assert.match(warnings[0], /Unknown min-severity "hgih"/);
+});
+
+test('a kebab-case key in the config file is reported with the name it should have', () => {
+  const { cfg, warnings } = withInputs({}, 'fail-on-severity: high\n');
+
+  // The file is snake_case only, so this key was read as nothing at all.
+  assert.equal(cfg.failOnSeverity, 'none');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /"fail-on-severity" is being ignored/);
+  assert.match(warnings[0], /Did you mean "fail_on_severity"/);
+});
+
+test('the snake_case key in the config file actually gates', () => {
+  const { cfg, warnings } = withInputs({}, 'fail_on_severity: high\n');
+  assert.equal(cfg.failOnSeverity, 'high');
+  assert.deepEqual(warnings, []);
+});
+
+test('an action input still wins over the config file', () => {
+  const { cfg } = withInputs({ 'fail-on-severity': 'critical' }, 'fail_on_severity: low\n');
+  assert.equal(cfg.failOnSeverity, 'critical');
+});
+
+test('an unrecognised config-file key is named rather than ignored', () => {
+  const { warnings } = withInputs({}, 'fail_on_sevrity: high\n');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /unknown key "fail_on_sevrity"/);
+});

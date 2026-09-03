@@ -94,6 +94,50 @@ const DEFAULT_EXCLUDES = [
 const SEVERITIES: Severity[] = ['low', 'medium', 'high', 'critical'];
 const REASONING_LEVELS: Reasoning[] = ['auto', 'none', 'minimal', 'low', 'medium', 'high'];
 
+/**
+ * Every key `loadConfig` reads out of the YAML file. A key that is not here was
+ * silently ignored before, which is indistinguishable from the feature not
+ * working — `fail-on-severity` written in kebab case turned the merge gate off
+ * and said nothing.
+ */
+const KNOWN_FILE_KEYS = [
+  'provider',
+  'model',
+  'base_url',
+  'mode',
+  'max_comments',
+  'min_severity',
+  'min_confidence',
+  'include',
+  'exclude',
+  'exclude_defaults',
+  'guidelines',
+  'fail_on_severity',
+  'fail_on_incomplete',
+  'max_issues',
+  'issue_labels',
+  'dry_run',
+  'max_chars_per_batch',
+  'max_files',
+  'reasoning',
+  'max_response_tokens',
+  'request_options',
+];
+
+function warnUnknownFileKeys(file: Record<string, unknown>, configPath: string): void {
+  for (const key of Object.keys(file)) {
+    if (KNOWN_FILE_KEYS.includes(key)) continue;
+    const snake = key.replace(/-/g, '_');
+    if (KNOWN_FILE_KEYS.includes(snake)) {
+      core.warning(
+        `${configPath}: "${key}" is being ignored — this file uses snake_case. Did you mean "${snake}"?`,
+      );
+    } else {
+      core.warning(`${configPath}: unknown key "${key}" is being ignored.`);
+    }
+  }
+}
+
 function splitList(value: string | undefined): string[] {
   if (!value) return [];
   return value
@@ -118,9 +162,12 @@ function pickReasoning(value: unknown): Reasoning {
   return 'auto';
 }
 
-function pickSeverity(value: unknown, fallback: Severity): Severity {
+function pickSeverity(value: unknown, fallback: Severity, label: string): Severity {
   const v = String(value ?? '').toLowerCase();
-  return (SEVERITIES as string[]).includes(v) ? (v as Severity) : fallback;
+  if (!v) return fallback;
+  if ((SEVERITIES as string[]).includes(v)) return v as Severity;
+  core.warning(`Unknown ${label} "${v}"; falling back to "${fallback}". Use one of: ${SEVERITIES.join(' | ')}.`);
+  return fallback;
 }
 
 function readFileConfig(configPath: string): Record<string, unknown> {
@@ -146,7 +193,9 @@ function readFileConfig(configPath: string): Record<string, unknown> {
  * Action inputs default to '' in action.yml precisely so this ordering works.
  */
 export function loadConfig(): Config {
-  const file = readFileConfig(core.getInput('config-path') || '.github/hawky.yml');
+  const configPath = core.getInput('config-path') || '.github/hawky.yml';
+  const file = readFileConfig(configPath);
+  warnUnknownFileKeys(file, configPath);
   const input = (name: string) => core.getInput(name).trim();
   const pick = (inputName: string, fileKey: string): string | undefined => {
     const fromInput = input(inputName);
@@ -176,7 +225,17 @@ export function loadConfig(): Config {
     ...asStringList(file.exclude),
   ];
 
-  const failRaw = (pick('fail-on-severity', 'fail_on_severity') ?? 'none').toLowerCase();
+  // Anything unrecognised here used to become "none", so a typo turned the merge
+  // gate off and the run went green with a critical finding on it.
+  const failRaw = (pick('fail-on-severity', 'fail_on_severity') ?? '').toLowerCase();
+  let failOnSeverity: Severity | 'none' = 'none';
+  if ((SEVERITIES as string[]).includes(failRaw)) {
+    failOnSeverity = failRaw as Severity;
+  } else if (failRaw && failRaw !== 'none') {
+    core.warning(
+      `Unknown fail-on-severity "${failRaw}"; this run will not gate. Use one of: ${SEVERITIES.join(' | ')} | none.`,
+    );
+  }
 
   return {
     provider,
@@ -186,12 +245,12 @@ export function loadConfig(): Config {
     githubToken: input('github-token') || process.env.GITHUB_TOKEN || '',
     mode,
     maxComments: num('max-comments', 'max_comments', 15),
-    minSeverity: pickSeverity(pick('min-severity', 'min_severity'), 'medium'),
+    minSeverity: pickSeverity(pick('min-severity', 'min_severity'), 'medium', 'min-severity'),
     minConfidence: num('min-confidence', 'min_confidence', 0.6),
     include: [...splitList(input('include')), ...asStringList(file.include)],
     exclude,
     guidelines: pick('guidelines', 'guidelines') ?? '',
-    failOnSeverity: (SEVERITIES as string[]).includes(failRaw) ? (failRaw as Severity) : 'none',
+    failOnSeverity,
     failOnIncomplete:
       (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
     maxIssues: num('max-issues', 'max_issues', 3),

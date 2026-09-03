@@ -34,6 +34,7 @@ const cfg = {
   minConfidence: 0.6,
   maxComments: 15,
   dryRun: false,
+  failOnSeverity: 'none',
 } as Config;
 
 function file(path: string): DiffFile {
@@ -88,4 +89,73 @@ test('a finding outside the reviewed diff does not gate', async () => {
   const stray = { ...finding('critical', 'b'), path: 'src/elsewhere.ts' };
   const result = await post([stray]);
   assert.equal(result.highestSeverity, null);
+});
+
+/** Same stand-in, but keeps whatever body the sticky summary comment was given. */
+function capturingOctokit() {
+  const bodies: string[] = [];
+  const octokit = {
+    paginate: async (route: unknown) => {
+      if (route === LIST_REVIEW_COMMENTS) return [];
+      if (route === LIST_ISSUE_COMMENTS) return [];
+      throw new Error('unexpected paginate route');
+    },
+    rest: {
+      pulls: { listReviewComments: LIST_REVIEW_COMMENTS, createReview: async () => ({}) },
+      issues: {
+        listComments: LIST_ISSUE_COMMENTS,
+        createComment: async ({ body }: { body: string }) => {
+          bodies.push(body);
+          return {};
+        },
+        updateComment: async () => ({}),
+      },
+    },
+  } as never;
+  return { octokit, bodies };
+}
+
+const postWith = async (overrides: Partial<Config>, findings: Finding[], incomplete = false) => {
+  const { octokit, bodies } = capturingOctokit();
+  await postReview(
+    octokit,
+    'o',
+    'r',
+    1,
+    'sha',
+    'summary',
+    findings,
+    [file('src/a.ts')],
+    { ...cfg, ...overrides } as Config,
+    incomplete,
+  );
+  return bodies[0] ?? '';
+};
+
+test('the summary comment says the gate is off when fail-on-severity is unset', async () => {
+  const body = await postWith({ failOnSeverity: 'none' }, [finding('high', 'a')]);
+
+  // The symptom this fixes: a High comment on a green check, with nothing on the
+  // pull request explaining that no threshold was ever configured.
+  assert.match(body, /Highest severity found: \*\*High\*\*/);
+  assert.match(body, /Not gating/);
+  assert.match(body, /fail-on-severity` is not set/);
+});
+
+test('the summary comment reports a failure when a finding crosses the threshold', async () => {
+  const body = await postWith({ failOnSeverity: 'high' }, [finding('high', 'a')]);
+  assert.match(body, /\*\*Failed\.\*\*/);
+  assert.match(body, /At or above the `high` threshold/);
+});
+
+test('the summary comment reports a pass when everything is below the threshold', async () => {
+  const body = await postWith({ failOnSeverity: 'high' }, [finding('medium', 'a')]);
+  assert.match(body, /\*\*Passed\.\*\*/);
+  assert.match(body, /Below the `high` threshold/);
+});
+
+test('a partly reviewed diff is reported as a failure, not a pass', async () => {
+  const body = await postWith({ failOnSeverity: 'high' }, [finding('medium', 'a')], true);
+  assert.match(body, /\*\*Failed\.\*\*/);
+  assert.match(body, /could not be reviewed/);
 });

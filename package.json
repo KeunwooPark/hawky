@@ -1,6 +1,6 @@
 {
   "name": "hawky",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "LLM-powered pull request reviewer and refactoring-issue generator for GitHub Actions",
   "main": "dist/index.js",

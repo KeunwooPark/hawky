@@ -121,6 +121,8 @@ async function run(): Promise<void> {
   let findingsPosted = 0;
   let issuesCreated = 0;
   let highest: Severity | null = null;
+  // A run that only reviewed part of the diff cannot honestly report a pass.
+  const incomplete = failedBatches > 0 && cfg.failOnIncomplete;
 
   if (cfg.mode !== 'refactor' && target.pullNumber) {
     const result = await postReview(
@@ -133,6 +135,7 @@ async function run(): Promise<void> {
       findings,
       files,
       cfg,
+      incomplete,
     );
     findingsPosted = result.posted.length + result.unanchored.length;
     highest = result.highestSeverity;
@@ -151,10 +154,16 @@ async function run(): Promise<void> {
     );
   }
 
-  // A run that only reviewed part of the diff cannot honestly report a pass.
-  const incomplete = failedBatches > 0 && cfg.failOnIncomplete;
   const gated =
     cfg.failOnSeverity !== 'none' && highest !== null && SEVERITY_ORDER[highest] >= SEVERITY_ORDER[cfg.failOnSeverity];
+
+  // Always logged, including when the gate is off: "why did this pass?" has to be
+  // answerable from the run log alone, without re-reading the workflow file.
+  core.info(
+    cfg.failOnSeverity === 'none'
+      ? `Gate: off (fail-on-severity is not set). Highest severity found: ${highest ?? 'none'}. This run cannot fail on findings.`
+      : `Gate: fail-on-severity=${cfg.failOnSeverity}, highest severity found=${highest ?? 'none'} -> ${gated ? 'FAIL' : 'pass'}.`,
+  );
 
   core.setOutput('findings-count', findingsPosted);
   core.setOutput('issues-created', issuesCreated);
@@ -167,6 +176,9 @@ async function run(): Promise<void> {
     .addList([
       `${findingsPosted} finding(s) reported`,
       `Highest severity: ${highest ?? 'none'}`,
+      cfg.failOnSeverity === 'none'
+        ? 'Gate: off (fail-on-severity is not set)'
+        : `Gate: ${gated || incomplete ? 'FAIL' : 'pass'} (fail-on-severity: ${cfg.failOnSeverity})`,
       `${issuesCreated} refactoring issue(s) opened`,
       `${provider.name}/${provider.model}, ${total.inputTokens + total.outputTokens} tokens`,
     ])
