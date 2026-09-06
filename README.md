@@ -6,6 +6,7 @@ Works with the Anthropic API and with any OpenAI-compatible endpoint.
 - Inline review comments anchored to the exact changed line, with one-click `suggestion` blocks
 - A sticky summary comment that is updated in place instead of piling up
 - Refactoring opportunities filed as labelled issues, deduplicated across runs
+- An over-engineering pass that asks what the change could simply not have, on by default
 - Nothing is reposted when you push again — findings are fingerprinted
 - Provider-agnostic: Anthropic, OpenAI, Azure, OpenRouter, Together, Groq, vLLM, Ollama
 
@@ -225,6 +226,7 @@ Every input is optional except `api-key`.
 | `fail-on-severity` | `none` | Fail the check at or above this severity. |
 | `fail-on-incomplete` | `false` | Fail the check if part of the diff could not be reviewed. |
 | `dismissals` | `all` | How a reviewer waives a false positive: `all`, `command`, or `off`. See [Waiving a false positive](#waiving-a-false-positive). |
+| `ponytail` | `full` | How hard to review for over-engineering: `full`, `lite`, `ultra`, or `off`. See [Reviewing for over-engineering](#reviewing-for-over-engineering). |
 | `max-issues` | `3` | Cap on refactoring issues per run. |
 | `issue-labels` | `hawky,refactor` | Labels applied to refactoring issues. |
 | `dry-run` | `false` | Log what would be posted without posting it. |
@@ -341,6 +343,55 @@ outputs instead. They are written even when the step fails, so pair them with `i
         run: echo "Highest severity: ${{ steps.hawky.outputs.highest-severity }}"
 ```
 
+### Reviewing for over-engineering
+
+Hawky asks two questions of every added block. The first is whether it is wrong. The
+second — *does this need to exist at all?* — follows the
+[ponytail](https://github.com/DietrichGebert/ponytail) skill's ladder:
+
+1. Does this need to exist at all? A speculative need is not a need.
+2. Is it already in this codebase?
+3. Does the standard library do it?
+4. Does a native platform feature cover it?
+5. Does an already-installed dependency solve it?
+6. Can it be one line?
+7. Only then: the minimum code that works.
+
+`ponytail` sets how hard it presses:
+
+| Value | The reviewer |
+| --- | --- |
+| `full` (default) | Enforces the ladder — anything that fails a rung is a finding |
+| `lite` | Names the lazier alternative once per file and leaves the choice to the author |
+| `ultra` | Argues the added code should not exist, not merely that it could be shorter |
+| `off` | Looks for defects only |
+
+```yaml
+# .github/hawky.yml
+ponytail: lite   # or: ultra, off
+```
+
+These arrive as ordinary inline comments, tagged in the title so they are skimmable and
+categorised `over-engineering`:
+
+> **Medium · over-engineering** — `stdlib:` hand-rolled 27-line email validator
+>
+> `zod`'s `z.string().email()` is already a dependency here, and the real validation is
+> the confirmation mail. net: -27 lines.
+
+Two things keep the pass from turning into noise:
+
+- **It cannot block a merge.** These findings are capped at `medium` severity, in the
+  prompt and again in code before the gate reads them. `fail-on-severity: high` catches
+  defects and ignores complexity, which is the split most teams want.
+- **It will not ask you to delete the code you need.** Validation at a trust boundary,
+  error handling that prevents data loss, security measures, accessibility basics, and
+  the one test that fails when the logic breaks are all explicitly out of scope, however
+  many lines they cost. So is anything the pull request description asks for by name.
+
+Over-engineering findings are waived like any other, with `@hawky ignore` — worth knowing
+if your team disagrees with one of them more than once.
+
 ### Config file
 
 Anything in the table can live in `.github/hawky.yml` instead, in snake_case. Action
@@ -364,6 +415,10 @@ exclude_defaults: true
 # reply only), or "off" (nothing waives a finding).
 dismissals: all
 
+# How hard to hunt over-engineering: "full" (default), "lite", "ultra", or "off".
+# These findings are capped at medium severity so they cannot fail a merge gate.
+ponytail: full
+
 # Extra fields merged into the request body, for endpoint-specific knobs.
 # Passed through verbatim, so a typo here reaches the server.
 request_options: {}
@@ -383,6 +438,9 @@ The defaults are tuned so a reviewer reads the comments rather than muting the b
 - **A hard cap on comments.** The highest-severity findings survive the cap.
 - **No style opinions.** The prompt explicitly excludes formatting, naming, and comment
   density — your linter already covers those, and the model is worse at them.
+- **Complexity does not block merges.** An over-engineering finding is capped at
+  `medium` severity, so the ponytail pass runs while `fail-on-severity` still means
+  "there is a bug in this".
 - **No repeats.** Every comment carries a fingerprint derived from the path, category,
   and title, but not the line number, so a finding that scrolls down when you edit the
   file above it is still recognised as the same finding on the next push.

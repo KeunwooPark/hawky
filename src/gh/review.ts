@@ -41,6 +41,26 @@ function severityAtLeast(value: Severity, floor: Severity): boolean {
 }
 
 /**
+ * The highest severity an over-engineering finding is allowed to carry.
+ *
+ * The prompt already says these are `low` or `medium`, but severity is the model's
+ * own field and it is what the merge gate reads. Left uncapped, one enthusiastic
+ * `critical` on a hand-rolled helper fails a pull request that has no defect in
+ * it, which is not what anyone sets `fail-on-severity` up to catch.
+ */
+const OVER_ENGINEERING_CEILING: Severity = 'medium';
+
+function capOverEngineering(finding: Finding): Finding {
+  if (finding.category !== 'over-engineering') return finding;
+  if (!severityAtLeast(finding.severity, 'high')) return finding;
+  core.info(
+    `Capping ${finding.path}:${finding.line} from ${finding.severity} to ${OVER_ENGINEERING_CEILING}: ` +
+      'over-engineering is maintenance cost, not breakage, and does not gate a merge.',
+  );
+  return { ...finding, severity: OVER_ENGINEERING_CEILING };
+}
+
+/**
  * Resolve a finding to a line range GitHub will accept, or null.
  *
  * A review POST fails as a whole with 422 if any single comment anchors outside
@@ -257,6 +277,7 @@ export async function postReview(
   const before = findings.length;
   const qualified = findings
     .filter((f) => byPath.has(f.path))
+    .map(capOverEngineering)
     .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
     .filter((f) => (f.confidence ?? 0) >= cfg.minConfidence)
     .sort(

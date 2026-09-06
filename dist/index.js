@@ -39822,6 +39822,7 @@ const DEFAULT_EXCLUDES = [
 const SEVERITIES = ['low', 'medium', 'high', 'critical'];
 const REASONING_LEVELS = ['auto', 'none', 'minimal', 'low', 'medium', 'high'];
 const DISMISSAL_MODES = ['all', 'command', 'off'];
+const PONYTAIL_LEVELS = ['off', 'lite', 'full', 'ultra'];
 /**
  * Every key `loadConfig` reads out of the YAML file. A key that is not here was
  * silently ignored before, which is indistinguishable from the feature not
@@ -39843,6 +39844,7 @@ const KNOWN_FILE_KEYS = [
     'fail_on_severity',
     'fail_on_incomplete',
     'dismissals',
+    'ponytail',
     'max_issues',
     'issue_labels',
     'dry_run',
@@ -39910,6 +39912,25 @@ function pickDismissals(value) {
         return 'off';
     core.warning(`Unknown dismissals mode "${v}"; no finding can be waived on this run. Use one of: ${DISMISSAL_MODES.join(' | ')}.`);
     return 'off';
+}
+/**
+ * Unknown values degrade to the default rather than to `off`. Someone who wrote
+ * this key at all wants the pass; reading a typo as "switch it off" would grant a
+ * request they did not make and say nothing. Turning it off takes `off`.
+ */
+function pickPonytail(value) {
+    const v = (value ?? '').toLowerCase();
+    if (!v)
+        return 'full';
+    if (PONYTAIL_LEVELS.includes(v))
+        return v;
+    // 'true'/'on' is what people reach for first for something that reads as a flag.
+    if (['true', 'yes', 'on'].includes(v))
+        return 'full';
+    if (['false', 'no', 'none'].includes(v))
+        return 'off';
+    core.warning(`Unknown ponytail level "${v}"; falling back to "full". Use one of: ${PONYTAIL_LEVELS.join(' | ')}.`);
+    return 'full';
 }
 function pickSeverity(value, fallback, label) {
     const v = String(value ?? '').toLowerCase();
@@ -39998,6 +40019,7 @@ function loadConfig() {
         failOnSeverity,
         failOnIncomplete: (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
         dismissals: pickDismissals(pick('dismissals', 'dismissals')),
+        ponytail: pickPonytail(pick('ponytail', 'ponytail')),
         maxIssues: num('max-issues', 'max_issues', 3),
         issueLabels: (() => {
             const l = [...splitList(input('issue-labels')), ...asStringList(file.issue_labels)];
@@ -40784,6 +40806,24 @@ function severityAtLeast(value, floor) {
     return types_js_1.SEVERITY_ORDER[value] >= types_js_1.SEVERITY_ORDER[floor];
 }
 /**
+ * The highest severity an over-engineering finding is allowed to carry.
+ *
+ * The prompt already says these are `low` or `medium`, but severity is the model's
+ * own field and it is what the merge gate reads. Left uncapped, one enthusiastic
+ * `critical` on a hand-rolled helper fails a pull request that has no defect in
+ * it, which is not what anyone sets `fail-on-severity` up to catch.
+ */
+const OVER_ENGINEERING_CEILING = 'medium';
+function capOverEngineering(finding) {
+    if (finding.category !== 'over-engineering')
+        return finding;
+    if (!severityAtLeast(finding.severity, 'high'))
+        return finding;
+    core.info(`Capping ${finding.path}:${finding.line} from ${finding.severity} to ${OVER_ENGINEERING_CEILING}: ` +
+        'over-engineering is maintenance cost, not breakage, and does not gate a merge.');
+    return { ...finding, severity: OVER_ENGINEERING_CEILING };
+}
+/**
  * Resolve a finding to a line range GitHub will accept, or null.
  *
  * A review POST fails as a whole with 422 if any single comment anchors outside
@@ -40927,6 +40967,7 @@ incomplete = false) {
     const before = findings.length;
     const qualified = findings
         .filter((f) => byPath.has(f.path))
+        .map(capOverEngineering)
         .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
         .filter((f) => (f.confidence ?? 0) >= cfg.minConfidence)
         .sort((a, b) => types_js_1.SEVERITY_ORDER[b.severity] - types_js_1.SEVERITY_ORDER[a.severity] || (b.confidence ?? 0) - (a.confidence ?? 0));
@@ -41946,6 +41987,7 @@ async function run() {
     const octokit = (0, client_js_1.makeOctokit)(cfg.githubToken);
     const target = await (0, client_js_1.resolveTarget)(octokit);
     core.info(`Hawky: mode=${cfg.mode} provider=${cfg.provider} model=${cfg.model}` +
+        (cfg.ponytail === 'off' ? '' : ` ponytail=${cfg.ponytail}`) +
         (target.pullNumber ? ` pr=#${target.pullNumber}` : ` commit=${target.headSha.slice(0, 7)}`));
     const files = target.pullNumber
         ? await (0, diff_js_1.getPullRequestDiff)(octokit, target.owner, target.repo, target.pullNumber, cfg)
@@ -42086,6 +42128,58 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.buildSystemPrompt = buildSystemPrompt;
 exports.buildUserPrompt = buildUserPrompt;
 /**
+ * What each intensity level changes about how much the reviewer cuts. Taken from
+ * the `ponytail` skill, which grades the same ladder from "mention the lazier
+ * option" up to "argue the code should not exist".
+ */
+const PONYTAIL_INTENSITY = {
+    lite: 'Intensity: lite. Raise only the clearest case in a file, and frame it as the lazier alternative rather ' +
+        'than a defect. The author decides. If you would not delete it yourself, do not raise it.',
+    full: 'Intensity: full. The ladder enforced. Anything that fails a rung is a finding, but stay on things worth ' +
+        'the author\'s time to change.',
+    ultra: 'Intensity: ultra. Deletion before addition. Challenge whether the added code needs to exist at all, not ' +
+        'just whether it could be shorter, and say so even when the answer is that the feature itself is speculative.',
+};
+/**
+ * The over-engineering pass, from the `ponytail` skill: what the change could
+ * simply not have. It is deliberately a separate section rather than more items
+ * under `## Rules`, because it asks a different question than the rest of the
+ * review — not "is this wrong" but "does this need to exist".
+ */
+function ponytailSection(level, wantsFindings) {
+    const parts = [
+        ``,
+        `## Over-engineering`,
+        ``,
+        `You are also a lazy senior engineer: the best code is the code that was never written. For each added`,
+        `block, climb this ladder and stop at the first rung that holds. Anything that fails a rung is worth`,
+        `reporting.`,
+        ``,
+        `1. Does this need to exist at all? A speculative need is not a need. (YAGNI)`,
+        `2. Is it already in this codebase? A helper, type, or pattern that already lives here should be reused.`,
+        `   Re-implementing what sits a few files over is the most common form of this.`,
+        `3. Does the standard library do it? Name the function.`,
+        `4. Does a native platform feature cover it? A built-in input type over a picker library, CSS over JS,`,
+        `   a database constraint over application code.`,
+        `5. Does an already-installed dependency solve it? A new dependency for what a few lines do is never worth it.`,
+        `6. Can it be one line?`,
+        `7. Only then: the minimum code that works.`,
+        ``,
+        `Never propose cutting these, however much code they cost: validation at a trust boundary, error handling`,
+        `that prevents data loss, a security measure, an accessibility basic, or the one test or self-check that`,
+        `fails when the logic breaks. Anything the pull request description explicitly asks for was requested, not`,
+        `speculated — leave it alone, and do not re-argue a simplification the author has already declined.`,
+        ``,
+        `This is about deleting code, not renaming it. The no-style rule above still holds.`,
+        ``,
+        PONYTAIL_INTENSITY[level],
+    ];
+    if (!wantsFindings)
+        return parts;
+    parts.push(``, `Report each one as a finding with \`category\` set to \`over-engineering\` and one of these tags at the`, `front of the \`title\`:`, ``, `- \`delete:\` dead code, unused flexibility, a speculative feature. Nothing replaces it.`, `- \`stdlib:\` a hand-rolled version of something the standard library ships. Name the function.`, `- \`native:\` code or a dependency doing what the platform already does. Name the feature.`, `- \`yagni:\` an abstraction with one implementation, config nobody sets, a layer with one caller.`, `- \`shrink:\` the same logic in fewer lines. Show the shorter form.`, ``, `The \`body\` says what to cut and what replaces it, in one or two sentences, and ends with the lines it`, `saves, like \`net: -18 lines\`. No paragraph defending the simplification: prose arguing for less code is`, `more complexity, not less. Put the shorter form in \`suggestion\` whenever it fits the anchored lines.`, ``, `Severity for these is \`low\` or \`medium\`, never \`high\` or \`critical\`. Over-engineering is maintenance`, `cost, not breakage, and it must not fail a merge gate that exists to catch defects. Judge \`confidence\` on`, `whether the replacement genuinely works, not on how strongly you dislike the code.`);
+    return parts;
+}
+/**
  * The system prompt is deliberately identical across every batch in a run so it
  * can be cached by the provider. Anything that varies per batch belongs in the
  * user message.
@@ -42104,8 +42198,14 @@ function buildSystemPrompt(cfg, mode) {
     }
     if (wantsRefactors) {
         parts.push(`Report structural problems the change exposes: duplicated logic, a function or module that has outgrown its`, `responsibility, an abstraction that is leaking, a pattern being copied for the third time. These become`, `tracked issues, not inline comments, so only raise ones worth a separate piece of work.`, ``);
+        if (cfg.ponytail !== 'off') {
+            parts.push(`Prefer the ones that end with less code than they started with. A refactor that deletes a layer beats one`, `that adds a better layer.`, ``);
+        }
     }
-    parts.push(`## Rules`, ``, `- Anchor every finding to a line marked \`+\` in the diff. The number in the left gutter is the line number to use.`, `  Never anchor to an unchanged context line, and never invent a line number.`, `- You are reading a partial view of the codebase. If a symbol, import, or caller is not shown, assume it exists and`, `  is correct. Do not report something as missing or undefined when it is simply outside the diff.`, `- Report a problem only if you can name the input or state that triggers it and the resulting behaviour. If you`, `  cannot, drop it.`, `- Set \`confidence\` honestly. Below 0.6 means you are guessing; that finding will be discarded, which is the`, `  correct outcome for a guess.`, `- No style, formatting, naming, or comment-density opinions unless the project guidelines below ask for them.`, `  Linters and formatters already handle those and the author does not want them from you.`, `- No praise, no summary of what the code does, no "consider adding tests" boilerplate. If a specific untested`, `  branch will break, say which branch and why.`, `- One finding per distinct problem. Do not repeat the same issue across several lines; report it once at the`, `  clearest location.`, `- Every field holds a finished answer, not your working-out. Do not narrate your deliberation, weigh options`, `  against each other, or trail off mid-thought inside a \`body\`. If you have not reached a conclusion, the`, `  finding does not go in.`, `- Prefer few high-signal findings over many. An empty \`findings\` array is a perfectly good review of a clean change.`, `- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`, `  keeping the surrounding indentation, so it can be applied directly.`);
+    parts.push(`## Rules`, ``, `- Anchor every finding to a line marked \`+\` in the diff. The number in the left gutter is the line number to use.`, `  Never anchor to an unchanged context line, and never invent a line number.`, `- You are reading a partial view of the codebase. If a symbol, import, or caller is not shown, assume it exists and`, `  is correct. Do not report something as missing or undefined when it is simply outside the diff.`, `- Report a defect only if you can name the input or state that triggers it and the resulting behaviour. If you`, `  cannot, drop it.`, `- Set \`confidence\` honestly. Below 0.6 means you are guessing; that finding will be discarded, which is the`, `  correct outcome for a guess.`, `- No style, formatting, naming, or comment-density opinions unless the project guidelines below ask for them.`, `  Linters and formatters already handle those and the author does not want them from you.`, `- No praise, no summary of what the code does, no "consider adding tests" boilerplate. If a specific untested`, `  branch will break, say which branch and why.`, `- One finding per distinct problem. Do not repeat the same issue across several lines; report it once at the`, `  clearest location.`, `- Every field holds a finished answer, not your working-out. Do not narrate your deliberation, weigh options`, `  against each other, or trail off mid-thought inside a \`body\`. If you have not reached a conclusion, the`, `  finding does not go in.`, `- Prefer few high-signal findings over many. An empty \`findings\` array is a perfectly good review of a clean change.`, `- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`, `  keeping the surrounding indentation, so it can be applied directly.`);
+    if (cfg.ponytail !== 'off') {
+        parts.push(...ponytailSection(cfg.ponytail, wantsFindings));
+    }
     if (cfg.guidelines.trim()) {
         parts.push(``, `## Project guidelines`, ``, `These come from the repository maintainers and take precedence over your defaults:`, ``, cfg.guidelines.trim());
     }
@@ -42198,6 +42298,7 @@ exports.REVIEW_SCHEMA = {
                             'api-design',
                             'testing',
                             'maintainability',
+                            'over-engineering',
                             'documentation',
                         ],
                     },

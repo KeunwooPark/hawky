@@ -230,3 +230,24 @@ test('the summary prints an id for findings that could not be anchored', async (
   const body = await postWith({}, [stray]);
   assert.match(body, new RegExp(findingFingerprint(stray.path, stray.category, stray.title)));
 });
+
+test('an over-engineering finding cannot gate the merge, however the model graded it', () => {
+  // The prompt caps these at medium, but severity is the model's own field and it
+  // is what fail-on-severity reads: a hand-rolled helper must not fail a merge.
+  const overEngineered: Finding = { ...finding('critical', 'stdlib: hand-rolled deep clone'), category: 'over-engineering' };
+
+  return post([overEngineered]).then((result) => {
+    assert.equal(result.highestSeverity, 'medium');
+    assert.equal(result.posted.length, 1);
+    assert.equal(result.posted[0].severity, 'medium');
+  });
+});
+
+test('capping an over-engineering finding leaves defects at their real severity', async () => {
+  const result = await post([
+    { ...finding('critical', 'yagni: interface with one implementation'), category: 'over-engineering' },
+    finding('high', 'unchecked index'),
+  ]);
+
+  assert.equal(result.highestSeverity, 'high');
+});

@@ -55,6 +55,7 @@ export const REVIEW_SCHEMA: Record<string, unknown> = {
               'api-design',
               'testing',
               'maintainability',
+              'over-engineering',
               'documentation',
             ],
           },

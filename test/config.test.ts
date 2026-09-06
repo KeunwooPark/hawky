@@ -57,6 +57,39 @@ test('a misspelled fail-on-severity warns instead of silently disabling the gate
   assert.match(warnings[0], /will not gate/);
 });
 
+test('the over-engineering pass is on by default', () => {
+  const { cfg, warnings } = withInputs({});
+  assert.equal(cfg.ponytail, 'full');
+  assert.deepEqual(warnings, []);
+});
+
+test('ponytail: off is the way back to a defects-only review', () => {
+  assert.equal(withInputs({ ponytail: 'off' }).cfg.ponytail, 'off');
+  assert.equal(withInputs({}, 'ponytail: off\n').cfg.ponytail, 'off');
+});
+
+test('a ponytail level is read from the config file', () => {
+  const { cfg, warnings } = withInputs({}, 'ponytail: ultra\n');
+  assert.equal(cfg.ponytail, 'ultra');
+  assert.deepEqual(warnings, []);
+});
+
+test('ponytail written as a flag turns the pass on at full', () => {
+  // YAML would have parsed a bare `true` into a boolean; both spellings mean on.
+  assert.equal(withInputs({ ponytail: 'true' }).cfg.ponytail, 'full');
+  assert.equal(withInputs({}, 'ponytail: true\n').cfg.ponytail, 'full');
+  assert.equal(withInputs({}, 'ponytail: false\n').cfg.ponytail, 'off');
+});
+
+test('a misspelled ponytail level warns instead of silently switching the pass off', () => {
+  const { cfg, warnings } = withInputs({ ponytail: 'extra' });
+
+  // Reading a typo as "off" would grant a request nobody made, and quietly.
+  assert.equal(cfg.ponytail, 'full');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /Unknown ponytail level "extra"/);
+});
+
 test('a misspelled min-severity warns instead of silently widening the filter', () => {
   const { cfg, warnings } = withInputs({ 'min-severity': 'hgih' });
   assert.equal(cfg.minSeverity, 'medium');
