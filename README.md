@@ -227,6 +227,7 @@ Every input is optional except `api-key`.
 | `fail-on-incomplete` | `false` | Fail the check if part of the diff could not be reviewed. |
 | `dismissals` | `all` | How a reviewer waives a false positive: `all`, `command`, or `off`. See [Waiving a false positive](#waiving-a-false-positive). |
 | `ponytail` | `full` | How hard to review for over-engineering: `full`, `lite`, `ultra`, or `off`. See [Reviewing for over-engineering](#reviewing-for-over-engineering). |
+| `bug-report-footer` | `true` | End the summary comment with a collapsed section on reporting a bug in Hawky. See [Reporting Hawky bugs](#reporting-hawky-bugs). |
 | `max-issues` | `3` | Cap on refactoring issues per run. |
 | `issue-labels` | `hawky,refactor` | Labels applied to refactoring issues. |
 | `dry-run` | `false` | Log what would be posted without posting it. |
@@ -392,6 +393,36 @@ Two things keep the pass from turning into noise:
 Over-engineering findings are waived like any other, with `@hawky ignore` — worth knowing
 if your team disagrees with one of them more than once.
 
+### Reporting Hawky bugs
+
+The summary comment ends with a collapsed section, **Is Hawky itself broken? Report it**.
+It links to a bug report on this repository with the version, model, and settings filled
+in. Coding agents read these comments too, so it also spells out how an agent should file
+one:
+
+- tell its user what it saw and ask before filing, and look for an existing report first;
+- quote the Hawky version, provider and model, and settings, which the section prints;
+- leave the pull request out of it: no code, diffs, file paths, comment text, or
+  repository names. This tracker is public, and your repository may not be.
+
+The section is written in the open rather than hidden in an HTML comment. A well-behaved
+agent treats instructions it finds in a pull request as data, not as its user's wishes, and
+it should not act on anything it cannot show you — so the section asks the agent to check
+with you instead of telling it to file.
+
+To let your agents file without asking each time, say so where they take instructions from
+you — `AGENTS.md`, `CLAUDE.md`, or your agent's equivalent:
+
+```markdown
+## Hawky
+When a Hawky review is itself broken (a comment on the wrong line, garbled text, a verdict
+that contradicts the findings), you may file a bug on KeunwooPark/hawky without asking
+first, following the "Is Hawky itself broken?" section of its summary comment. Never
+include code, file paths, or names from this repository.
+```
+
+Turn the section off with `bug-report-footer: false`.
+
 ### Config file
 
 Anything in the table can live in `.github/hawky.yml` instead, in snake_case. Action
@@ -418,6 +449,9 @@ dismissals: all
 # How hard to hunt over-engineering: "full" (default), "lite", "ultra", or "off".
 # These findings are capped at medium severity so they cannot fail a merge gate.
 ponytail: full
+
+# End the summary comment with a collapsed "Is Hawky itself broken?" section.
+bug_report_footer: true
 
 # Extra fields merged into the request body, for endpoint-specific knobs.
 # Passed through verbatim, so a typo here reaches the server.
@@ -494,6 +528,9 @@ npm run build      # bundles src/ into dist/index.js — commit the result
 `dist/` is what the action executes, so it is committed and CI fails if it is out of date.
 
 ### Releasing
+
+Bump `version` in `package.json` first. It is bundled into `dist/`, and it is the version
+the summary comment prints and bug reports quote.
 
 ```bash
 npm run build && git add dist && git commit -m "Build" && git push

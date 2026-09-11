@@ -1,0 +1,59 @@
+name: Bug report
+description: Hawky misbehaved — a comment on the wrong line, garbled output, a wrong verdict, a crash.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **This tracker is public.** Do not paste code, diffs, file paths, review comment text, or
+        repository and organization names from a private repository. Describe the shape of the
+        problem, or write a minimal repro from scratch.
+
+        Disagreeing with a finding is not a Hawky bug: reply `@hawky ignore <reason>` in its thread.
+  - type: input
+    id: version
+    attributes:
+      label: Hawky version
+      description: Printed in the summary comment's "Is Hawky itself broken?" section.
+      placeholder: 1.4.0
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Provider and model
+      placeholder: anthropic/claude-opus-5
+    validations:
+      required: true
+  - type: input
+    id: settings
+    attributes:
+      label: Settings
+      description: The ones the summary comment lists, plus anything else you changed from the defaults.
+      placeholder: mode review, fail-on-severity high, dismissals all, ponytail full
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: finding-id
+    attributes:
+      label: Finding id
+      description: >-
+        If the bug concerns one finding. It is the 16-digit hex id in the hidden `<!-- hawky:… -->`
+        marker at the end of its comment, or printed beside it in the summary.
+  - type: dropdown
+    id: reporter
+    attributes:
+      label: Filed by
+      options:
+        - A person
+        - A coding agent, on behalf of its user

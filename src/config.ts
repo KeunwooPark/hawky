@@ -48,6 +48,8 @@ export interface Config {
   dismissals: Dismissals;
   /** How hard to hunt over-engineering alongside defects. */
   ponytail: Ponytail;
+  /** Append a collapsed "report a Hawky bug" section to the summary comment. */
+  bugReportFooter: boolean;
   maxIssues: number;
   issueLabels: string[];
   dryRun: boolean;
@@ -134,6 +136,7 @@ const KNOWN_FILE_KEYS = [
   'fail_on_incomplete',
   'dismissals',
   'ponytail',
+  'bug_report_footer',
   'max_issues',
   'issue_labels',
   'dry_run',
@@ -311,6 +314,11 @@ export function loadConfig(): Config {
       (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
     dismissals: pickDismissals(pick('dismissals', 'dismissals')),
     ponytail: pickPonytail(pick('ponytail', 'ponytail')),
+    // On unless switched off by name: it is how Hawky's own bugs get reported, so
+    // a typo should not be what quietly removes it.
+    bugReportFooter: !['false', 'no', 'off'].includes(
+      (pick('bug-report-footer', 'bug_report_footer') ?? 'true').toLowerCase(),
+    ),
     maxIssues: num('max-issues', 'max_issues', 3),
     issueLabels: (() => {
       const l = [...splitList(input('issue-labels')), ...asStringList(file.issue_labels)];

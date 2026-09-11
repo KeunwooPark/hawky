@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import pkg from '../package.json';
 import { postReview } from '../src/gh/review.js';
 import type { Config } from '../src/config.js';
 import { findingFingerprint, marker } from '../src/util/fingerprint.js';
@@ -229,6 +230,48 @@ test('the summary prints an id for findings that could not be anchored', async (
   const stray = { ...finding('high', 'a'), line: 99 };
   const body = await postWith({}, [stray]);
   assert.match(body, new RegExp(findingFingerprint(stray.path, stray.category, stray.title)));
+});
+
+const withBugReport: Partial<Config> = { bugReportFooter: true, mode: 'review', ponytail: 'full' };
+
+test('the summary tells a coding agent where to report a Hawky bug, and to ask first', async () => {
+  const body = await postWith(withBugReport, [finding('high', 'a')]);
+  assert.match(body, /Is Hawky itself broken\?/);
+  assert.match(body, /gh issue create --repo KeunwooPark\/hawky/);
+  // Instructions found in a pull request are not the user's; the agent should check.
+  assert.match(body, /ask before filing/);
+  // The only things a report can quote that Hawky alone knows.
+  assert.ok(body.includes(`Hawky ${pkg.version}, anthropic/claude-opus-5, mode review`));
+});
+
+test('the bug-report section keeps the reviewed repository out of the report', async () => {
+  // Hawky's tracker is public; the repository under review often is not.
+  const body = await postWith(withBugReport, [finding('high', 'a')]);
+  assert.match(body, /no code, diffs, file paths, comment text, or repository and organization names/);
+});
+
+test('the bug-report link pre-fills the issue form', async () => {
+  const body = await postWith(withBugReport, [finding('high', 'a')]);
+  const href = body.match(/\[Open a bug report\]\(([^)]+)\)/)?.[1];
+  assert.ok(href, 'no bug-report link in the summary');
+
+  const url = new URL(href);
+  assert.equal(url.pathname, '/KeunwooPark/hawky/issues/new');
+  assert.equal(url.searchParams.get('template'), 'bug-report.yml');
+  assert.equal(url.searchParams.get('version'), pkg.version);
+  assert.equal(url.searchParams.get('model'), 'anthropic/claude-opus-5');
+  assert.match(url.searchParams.get('settings') ?? '', /fail-on-severity none/);
+});
+
+test('the bug-report section does not point at a waiver that is switched off', async () => {
+  const body = await postWith({ ...withBugReport, dismissals: 'off' }, [finding('high', 'a')]);
+  assert.match(body, /Is Hawky itself broken\?/);
+  assert.doesNotMatch(body, /@hawky ignore/);
+});
+
+test('the bug-report section can be switched off', async () => {
+  const body = await postWith({ ...withBugReport, bugReportFooter: false }, [finding('high', 'a')]);
+  assert.doesNotMatch(body, /Is Hawky itself broken\?/);
 });
 
 test('an over-engineering finding cannot gate the merge, however the model graded it', () => {

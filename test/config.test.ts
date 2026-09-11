@@ -123,6 +123,20 @@ test('an unrecognised config-file key is named rather than ignored', () => {
   assert.match(warnings[0], /unknown key "fail_on_sevrity"/);
 });
 
+test('the bug-report footer is on by default', () => {
+  const { cfg, warnings } = withInputs({});
+  assert.equal(cfg.bugReportFooter, true);
+  assert.deepEqual(warnings, []);
+});
+
+test('the bug-report footer can be switched off from the input or the config file', () => {
+  assert.equal(withInputs({ 'bug-report-footer': 'false' }).cfg.bugReportFooter, false);
+  // YAML parses a bare `false` into a boolean; it must still mean off.
+  const { cfg, warnings } = withInputs({}, 'bug_report_footer: false\n');
+  assert.equal(cfg.bugReportFooter, false);
+  assert.deepEqual(warnings, []);
+});
+
 test('dismissals default to every gesture', () => {
   const { cfg, warnings } = withInputs({});
   assert.equal(cfg.dismissals, 'all');
