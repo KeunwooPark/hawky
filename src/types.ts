@@ -66,6 +66,20 @@ export interface Provider {
   complete<T>(req: CompleteRequest): Promise<CompleteResponse<T>>;
 }
 
+/**
+ * The reviewable diff, plus what was left out of it.
+ *
+ * The omissions travel with the files because the model has to be told about
+ * them: a definition in a file that was excluded, was too large to render, or did
+ * not survive `max_files` is invisible, and a reviewer who cannot see it reports
+ * the symbol as undefined rather than as unshown.
+ */
+export interface Diff {
+  files: DiffFile[];
+  /** Paths this change touched that are not in `files`. */
+  omitted: string[];
+}
+
 /** A file in the diff, reduced to what the reviewer needs. */
 export interface DiffFile {
   path: string;

@@ -118,30 +118,81 @@ export function buildSystemPrompt(cfg: Config, mode: Mode): string {
     }
   }
 
+  // Rules naming a field only a `Finding` has are gated on `wantsFindings`. A
+  // refactor-only run produces no findings, so asking it to weigh a `confidence` or
+  // anchor to a `+` line is a contract for output it must not send.
+  parts.push(`## Rules`, ``);
+
+  if (wantsFindings) {
+    parts.push(
+      `- Anchor every finding to a line marked \`+\` in the diff. The number in the left gutter is the line number to use.`,
+      `  Never anchor to an unchanged context line, and never invent a line number.`,
+    );
+  }
+
   parts.push(
-    `## Rules`,
-    ``,
-    `- Anchor every finding to a line marked \`+\` in the diff. The number in the left gutter is the line number to use.`,
-    `  Never anchor to an unchanged context line, and never invent a line number.`,
     `- You are reading a partial view of the codebase. If a symbol, import, or caller is not shown, assume it exists and`,
     `  is correct. Do not report something as missing or undefined when it is simply outside the diff.`,
-    `- Report a defect only if you can name the input or state that triggers it and the resulting behaviour. If you`,
-    `  cannot, drop it.`,
-    `- Set \`confidence\` honestly. Below 0.6 means you are guessing; that finding will be discarded, which is the`,
-    `  correct outcome for a guess.`,
+  );
+
+  if (wantsFindings) {
+    parts.push(
+      `- Report a defect only if you can name the input or state that triggers it and the resulting behaviour. If you`,
+      `  cannot, drop it.`,
+      `- Set \`confidence\` honestly. Anything below ${cfg.minConfidence} is discarded on this run, which is the correct`,
+      `  outcome for a guess.`,
+    );
+  }
+
+  parts.push(
     `- No style, formatting, naming, or comment-density opinions unless the project guidelines below ask for them.`,
     `  Linters and formatters already handle those and the author does not want them from you.`,
-    `- No praise, no summary of what the code does, no "consider adding tests" boilerplate. If a specific untested`,
-    `  branch will break, say which branch and why.`,
-    `- One finding per distinct problem. Do not repeat the same issue across several lines; report it once at the`,
-    `  clearest location.`,
-    `- Every field holds a finished answer, not your working-out. Do not narrate your deliberation, weigh options`,
-    `  against each other, or trail off mid-thought inside a \`body\`. If you have not reached a conclusion, the`,
-    `  finding does not go in.`,
-    `- Prefer few high-signal findings over many. An empty \`findings\` array is a perfectly good review of a clean change.`,
-    `- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`,
-    `  keeping the surrounding indentation, so it can be applied directly.`,
   );
+
+  if (wantsFindings) {
+    parts.push(
+      `- Inside a finding: no praise, no restating what the code does, no "consider adding tests" boilerplate. The`,
+      `  top-level \`summary\` field is the one place that describes the change. If a specific untested branch will`,
+      `  break, say which branch and why.`,
+    );
+  }
+
+  parts.push(
+    `- Raise each distinct problem once, at the clearest location. Do not repeat the same one across several lines.`,
+    `- Every field holds a finished answer, not your working-out. Do not narrate your deliberation, weigh options`,
+    `  against each other, or trail off mid-thought inside a \`body\`. If you have not reached a conclusion, it does`,
+    `  not go in.`,
+    ...(wantsFindings
+      ? [
+          `- Prefer few high-signal findings over many. An empty \`findings\` array is a perfectly good review of a clean change.`,
+        ]
+      : [
+          `- Prefer few high-signal refactors over many. An empty \`refactors\` array is a perfectly good review of a change`,
+          `  that exposes nothing structural.`,
+        ]),
+  );
+
+  if (wantsFindings) {
+    parts.push(
+      `- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`,
+      `  keeping the surrounding indentation, so it can be applied directly.`,
+    );
+    // The floor the run actually filters on. Left unsaid, the model spends output on
+    // findings that are discarded before anyone reads them.
+    if (cfg.minSeverity !== 'low') {
+      parts.push(
+        `- Findings below \`${cfg.minSeverity}\` severity are discarded on this run. Do not spend output on them.`,
+      );
+    }
+  } else {
+    // The schema requires `findings` in every mode, and this one posts no inline
+    // comments: whatever comes back in it is dropped without being read. Left
+    // unsaid, that is a mandatory field the model pays for and nobody sees.
+    parts.push(
+      `- Return \`findings\` as an empty array. The schema requires the field, but this run posts no inline comments`,
+      `  and anything in it is discarded — put everything you have to say in \`refactors\` and \`summary\`.`,
+    );
+  }
 
   if (cfg.ponytail !== 'off') {
     parts.push(...ponytailSection(cfg.ponytail, wantsFindings));
@@ -165,10 +216,19 @@ export function buildSystemPrompt(cfg: Config, mode: Mode): string {
     `Each hunk is rendered with head-revision line numbers in the left gutter:`,
     ``,
     `\`\`\``,
+    `      @@ -40,3 +42,4 @@         <- hunk header: the lines below it start at line 42`,
     `   42 +  const x = compute();   <- added line 42, you may comment here`,
     `   43    return x;              <- unchanged context line 43, do not comment here`,
-    `      -  const y = old();       <- removed line, no line number`,
+    `    -   const y = old();        <- removed line, no line number`,
     `\`\`\``,
+    ``,
+    `A file arrives as a series of hunks, and the line numbers jump where one hunk ends and the next begins.`,
+    `Every line in that gap exists in the file and is simply not shown to you: a hunk starting at line 300 after`,
+    `one that ended at line 42 means lines 43 to 299 are real code you cannot see. Imports, definitions, helpers,`,
+    `and earlier uses of a variable are usually in those gaps rather than absent, so a symbol you cannot find is`,
+    `almost never actually missing. A note that the diff was truncated means the same thing: what it replaced`,
+    `exists. Never report a symbol as undefined, uninitialised, unused, or never called on the strength of not`,
+    `seeing it here.`,
     ``,
     `Respond with JSON matching the required schema and nothing else.`,
   );
@@ -176,11 +236,21 @@ export function buildSystemPrompt(cfg: Config, mode: Mode): string {
   return parts.join('\n');
 }
 
+/**
+ * How many withheld paths to name before falling back to a count. The list exists
+ * to stop the model calling a symbol undefined, which the first several paths and
+ * a total do as well as an exhaustive list would — and a change that touches
+ * hundreds of generated files should not spend the batch budget listing them.
+ */
+const MAX_OMITTED_LISTED = 20;
+
 export function buildUserPrompt(
   target: Target,
   files: DiffFile[],
   batchIndex: number,
   batchCount: number,
+  /** Paths this change touched that are not in `files`; see `Diff.omitted`. */
+  omitted: string[],
 ): string {
   const header = [
     `# Pull request`,
@@ -195,6 +265,21 @@ export function buildUserPrompt(
   if (batchCount > 1) {
     header.push(
       `This is part ${batchIndex + 1} of ${batchCount}. Review only the files below; other files are handled separately.`,
+      ``,
+    );
+  }
+
+  if (omitted.length) {
+    const listed = omitted.slice(0, MAX_OMITTED_LISTED);
+    header.push(
+      `# Changed but not shown`,
+      ``,
+      `This change also touched the files below and they are not in the diff that follows: they were excluded`,
+      `by configuration, are binary, were deleted, or did not fit this run. Whatever they contain is real code.`,
+      `Do not report a symbol as missing, undefined, or never used because it is defined in one of these.`,
+      ``,
+      ...listed.map((p) => `- ${p}`),
+      ...(omitted.length > listed.length ? [`- ... and ${omitted.length - listed.length} more`] : []),
       ``,
     );
   }

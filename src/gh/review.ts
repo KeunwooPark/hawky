@@ -187,6 +187,8 @@ function renderSummary(
   dismissed: DismissedFinding[],
   cfg: Config,
   dropped: number,
+  /** How many of `dropped` went because their line was not in the diff at all. */
+  misanchored: number,
   highest: Severity | null,
   incomplete: boolean,
 ): string {
@@ -256,7 +258,10 @@ function renderSummary(
   if (dropped) {
     lines.push(
       `_${dropped} lower-signal finding${dropped === 1 ? '' : 's'} filtered out ` +
-        `(below \`${cfg.minSeverity}\` severity or \`${cfg.minConfidence}\` confidence, or already commented on)._`,
+        `(below \`${cfg.minSeverity}\` severity or \`${cfg.minConfidence}\` confidence, or already commented on)` +
+        // Named apart from the rest: these went as unreliable, not as low-signal.
+        (misanchored ? `, including ${misanchored} that did not anchor to a changed line` : '') +
+        '._',
       '',
     );
   }
@@ -351,7 +356,26 @@ export async function postReview(
     else active.push(f);
   }
 
-  const kept = active
+  // A finding whose line is nowhere in the diff is the strongest evidence there is
+  // that the model misread its partial view of the file and invented the location.
+  // It leaves the run: published, it is the review talking about code that is not
+  // there, and gating on it fails a merge over a hallucination. Judged here rather
+  // than in the posting loop below because anchorability is a property of the
+  // finding, not of whether this particular run happens to be posting it.
+  const anchorable: Finding[] = [];
+  for (const f of active) {
+    if (resolveAnchor(f, byPath.get(f.path)!)) {
+      anchorable.push(f);
+      continue;
+    }
+    core.warning(
+      `Discarded ${f.severity} ${f.path}:${f.line} — ${f.title}: line ${f.line} is not part of the diff, ` +
+        'so the finding does not describe a line this pull request changed.',
+    );
+  }
+  const misanchored = active.length - anchorable.length;
+
+  const kept = anchorable
     .filter((f) => !alreadyPosted.has(findingFingerprint(f.path, f.category, f.title)))
     .slice(0, cfg.maxComments);
 
@@ -360,12 +384,8 @@ export async function postReview(
   const comments: Array<Record<string, unknown>> = [];
 
   for (const finding of kept) {
-    const file = byPath.get(finding.path)!;
-    const anchor = resolveAnchor(finding, file);
-    if (!anchor) {
-      unanchored.push(finding);
-      continue;
-    }
+    // Cannot be null: everything in `kept` came through the anchorable filter above.
+    const anchor = resolveAnchor(finding, byPath.get(finding.path)!)!;
     posted.push(finding);
     comments.push({
       path: finding.path,
@@ -380,15 +400,26 @@ export async function postReview(
   // counted among the ones quietly filtered out.
   const dropped = before - posted.length - unanchored.length - dismissed.length;
 
-  // Gate on everything that survived the quality filters, whether or not GitHub
-  // let us anchor it inline and whether or not an earlier run already commented
-  // on it: an unresolved critical finding is still critical on the second push.
-  const highestSeverity = active.reduce<Severity | null>(
+  // Gate on everything that survived the quality filters and anchored to a line
+  // this pull request actually changed, whether or not GitHub accepted the inline
+  // comment and whether or not an earlier run already commented on it: an
+  // unresolved critical finding is still critical on the second push.
+  const highestSeverity = anchorable.reduce<Severity | null>(
     (acc, f) => (acc === null || SEVERITY_ORDER[f.severity] > SEVERITY_ORDER[acc] ? f.severity : acc),
     null,
   );
 
-  const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, highestSeverity, incomplete);
+  const summaryBody = renderSummary(
+    summary,
+    posted,
+    unanchored,
+    dismissed,
+    cfg,
+    dropped,
+    misanchored,
+    highestSeverity,
+    incomplete,
+  );
 
   if (cfg.dryRun) {
     core.info('[dry-run] Would post the following review:');
@@ -423,7 +454,7 @@ export async function postReview(
         repo,
         pull_number,
         issueComments,
-        renderSummary(summary, [], unanchored, dismissed, cfg, dropped, highestSeverity, incomplete),
+        renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, highestSeverity, incomplete),
       );
       return { posted, unanchored, dismissed, highestSeverity };
     }

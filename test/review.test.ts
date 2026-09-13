@@ -4,6 +4,7 @@ import pkg from '../package.json';
 import { postReview } from '../src/gh/review.js';
 import type { Config } from '../src/config.js';
 import { findingFingerprint, marker } from '../src/util/fingerprint.js';
+import { captureWarnings } from './warnings.js';
 import type { DiffFile, Finding, Severity } from '../src/types.js';
 
 const LIST_REVIEW_COMMENTS = Symbol('pulls.listReviewComments');
@@ -71,8 +72,17 @@ function finding(severity: Severity, title: string, confidence = 0.9): Finding {
   };
 }
 
+/**
+ * Warnings are collected rather than printed: discarding a mis-anchored finding
+ * warns by design, and here that is a fixture rather than a problem with the run.
+ */
+const postCapturing = (findings: Finding[], existing: ReviewCommentStub[] = []) =>
+  captureWarnings(() =>
+    postReview(stubOctokit(existing), 'o', 'r', 1, 'sha', 'summary', findings, [file('src/a.ts')], cfg),
+  );
+
 const post = (findings: Finding[], existing: ReviewCommentStub[] = []) =>
-  postReview(stubOctokit(existing), 'o', 'r', 1, 'sha', 'summary', findings, [file('src/a.ts')], cfg);
+  postCapturing(findings, existing).then(({ result }) => result);
 
 test('gating severity reflects the highest finding that cleared the filters', async () => {
   const result = await post([finding('medium', 'a'), finding('critical', 'b')]);
@@ -166,17 +176,19 @@ function capturingOctokit(existingReviewComments: ReviewCommentStub[] = []) {
 
 const postWith = async (overrides: Partial<Config>, findings: Finding[], incomplete = false) => {
   const { octokit, bodies } = capturingOctokit();
-  await postReview(
-    octokit,
-    'o',
-    'r',
-    1,
-    'sha',
-    'summary',
-    findings,
-    [file('src/a.ts')],
-    { ...cfg, ...overrides } as Config,
-    incomplete,
+  await captureWarnings(() =>
+    postReview(
+      octokit,
+      'o',
+      'r',
+      1,
+      'sha',
+      'summary',
+      findings,
+      [file('src/a.ts')],
+      { ...cfg, ...overrides } as Config,
+      incomplete,
+    ),
   );
   return bodies[0] ?? '';
 };
@@ -225,11 +237,87 @@ test('the summary names who waived a finding and why', async () => {
   assert.match(body, /@alice waived it: the caller already checks this/);
 });
 
-test('the summary prints an id for findings that could not be anchored', async () => {
-  // There is no thread to reply in for these, so the id is the only way to waive one.
-  const stray = { ...finding('high', 'a'), line: 99 };
-  const body = await postWith({}, [stray]);
-  assert.match(body, new RegExp(findingFingerprint(stray.path, stray.category, stray.title)));
+test('a finding on a line that is not in the diff is discarded, not published', async () => {
+  // The strongest evidence of a hallucination there is: the model read a partial
+  // view of the file and invented the location. Publishing it is the review
+  // talking about code that is not there.
+  const stray = { ...finding('critical', 'a'), line: 99 };
+
+  const result = await post([stray]);
+
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.unanchored.length, 0);
+  // And it must not fail a merge on the way out.
+  assert.equal(result.highestSeverity, null);
+});
+
+test('discarding a mis-anchored finding says so in the log', async () => {
+  const { warnings } = await postCapturing([{ ...finding('critical', 'a'), line: 99 }]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /line 99 is not part of the diff/);
+});
+
+test('a mis-anchored finding is counted as filtered out, with the reason', async () => {
+  const body = await postWith({}, [{ ...finding('high', 'a'), line: 99 }]);
+
+  assert.match(body, /did not anchor to a changed line/);
+  // Not dressed up as a finding the reader still has to evaluate.
+  assert.doesNotMatch(body, /could not be anchored/);
+});
+
+test('a mis-anchored finding does not suppress the ones that do anchor', async () => {
+  const result = await post([{ ...finding('critical', 'a'), line: 99 }, finding('high', 'b')]);
+
+  assert.equal(result.posted.length, 1);
+  assert.equal(result.posted[0].title, 'b');
+  assert.equal(result.highestSeverity, 'high');
+});
+
+/** Octokit whose review POST fails, as GitHub's does when it rejects one anchor. */
+function rejectingOctokit() {
+  const bodies: string[] = [];
+  const octokit = {
+    paginate: async (route: unknown) => {
+      if (route === LIST_REVIEW_COMMENTS) return [];
+      if (route === LIST_ISSUE_COMMENTS) return [];
+      throw new Error('unexpected paginate route');
+    },
+    rest: {
+      pulls: {
+        listReviewComments: LIST_REVIEW_COMMENTS,
+        createReview: async () => {
+          throw new Error('422 Unprocessable Entity');
+        },
+      },
+      issues: {
+        listComments: LIST_ISSUE_COMMENTS,
+        createComment: async ({ body }: { body: string }) => {
+          bodies.push(body);
+          return {};
+        },
+        updateComment: async () => ({}),
+      },
+    },
+  } as never;
+  return { octokit, bodies };
+}
+
+test('a review GitHub rejects wholesale keeps its findings, with ids to waive them', async () => {
+  // Distinct from a mis-anchor: these anchored to real changed lines and the POST
+  // still failed. They are genuine findings, and with no thread to reply in the id
+  // is the only handle for waiving one.
+  const f = finding('high', 'a');
+  const { octokit, bodies } = rejectingOctokit();
+
+  const { result } = await captureWarnings(() =>
+    postReview(octokit, 'o', 'r', 1, 'sha', 'summary', [f], [file('src/a.ts')], cfg),
+  );
+
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.unanchored.length, 1);
+  const body = bodies[0] ?? '';
+  assert.match(body, /could not be anchored/);
+  assert.match(body, new RegExp(findingFingerprint(f.path, f.category, f.title)));
 });
 
 const withBugReport: Partial<Config> = { bugReportFooter: true, mode: 'review', ponytail: 'full' };

@@ -1,7 +1,7 @@
 import * as core from '@actions/core';
 import { minimatch } from 'minimatch';
 import type { Config } from '../config.js';
-import type { DiffFile } from '../types.js';
+import type { Diff, DiffFile } from '../types.js';
 import type { Octokit } from './client.js';
 
 /**
@@ -59,18 +59,18 @@ function toDiffFiles(
     patch?: string;
   }>,
   cfg: Config,
-): DiffFile[] {
+): Diff {
   const kept: DiffFile[] = [];
-  let skipped = 0;
+  const omitted: string[] = [];
 
   for (const f of files) {
     // No `patch` means binary or too large for the API to render.
     if (!f.patch || f.status === 'removed' || f.additions === 0) {
-      skipped++;
+      omitted.push(f.filename);
       continue;
     }
     if (isExcluded(f.filename, cfg)) {
-      skipped++;
+      omitted.push(f.filename);
       continue;
     }
     const { commentableLines, annotated } = parsePatch(f.patch);
@@ -86,15 +86,18 @@ function toDiffFiles(
     });
   }
 
-  core.info(`Diff: ${kept.length} file(s) to review, ${skipped} skipped (binary, deleted, or filtered).`);
+  core.info(`Diff: ${kept.length} file(s) to review, ${omitted.length} skipped (binary, deleted, or filtered).`);
 
   // Review the smallest files first so a maxFiles cut keeps the most files.
   kept.sort((a, b) => a.annotated.length - b.annotated.length);
   if (kept.length > cfg.maxFiles) {
     core.warning(`Reviewing the first ${cfg.maxFiles} of ${kept.length} changed files (max_files).`);
-    return kept.slice(0, cfg.maxFiles);
+    return {
+      files: kept.slice(0, cfg.maxFiles),
+      omitted: [...omitted, ...kept.slice(cfg.maxFiles).map((f) => f.path)],
+    };
   }
-  return kept;
+  return { files: kept, omitted };
 }
 
 export async function getPullRequestDiff(
@@ -103,7 +106,7 @@ export async function getPullRequestDiff(
   repo: string,
   pull_number: number,
   cfg: Config,
-): Promise<DiffFile[]> {
+): Promise<Diff> {
   const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
     owner,
     repo,
@@ -120,13 +123,49 @@ export async function getCompareDiff(
   base: string,
   head: string,
   cfg: Config,
-): Promise<DiffFile[]> {
+): Promise<Diff> {
   const { data } = await octokit.rest.repos.compareCommitsWithBasehead({
     owner,
     repo,
     basehead: `${base}...${head}`,
   });
   return toDiffFiles(data.files ?? [], cfg);
+}
+
+/**
+ * Shrink one oversized file's diff so it fits a batch.
+ *
+ * Cutting the rendered text at an arbitrary character leaves a severed line, and
+ * half a statement reads as a defect: the model reports the missing half rather
+ * than the truncation. So the cut lands on a line boundary and the kept lines are
+ * re-rendered from the patch, which is also what keeps `commentableLines` honest.
+ * Carried over untouched it would still list lines that were cut away, and
+ * anchoring a comment to one of those makes GitHub reject the whole review.
+ */
+function truncateFile(file: DiffFile, maxChars: number): DiffFile {
+  // What parsePatch prepends to every line: a five-wide gutter and a marker column.
+  const GUTTER = 7;
+  const lines = file.patch.split('\n');
+  const kept: string[] = [];
+  let size = 0;
+
+  for (const line of lines) {
+    // Always keep one line, or a budget smaller than the first line yields no diff at all.
+    if (kept.length && size + line.length + GUTTER > maxChars) break;
+    kept.push(line);
+    size += line.length + GUTTER;
+  }
+
+  const omitted = lines.length - kept.length;
+  const { commentableLines, annotated } = parsePatch(kept.join('\n'));
+  return {
+    ...file,
+    commentableLines,
+    annotated:
+      `${annotated}\n\n` +
+      `... ${omitted} more diff line(s) in this file are not shown (too large to review in full); ` +
+      'the code they contain exists ...',
+  };
 }
 
 /** Pack files into batches that fit a single LLM call. */
@@ -137,13 +176,7 @@ export function batchFiles(files: DiffFile[], maxChars: number): DiffFile[][] {
 
   for (const raw of files) {
     // A single file can exceed the batch budget; truncate rather than blow the context window.
-    const file =
-      raw.annotated.length > maxChars
-        ? {
-            ...raw,
-            annotated: `${raw.annotated.slice(0, maxChars)}\n      ... diff truncated (file too large to review in full) ...`,
-          }
-        : raw;
+    const file = raw.annotated.length > maxChars ? truncateFile(raw, maxChars) : raw;
     const cost = file.annotated.length + file.path.length + 64;
     if (current.length && size + cost > maxChars) {
       batches.push(current);

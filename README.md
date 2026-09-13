@@ -259,10 +259,10 @@ until a push produces a run with no finding at or above the threshold.
 
 Three details matter if you rely on this:
 
-- The gate looks at every finding that clears `min-severity` and `min-confidence`,
-  including ones an earlier run already commented on. Pushing again does not clear a
-  finding the model still reports — fixing the code does, or waiving it does when the
-  model is wrong.
+- The gate looks at every finding that clears `min-severity` and `min-confidence` and
+  anchors to a line this pull request changed, including ones an earlier run already
+  commented on. Pushing again does not clear a finding the model still reports — fixing
+  the code does, or waiving it does when the model is wrong.
 - `fail-on-incomplete: true` also fails the check when an LLM call errors out and part of
   the diff went unreviewed. Without it, a partly-reviewed diff can report a pass.
 - The step still posts its comments before failing, so authors see what to fix.
@@ -295,9 +295,10 @@ So a maintainer can waive a finding. Reply in its thread:
 Or resolve the review thread, which means the same thing. Either way the next run drops
 that finding: it stops gating, and it is not reposted.
 
-Findings that could not be anchored to a changed line live in the summary comment instead
-of a thread, so the summary prints an id for each one. Name it in a comment on the pull
-request:
+A finding can also end up in the summary comment rather than in a thread of its own: when
+GitHub rejects the review as a whole, every comment in it falls back there rather than
+being lost. Those have no thread to reply in, so the summary prints an id for each one.
+Name it in a comment on the pull request:
 
 ```
 @hawky ignore 4f2c9a1b7e0d3c56 generated file, not hand-edited
@@ -505,14 +506,18 @@ sent.
 ## How it works
 
 1. Fetch the changed files from the GitHub API — no checkout, no `git` shelling out.
-2. Filter out excluded, binary, and deleted files.
+2. Filter out excluded, binary, and deleted files, and name the ones that were withheld in
+   the prompt. A definition the model cannot see is the usual reason a review calls a
+   symbol undefined, so it is told which files changed without being shown.
 3. Re-render each hunk with head-revision line numbers in the gutter, so the model
    anchors to real, addressable lines.
 4. Pack files into batches and send each with a JSON schema the response must satisfy,
    then check the response against that schema before using it.
-5. Validate every anchor against the lines actually present in the diff. GitHub rejects an
-   entire review with a 422 if one comment points outside the diff, so findings that
-   cannot be anchored are folded into the summary rather than dropped.
+5. Validate every anchor against the lines actually present in the diff, and discard any
+   finding pointing outside it. A line that is not in the diff means the model misread its
+   partial view and invented the location, so the finding is neither posted nor gated on,
+   and the run log names it. This also keeps GitHub from rejecting the entire review with
+   a 422, which one bad anchor is enough to cause.
 6. Post one review with all inline comments, and update the sticky summary in place.
 7. File refactoring issues, skipping anything already tracked.
 
@@ -559,9 +564,17 @@ check `permissions:` against the table in Quick start.
 **"Resource not accessible by integration".** The job is missing `pull-requests: write` or
 `issues: write`, or the repository default token is read-only.
 
-**Comments appear in the summary instead of inline.** The model anchored to a line that is
-not part of the diff, so the finding was folded into the summary rather than dropped. This
-is expected occasionally; if it is most of them, the model is likely too small for the job.
+**Comments appear in the summary instead of inline.** GitHub rejected the review as a
+whole, so every comment in it fell back to the summary rather than being lost. The run log
+names the underlying error.
+
+**Hawky commented on a variable or function that does not exist.** It sees only the changed
+hunks, and the line numbers jump over everything between them, so a definition a few lines
+away can be invisible to it. Three things work against that: the prompt says a gap in the
+numbering is unseen code rather than absent code, it lists the files that changed without
+being shown, and any finding anchored to a line outside the diff is discarded and named in
+the run log. If it still happens often, the model is likely too small for the job — and it
+is worth reporting, because a review should not discuss code it was never shown.
 
 **"never finished the JSON answer within N output tokens".** Every rung of the retry
 ladder was spent: thinking off, budget doubled three times, and the reply was still cut

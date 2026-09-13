@@ -40267,15 +40267,15 @@ function isExcluded(path, cfg) {
 }
 function toDiffFiles(files, cfg) {
     const kept = [];
-    let skipped = 0;
+    const omitted = [];
     for (const f of files) {
         // No `patch` means binary or too large for the API to render.
         if (!f.patch || f.status === 'removed' || f.additions === 0) {
-            skipped++;
+            omitted.push(f.filename);
             continue;
         }
         if (isExcluded(f.filename, cfg)) {
-            skipped++;
+            omitted.push(f.filename);
             continue;
         }
         const { commentableLines, annotated } = parsePatch(f.patch);
@@ -40290,14 +40290,17 @@ function toDiffFiles(files, cfg) {
             annotated,
         });
     }
-    core.info(`Diff: ${kept.length} file(s) to review, ${skipped} skipped (binary, deleted, or filtered).`);
+    core.info(`Diff: ${kept.length} file(s) to review, ${omitted.length} skipped (binary, deleted, or filtered).`);
     // Review the smallest files first so a maxFiles cut keeps the most files.
     kept.sort((a, b) => a.annotated.length - b.annotated.length);
     if (kept.length > cfg.maxFiles) {
         core.warning(`Reviewing the first ${cfg.maxFiles} of ${kept.length} changed files (max_files).`);
-        return kept.slice(0, cfg.maxFiles);
+        return {
+            files: kept.slice(0, cfg.maxFiles),
+            omitted: [...omitted, ...kept.slice(cfg.maxFiles).map((f) => f.path)],
+        };
     }
-    return kept;
+    return { files: kept, omitted };
 }
 async function getPullRequestDiff(octokit, owner, repo, pull_number, cfg) {
     const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
@@ -40316,6 +40319,39 @@ async function getCompareDiff(octokit, owner, repo, base, head, cfg) {
     });
     return toDiffFiles(data.files ?? [], cfg);
 }
+/**
+ * Shrink one oversized file's diff so it fits a batch.
+ *
+ * Cutting the rendered text at an arbitrary character leaves a severed line, and
+ * half a statement reads as a defect: the model reports the missing half rather
+ * than the truncation. So the cut lands on a line boundary and the kept lines are
+ * re-rendered from the patch, which is also what keeps `commentableLines` honest.
+ * Carried over untouched it would still list lines that were cut away, and
+ * anchoring a comment to one of those makes GitHub reject the whole review.
+ */
+function truncateFile(file, maxChars) {
+    // What parsePatch prepends to every line: a five-wide gutter and a marker column.
+    const GUTTER = 7;
+    const lines = file.patch.split('\n');
+    const kept = [];
+    let size = 0;
+    for (const line of lines) {
+        // Always keep one line, or a budget smaller than the first line yields no diff at all.
+        if (kept.length && size + line.length + GUTTER > maxChars)
+            break;
+        kept.push(line);
+        size += line.length + GUTTER;
+    }
+    const omitted = lines.length - kept.length;
+    const { commentableLines, annotated } = parsePatch(kept.join('\n'));
+    return {
+        ...file,
+        commentableLines,
+        annotated: `${annotated}\n\n` +
+            `... ${omitted} more diff line(s) in this file are not shown (too large to review in full); ` +
+            'the code they contain exists ...',
+    };
+}
 /** Pack files into batches that fit a single LLM call. */
 function batchFiles(files, maxChars) {
     const batches = [];
@@ -40323,12 +40359,7 @@ function batchFiles(files, maxChars) {
     let size = 0;
     for (const raw of files) {
         // A single file can exceed the batch budget; truncate rather than blow the context window.
-        const file = raw.annotated.length > maxChars
-            ? {
-                ...raw,
-                annotated: `${raw.annotated.slice(0, maxChars)}\n      ... diff truncated (file too large to review in full) ...`,
-            }
-            : raw;
+        const file = raw.annotated.length > maxChars ? truncateFile(raw, maxChars) : raw;
         const cost = file.annotated.length + file.path.length + 64;
         if (current.length && size + cost > maxChars) {
             batches.push(current);
@@ -40940,7 +40971,9 @@ function renderBugReport(cfg) {
         '',
     ];
 }
-function renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, highest, incomplete) {
+function renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, 
+/** How many of `dropped` went because their line was not in the diff at all. */
+misanchored, highest, incomplete) {
     const lines = [
         fingerprint_js_1.SUMMARY_MARKER,
         '## Hawky review',
@@ -40985,7 +41018,10 @@ function renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, hig
     }
     if (dropped) {
         lines.push(`_${dropped} lower-signal finding${dropped === 1 ? '' : 's'} filtered out ` +
-            `(below \`${cfg.minSeverity}\` severity or \`${cfg.minConfidence}\` confidence, or already commented on)._`, '');
+            `(below \`${cfg.minSeverity}\` severity or \`${cfg.minConfidence}\` confidence, or already commented on)` +
+            // Named apart from the rest: these went as unreliable, not as low-signal.
+            (misanchored ? `, including ${misanchored} that did not anchor to a changed line` : '') +
+            '._', '');
     }
     if (cfg.dismissals !== 'off') {
         lines.push('<sub>Wrong about something? Reply `@hawky ignore <reason>` in its thread' +
@@ -41042,19 +41078,31 @@ incomplete = false) {
         else
             active.push(f);
     }
-    const kept = active
+    // A finding whose line is nowhere in the diff is the strongest evidence there is
+    // that the model misread its partial view of the file and invented the location.
+    // It leaves the run: published, it is the review talking about code that is not
+    // there, and gating on it fails a merge over a hallucination. Judged here rather
+    // than in the posting loop below because anchorability is a property of the
+    // finding, not of whether this particular run happens to be posting it.
+    const anchorable = [];
+    for (const f of active) {
+        if (resolveAnchor(f, byPath.get(f.path))) {
+            anchorable.push(f);
+            continue;
+        }
+        core.warning(`Discarded ${f.severity} ${f.path}:${f.line} — ${f.title}: line ${f.line} is not part of the diff, ` +
+            'so the finding does not describe a line this pull request changed.');
+    }
+    const misanchored = active.length - anchorable.length;
+    const kept = anchorable
         .filter((f) => !alreadyPosted.has((0, fingerprint_js_1.findingFingerprint)(f.path, f.category, f.title)))
         .slice(0, cfg.maxComments);
     const posted = [];
     const unanchored = [];
     const comments = [];
     for (const finding of kept) {
-        const file = byPath.get(finding.path);
-        const anchor = resolveAnchor(finding, file);
-        if (!anchor) {
-            unanchored.push(finding);
-            continue;
-        }
+        // Cannot be null: everything in `kept` came through the anchorable filter above.
+        const anchor = resolveAnchor(finding, byPath.get(finding.path));
         posted.push(finding);
         comments.push({
             path: finding.path,
@@ -41067,11 +41115,12 @@ incomplete = false) {
     // Waived findings are reported in their own section, so they must not also be
     // counted among the ones quietly filtered out.
     const dropped = before - posted.length - unanchored.length - dismissed.length;
-    // Gate on everything that survived the quality filters, whether or not GitHub
-    // let us anchor it inline and whether or not an earlier run already commented
-    // on it: an unresolved critical finding is still critical on the second push.
-    const highestSeverity = active.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
-    const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, highestSeverity, incomplete);
+    // Gate on everything that survived the quality filters and anchored to a line
+    // this pull request actually changed, whether or not GitHub accepted the inline
+    // comment and whether or not an earlier run already commented on it: an
+    // unresolved critical finding is still critical on the second push.
+    const highestSeverity = anchorable.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
+    const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, misanchored, highestSeverity, incomplete);
     if (cfg.dryRun) {
         core.info('[dry-run] Would post the following review:');
         core.info(summaryBody);
@@ -41098,7 +41147,7 @@ incomplete = false) {
             core.warning(`Could not post inline comments (${err.message}). Including them in the summary instead.`);
             unanchored.push(...posted);
             posted.length = 0;
-            await upsertSummary(octokit, owner, repo, pull_number, issueComments, renderSummary(summary, [], unanchored, dismissed, cfg, dropped, highestSeverity, incomplete));
+            await upsertSummary(octokit, owner, repo, pull_number, issueComments, renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, highestSeverity, incomplete));
             return { posted, unanchored, dismissed, highestSeverity };
         }
     }
@@ -42049,11 +42098,11 @@ async function run() {
     core.info(`Hawky: mode=${cfg.mode} provider=${cfg.provider} model=${cfg.model}` +
         (cfg.ponytail === 'off' ? '' : ` ponytail=${cfg.ponytail}`) +
         (target.pullNumber ? ` pr=#${target.pullNumber}` : ` commit=${target.headSha.slice(0, 7)}`));
-    const files = target.pullNumber
+    const { files, omitted } = target.pullNumber
         ? await (0, diff_js_1.getPullRequestDiff)(octokit, target.owner, target.repo, target.pullNumber, cfg)
         : target.baseSha
             ? await (0, diff_js_1.getCompareDiff)(octokit, target.owner, target.repo, target.baseSha, target.headSha, cfg)
-            : [];
+            : { files: [], omitted: [] };
     if (!files.length) {
         core.info('Nothing to review after filtering. Exiting.');
         core.setOutput('findings-count', 0);
@@ -42077,7 +42126,7 @@ async function run() {
         try {
             const { data, usage } = await provider.complete({
                 system,
-                user: (0, prompts_js_1.buildUserPrompt)(target, batch, index, batches.length),
+                user: (0, prompts_js_1.buildUserPrompt)(target, batch, index, batches.length, omitted),
                 schema: schema_js_1.REVIEW_SCHEMA,
                 schemaName: 'code_review',
                 // The system prompt is identical for every batch, so cache it once.
@@ -42262,17 +42311,62 @@ function buildSystemPrompt(cfg, mode) {
             parts.push(`Prefer the ones that end with less code than they started with. A refactor that deletes a layer beats one`, `that adds a better layer.`, ``);
         }
     }
-    parts.push(`## Rules`, ``, `- Anchor every finding to a line marked \`+\` in the diff. The number in the left gutter is the line number to use.`, `  Never anchor to an unchanged context line, and never invent a line number.`, `- You are reading a partial view of the codebase. If a symbol, import, or caller is not shown, assume it exists and`, `  is correct. Do not report something as missing or undefined when it is simply outside the diff.`, `- Report a defect only if you can name the input or state that triggers it and the resulting behaviour. If you`, `  cannot, drop it.`, `- Set \`confidence\` honestly. Below 0.6 means you are guessing; that finding will be discarded, which is the`, `  correct outcome for a guess.`, `- No style, formatting, naming, or comment-density opinions unless the project guidelines below ask for them.`, `  Linters and formatters already handle those and the author does not want them from you.`, `- No praise, no summary of what the code does, no "consider adding tests" boilerplate. If a specific untested`, `  branch will break, say which branch and why.`, `- One finding per distinct problem. Do not repeat the same issue across several lines; report it once at the`, `  clearest location.`, `- Every field holds a finished answer, not your working-out. Do not narrate your deliberation, weigh options`, `  against each other, or trail off mid-thought inside a \`body\`. If you have not reached a conclusion, the`, `  finding does not go in.`, `- Prefer few high-signal findings over many. An empty \`findings\` array is a perfectly good review of a clean change.`, `- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`, `  keeping the surrounding indentation, so it can be applied directly.`);
+    // Rules naming a field only a `Finding` has are gated on `wantsFindings`. A
+    // refactor-only run produces no findings, so asking it to weigh a `confidence` or
+    // anchor to a `+` line is a contract for output it must not send.
+    parts.push(`## Rules`, ``);
+    if (wantsFindings) {
+        parts.push(`- Anchor every finding to a line marked \`+\` in the diff. The number in the left gutter is the line number to use.`, `  Never anchor to an unchanged context line, and never invent a line number.`);
+    }
+    parts.push(`- You are reading a partial view of the codebase. If a symbol, import, or caller is not shown, assume it exists and`, `  is correct. Do not report something as missing or undefined when it is simply outside the diff.`);
+    if (wantsFindings) {
+        parts.push(`- Report a defect only if you can name the input or state that triggers it and the resulting behaviour. If you`, `  cannot, drop it.`, `- Set \`confidence\` honestly. Anything below ${cfg.minConfidence} is discarded on this run, which is the correct`, `  outcome for a guess.`);
+    }
+    parts.push(`- No style, formatting, naming, or comment-density opinions unless the project guidelines below ask for them.`, `  Linters and formatters already handle those and the author does not want them from you.`);
+    if (wantsFindings) {
+        parts.push(`- Inside a finding: no praise, no restating what the code does, no "consider adding tests" boilerplate. The`, `  top-level \`summary\` field is the one place that describes the change. If a specific untested branch will`, `  break, say which branch and why.`);
+    }
+    parts.push(`- Raise each distinct problem once, at the clearest location. Do not repeat the same one across several lines.`, `- Every field holds a finished answer, not your working-out. Do not narrate your deliberation, weigh options`, `  against each other, or trail off mid-thought inside a \`body\`. If you have not reached a conclusion, it does`, `  not go in.`, ...(wantsFindings
+        ? [
+            `- Prefer few high-signal findings over many. An empty \`findings\` array is a perfectly good review of a clean change.`,
+        ]
+        : [
+            `- Prefer few high-signal refactors over many. An empty \`refactors\` array is a perfectly good review of a change`,
+            `  that exposes nothing structural.`,
+        ]));
+    if (wantsFindings) {
+        parts.push(`- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`, `  keeping the surrounding indentation, so it can be applied directly.`);
+        // The floor the run actually filters on. Left unsaid, the model spends output on
+        // findings that are discarded before anyone reads them.
+        if (cfg.minSeverity !== 'low') {
+            parts.push(`- Findings below \`${cfg.minSeverity}\` severity are discarded on this run. Do not spend output on them.`);
+        }
+    }
+    else {
+        // The schema requires `findings` in every mode, and this one posts no inline
+        // comments: whatever comes back in it is dropped without being read. Left
+        // unsaid, that is a mandatory field the model pays for and nobody sees.
+        parts.push(`- Return \`findings\` as an empty array. The schema requires the field, but this run posts no inline comments`, `  and anything in it is discarded — put everything you have to say in \`refactors\` and \`summary\`.`);
+    }
     if (cfg.ponytail !== 'off') {
         parts.push(...ponytailSection(cfg.ponytail, wantsFindings));
     }
     if (cfg.guidelines.trim()) {
         parts.push(``, `## Project guidelines`, ``, `These come from the repository maintainers and take precedence over your defaults:`, ``, cfg.guidelines.trim());
     }
-    parts.push(``, `## Diff format`, ``, `Each hunk is rendered with head-revision line numbers in the left gutter:`, ``, `\`\`\``, `   42 +  const x = compute();   <- added line 42, you may comment here`, `   43    return x;              <- unchanged context line 43, do not comment here`, `      -  const y = old();       <- removed line, no line number`, `\`\`\``, ``, `Respond with JSON matching the required schema and nothing else.`);
+    parts.push(``, `## Diff format`, ``, `Each hunk is rendered with head-revision line numbers in the left gutter:`, ``, `\`\`\``, `      @@ -40,3 +42,4 @@         <- hunk header: the lines below it start at line 42`, `   42 +  const x = compute();   <- added line 42, you may comment here`, `   43    return x;              <- unchanged context line 43, do not comment here`, `    -   const y = old();        <- removed line, no line number`, `\`\`\``, ``, `A file arrives as a series of hunks, and the line numbers jump where one hunk ends and the next begins.`, `Every line in that gap exists in the file and is simply not shown to you: a hunk starting at line 300 after`, `one that ended at line 42 means lines 43 to 299 are real code you cannot see. Imports, definitions, helpers,`, `and earlier uses of a variable are usually in those gaps rather than absent, so a symbol you cannot find is`, `almost never actually missing. A note that the diff was truncated means the same thing: what it replaced`, `exists. Never report a symbol as undefined, uninitialised, unused, or never called on the strength of not`, `seeing it here.`, ``, `Respond with JSON matching the required schema and nothing else.`);
     return parts.join('\n');
 }
-function buildUserPrompt(target, files, batchIndex, batchCount) {
+/**
+ * How many withheld paths to name before falling back to a count. The list exists
+ * to stop the model calling a symbol undefined, which the first several paths and
+ * a total do as well as an exhaustive list would — and a change that touches
+ * hundreds of generated files should not spend the batch budget listing them.
+ */
+const MAX_OMITTED_LISTED = 20;
+function buildUserPrompt(target, files, batchIndex, batchCount, 
+/** Paths this change touched that are not in `files`; see `Diff.omitted`. */
+omitted) {
     const header = [
         `# Pull request`,
         ``,
@@ -42284,6 +42378,10 @@ function buildUserPrompt(target, files, batchIndex, batchCount) {
     ];
     if (batchCount > 1) {
         header.push(`This is part ${batchIndex + 1} of ${batchCount}. Review only the files below; other files are handled separately.`, ``);
+    }
+    if (omitted.length) {
+        const listed = omitted.slice(0, MAX_OMITTED_LISTED);
+        header.push(`# Changed but not shown`, ``, `This change also touched the files below and they are not in the diff that follows: they were excluded`, `by configuration, are binary, were deleted, or did not fit this run. Whatever they contain is real code.`, `Do not report a symbol as missing, undefined, or never used because it is defined in one of these.`, ``, ...listed.map((p) => `- ${p}`), ...(omitted.length > listed.length ? [`- ... and ${omitted.length - listed.length} more`] : []), ``);
     }
     header.push(`# Changed files`, ``);
     for (const file of files) {
@@ -63254,7 +63352,7 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],"disallowed_STD3_valid"],[[45
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"hawky","version":"1.5.0","private":true,"description":"LLM-powered pull request reviewer and refactoring-issue generator for GitHub Actions","main":"dist/index.js","scripts":{"build":"ncc build src/main.ts -o dist --source-map --license licenses.txt","typecheck":"tsc --noEmit","all":"npm run typecheck && npm run build","test":"node --import tsx --test test/*.test.ts"},"license":"MIT","dependencies":{"@actions/core":"^1.11.1","@actions/github":"^6.0.0","@anthropic-ai/sdk":"^0.72.0","js-yaml":"^4.1.0","minimatch":"^10.0.1","openai":"^4.104.0"},"devDependencies":{"@types/js-yaml":"^4.0.9","@types/node":"^22.10.0","@vercel/ncc":"^0.38.3","tsx":"^4.23.12","typescript":"^5.7.2"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"hawky","version":"1.6.0","private":true,"description":"LLM-powered pull request reviewer and refactoring-issue generator for GitHub Actions","main":"dist/index.js","scripts":{"build":"ncc build src/main.ts -o dist --source-map --license licenses.txt","typecheck":"tsc --noEmit","all":"npm run typecheck && npm run build","test":"node --import tsx --test test/*.test.ts"},"license":"MIT","dependencies":{"@actions/core":"^1.11.1","@actions/github":"^6.0.0","@anthropic-ai/sdk":"^0.72.0","js-yaml":"^4.1.0","minimatch":"^10.0.1","openai":"^4.104.0"},"devDependencies":{"@types/js-yaml":"^4.0.9","@types/node":"^22.10.0","@vercel/ncc":"^0.38.3","tsx":"^4.23.12","typescript":"^5.7.2"}}');
 
 /***/ })
 

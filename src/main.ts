@@ -74,11 +74,11 @@ async function run(): Promise<void> {
       (target.pullNumber ? ` pr=#${target.pullNumber}` : ` commit=${target.headSha.slice(0, 7)}`),
   );
 
-  const files = target.pullNumber
+  const { files, omitted } = target.pullNumber
     ? await getPullRequestDiff(octokit, target.owner, target.repo, target.pullNumber, cfg)
     : target.baseSha
       ? await getCompareDiff(octokit, target.owner, target.repo, target.baseSha, target.headSha, cfg)
-      : [];
+      : { files: [], omitted: [] };
 
   if (!files.length) {
     core.info('Nothing to review after filtering. Exiting.');
@@ -106,7 +106,7 @@ async function run(): Promise<void> {
     try {
       const { data, usage } = await provider.complete<ModelResult>({
         system,
-        user: buildUserPrompt(target, batch, index, batches.length),
+        user: buildUserPrompt(target, batch, index, batches.length, omitted),
         schema: REVIEW_SCHEMA,
         schemaName: 'code_review',
         // The system prompt is identical for every batch, so cache it once.

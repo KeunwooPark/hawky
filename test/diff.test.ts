@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { batchFiles, parsePatch } from '../src/gh/diff.js';
+import { batchFiles, getCompareDiff, parsePatch } from '../src/gh/diff.js';
 import { resolveAnchor } from '../src/gh/review.js';
 import { parseJsonObject } from '../src/llm/json.js';
 import { extractFingerprints, findingFingerprint, marker } from '../src/util/fingerprint.js';
+import { captureWarnings } from './warnings.js';
+import type { Config } from '../src/config.js';
 import type { DiffFile, Finding } from '../src/types.js';
 
 const PATCH = [
@@ -62,6 +64,16 @@ function finding(line: number, end?: number): Finding {
   };
 }
 
+/** A file whose diff is far larger than any batch budget under test. */
+function largeFile(addedLines: number): DiffFile {
+  const patch = [
+    `@@ -1,1 +1,${addedLines} @@`,
+    ...Array.from({ length: addedLines }, (_, i) => `+  const value${i} = ${i};`),
+  ].join('\n');
+  const { annotated, commentableLines } = parsePatch(patch);
+  return { ...fileWith([]), patch, annotated, commentableLines };
+}
+
 test('resolveAnchor rejects a line that is not in the diff', () => {
   assert.equal(resolveAnchor(finding(99), fileWith([1, 2, 3])), null);
 });
@@ -90,10 +102,81 @@ test('batchFiles packs files under the character budget', () => {
 });
 
 test('batchFiles truncates a file larger than a whole batch', () => {
-  const [batch] = batchFiles([{ ...fileWith([1]), annotated: 'x'.repeat(5000) }], 1000);
+  const [batch] = batchFiles([largeFile(200)], 1000);
   assert.equal(batch.length, 1);
-  assert.ok(batch[0].annotated.length < 1200);
-  assert.match(batch[0].annotated, /diff truncated/);
+  assert.match(batch[0].annotated, /more diff line\(s\) in this file are not shown/);
+});
+
+test('batchFiles truncates on a line boundary, never mid-statement', () => {
+  const [[file]] = batchFiles([largeFile(200)], 1000);
+
+  // Half a statement reads as a defect, so the model must never be shown one.
+  const body = file.annotated.split('\n\n...')[0];
+  const shown = body.split('\n').filter((l) => l.includes('const value'));
+  assert.ok(shown.length > 1, 'expected several lines to survive the cut');
+  for (const line of shown) {
+    assert.match(line, /const value\d+ = \d+;$/, `severed line: ${JSON.stringify(line)}`);
+  }
+});
+
+test('truncating a file prunes the lines it invites comments on', () => {
+  const full = largeFile(200);
+  const [[file]] = batchFiles([full], 1000);
+
+  // Anchoring to a line that was cut away makes GitHub reject the whole review.
+  assert.ok(file.commentableLines.size < full.commentableLines.size);
+  assert.ok(file.commentableLines.size > 0);
+  const lastShown = Math.max(...file.commentableLines);
+  assert.ok(!file.commentableLines.has(lastShown + 1), 'kept a line that is no longer shown');
+  for (const line of file.commentableLines) {
+    assert.match(file.annotated, new RegExp(`^\\s*${line} \\+`, 'm'), `line ${line} is not in the diff`);
+  }
+});
+
+/** Minimal Octokit stand-in for the compare endpoint getCompareDiff calls. */
+function compareStub(files: Array<Record<string, unknown>>) {
+  return { rest: { repos: { compareCommitsWithBasehead: async () => ({ data: { files } }) } } } as never;
+}
+
+const diffCfg = { include: [], exclude: [], maxFiles: 60 } as unknown as Config;
+
+const compare = (files: Array<Record<string, unknown>>, over: Partial<Config> = {}) =>
+  getCompareDiff(compareStub(files), 'o', 'r', 'base', 'head', { ...diffCfg, ...over } as Config);
+
+test('files withheld from the review are reported back, not silently forgotten', async () => {
+  // A definition in any of these is invisible to the model, which is how a review
+  // ends up calling a symbol undefined.
+  const { files, omitted } = await compare(
+    [
+      { filename: 'src/a.ts', status: 'modified', additions: 1, deletions: 0, patch: '@@ -1,1 +1,1 @@\n+const a = 1;' },
+      { filename: 'src/logo.png', status: 'added', additions: 0, deletions: 0 },
+      { filename: 'src/gone.ts', status: 'removed', additions: 0, deletions: 9, patch: '@@ -1,1 +0,0 @@\n-const x = 1;' },
+      { filename: 'package-lock.json', status: 'modified', additions: 5, deletions: 1, patch: '@@ -1,1 +1,5 @@\n+dep' },
+    ],
+    { exclude: ['**/package-lock.json'] },
+  );
+
+  assert.deepEqual(
+    files.map((f) => f.path),
+    ['src/a.ts'],
+  );
+  assert.deepEqual([...omitted].sort(), ['package-lock.json', 'src/gone.ts', 'src/logo.png']);
+});
+
+test('files cut by max_files are reported as omitted too', async () => {
+  const many = [1, 2, 3].map((n) => ({
+    filename: `src/f${n}.ts`,
+    status: 'modified',
+    additions: 1,
+    deletions: 0,
+    patch: `@@ -1,1 +1,1 @@\n+const v = '${'x'.repeat(n * 30)}';`,
+  }));
+
+  const { result } = await captureWarnings(() => compare(many, { maxFiles: 2 }));
+
+  assert.equal(result.files.length, 2);
+  // Smallest are reviewed first, so the largest is the one that gets cut.
+  assert.deepEqual(result.omitted, ['src/f3.ts']);
 });
 
 test('parseJsonObject recovers JSON from a fenced or chatty response', () => {
