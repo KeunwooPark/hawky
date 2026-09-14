@@ -385,6 +385,78 @@ test('an empty finding is counted as filtered out, and named as empty', async ()
   assert.doesNotMatch(body, /could not be anchored/);
 });
 
+/** A diff file whose patch text the identifier checks can actually read. */
+const withPatch = (patch: string): DiffFile => ({ ...file('src/a.ts'), patch });
+
+const postAgainst = (findings: Finding[], diffFile: DiffFile) =>
+  captureWarnings(() =>
+    postReview(stubOctokit([]), 'o', 'r', 1, 'sha', SUMMARY, findings, [diffFile], cfg),
+  );
+
+const PATCH = '+  const retries = new TransientRetries();\n';
+
+test('a finding asserting something duplicates itself does not gate the merge', async () => {
+  // Reported: on a diff of one changed line, a medium over-engineering finding
+  // claiming an identifier absent from the repository was a bug-for-bug
+  // duplicate of itself. It turned the required check red, and clearing it cost
+  // a waiver and a re-run — for a sentence that cannot be true of any code.
+  const degenerate = {
+    ...finding('critical', 'delete: `fix-versn-ab12c` is a bug-for-bug duplicate of `fix-versn-ab12c`'),
+    category: 'correctness' as const,
+  };
+
+  const { result } = await postAgainst([degenerate], withPatch(PATCH));
+
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.unanchored.length, 0);
+  assert.equal(result.highestSeverity, null);
+});
+
+test('a finding naming only code that is absent from the file is discarded', async () => {
+  const stray = finding('critical', '`fix-versn-ab12c` leaks the caller handle');
+
+  const { result } = await postAgainst([stray], withPatch(PATCH));
+
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.highestSeverity, null);
+});
+
+test('a finding naming code that is really in the file is left alone', async () => {
+  // The check must not eat findings that do their job. This one names code the
+  // patch contains, so nothing about it is degenerate.
+  const real = finding('high', '`TransientRetries` is never reset between batches');
+
+  const { result } = await postAgainst([real], withPatch(PATCH));
+
+  assert.equal(result.posted.length, 1);
+  assert.equal(result.highestSeverity, 'high');
+});
+
+test('discarding a degenerate finding says so in the log', async () => {
+  const { warnings } = await postAgainst(
+    [finding('critical', '`fix-versn-ab12c` is a duplicate of `fix-versn-ab12c`')],
+    withPatch(PATCH),
+  );
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /duplicate of itself/);
+  // The reason reaches a pull request comment; it must not carry the text with it.
+  assert.doesNotMatch(warnings[0], /bug-for-bug/);
+});
+
+test('a degenerate finding does not suppress the ones that say something', async () => {
+  const { result } = await postAgainst(
+    [
+      finding('critical', '`fix-versn-ab12c` is a duplicate of `fix-versn-ab12c`'),
+      finding('high', '`TransientRetries` is never reset between batches'),
+    ],
+    withPatch(PATCH),
+  );
+
+  assert.equal(result.posted.length, 1);
+  assert.equal(result.highestSeverity, 'high');
+});
+
 /** Octokit whose review POST fails, as GitHub's does when it rejects one anchor. */
 function rejectingOctokit() {
   const bodies: string[] = [];

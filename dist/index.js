@@ -40861,6 +40861,7 @@ exports.postReview = postReview;
 const core = __importStar(__nccwpck_require__(7484));
 const package_json_1 = __importDefault(__nccwpck_require__(8330));
 const types_js_1 = __nccwpck_require__(8522);
+const finding_js_1 = __nccwpck_require__(1649);
 const fingerprint_js_1 = __nccwpck_require__(7284);
 const dismissals_js_1 = __nccwpck_require__(3069);
 const SEVERITY_LABEL = {
@@ -41073,7 +41074,9 @@ function renderSummary(summary, posted, unanchored, dismissed, cfg, dropped,
 /** How many of `dropped` went because their line was not in the diff at all. */
 misanchored, 
 /** How many of `dropped` went because the model wrote nothing in them. */
-textless, highest, incomplete) {
+textless, 
+/** How many of `dropped` went because their text could not describe the diff. */
+degenerate, highest, incomplete) {
     const lines = [
         fingerprint_js_1.SUMMARY_MARKER,
         '## Hawky review',
@@ -41121,10 +41124,14 @@ textless, highest, incomplete) {
         const named = [
             misanchored ? `${misanchored} that did not anchor to a changed line` : '',
             textless ? `${textless} the model left empty` : '',
+            degenerate ? `${degenerate} whose text could not describe this diff` : '',
         ].filter(Boolean);
+        const list = named.length <= 2
+            ? named.join(' and ')
+            : `${named.slice(0, -1).join(', ')} and ${named[named.length - 1]}`;
         lines.push(`_${dropped} lower-signal finding${dropped === 1 ? '' : 's'} filtered out ` +
             `(below \`${cfg.minSeverity}\` severity or \`${cfg.minConfidence}\` confidence, or already commented on)` +
-            (named.length ? `, including ${named.join(' and ')}` : '') +
+            (named.length ? `, including ${list}` : '') +
             '._', '');
     }
     if (cfg.dismissals !== 'off') {
@@ -41179,7 +41186,24 @@ incomplete = false) {
             `${f.title.trim() ? 'description' : 'title or description'}, which makes no claim anyone could act on.`);
     }
     const textless = before - written.length;
-    const qualified = written
+    // Judged next, and for the same reason: a finding whose text cannot be true of
+    // any diff is not a finding, and at `fail-on-severity: medium` one of them is
+    // enough to stop a merge. Neither remedy applies to it — there is no code to
+    // change, and a waiver is a statement that a specific claim was considered,
+    // which cannot honestly be written about a claim that says nothing. Warned
+    // about individually, like an empty finding: this is a defect in the response,
+    // not a routine filtering decision.
+    const describing = [];
+    for (const f of written) {
+        const reason = (0, finding_js_1.screenFinding)(f, byPath.get(f.path)?.patch ?? '');
+        if (!reason) {
+            describing.push(f);
+            continue;
+        }
+        core.warning(`Discarded ${f.severity} ${f.path}:${f.line}: ${reason}. It is not reported and does not gate the merge.`);
+    }
+    const degenerate = written.length - describing.length;
+    const qualified = describing
         .filter((f) => byPath.has(f.path))
         .map(capOverEngineering)
         .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
@@ -41238,7 +41262,7 @@ incomplete = false) {
     // comment and whether or not an earlier run already commented on it: an
     // unresolved critical finding is still critical on the second push.
     const highestSeverity = anchorable.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
-    const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, misanchored, textless, highestSeverity, incomplete);
+    const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, misanchored, textless, degenerate, highestSeverity, incomplete);
     if (cfg.dryRun) {
         core.info('[dry-run] Would post the following review:');
         core.info(summaryBody);
@@ -41265,7 +41289,7 @@ incomplete = false) {
             core.warning(`Could not post inline comments (${err.message}). Including them in the summary instead.`);
             unanchored.push(...posted);
             posted.length = 0;
-            await upsertSummary(octokit, owner, repo, pull_number, issueComments, renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, textless, highestSeverity, incomplete));
+            await upsertSummary(octokit, owner, repo, pull_number, issueComments, renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, textless, degenerate, highestSeverity, incomplete));
             return { posted, unanchored, dismissed, highestSeverity };
         }
     }
@@ -43098,6 +43122,144 @@ exports.SEVERITY_ORDER = {
     high: 2,
     critical: 3,
 };
+
+
+/***/ }),
+
+/***/ 1649:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * Screening for the other half of a review that is free-form model prose.
+ *
+ * `summary` was screened first because it is the obviously unconstrained field.
+ * A finding's `title` is written just as freely, and a corrupted one costs more:
+ * a bad summary misleads a reader, a bad finding stops a merge.
+ *
+ * One arrived on a diff of a single changed line — a version string moved from
+ * one semver to the next, one insertion and one deletion — asserting at medium
+ * severity that an identifier occurring nowhere in the repository was a
+ * "bug-for-bug duplicate" of itself, and claiming a net of -1 lines for a change
+ * that deleted nothing. At `fail-on-severity: medium` it turned the required
+ * check red. Clearing it cost a waiver and a re-run of the job: a human
+ * judgement call spent on a sentence that cannot be true of any code.
+ *
+ * As with the summary screens, nothing here reads the text for meaning. Two
+ * properties hold of a finding that is about the diff it is anchored to,
+ * whatever it goes on to say: it does not assert that something is a duplicate
+ * of itself, and where it names code in backticks, at least some of that code is
+ * in the file it is pointing at.
+ *
+ * Only the title is screened. It is where the reported damage was, it is what
+ * the fingerprint is keyed on, and it is the one line a reader sees in the
+ * collapsed view. A body legitimately names things outside the diff — a standard
+ * library call, a type from another module, a replacement being proposed — so
+ * the same rules there would fire on well-formed findings.
+ *
+ * The reasons returned below are assembled from the rule that fired and never
+ * quote the text they rejected, for the reason the summary module does not: a
+ * reason can reach the same pull request comment, and echoing a fragment of
+ * something withheld as degenerate publishes a smaller copy of it.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.screenFinding = screenFinding;
+/** Code the model named explicitly. Two characters is the shortest worth matching. */
+const BACKTICKED = /`([^`\n]{2,})`/g;
+/**
+ * Words asserting that one thing is a restatement of another.
+ *
+ * Only these turn two mentions of one identifier into a claim about it. Without
+ * a relation in between, an identifier named twice in a title is ordinary
+ * English — "`parse` fails when `parse` is re-entered" says something.
+ */
+const RELATION = /\b(?:duplicat\w*|copy|copies|clone|clones|reimplement\w*|reimplementation|identical|same|equivalent|alias|aliases|wrapper|wraps|supersed\w*|replac\w*|shadows|repeats)\b/i;
+function backticked(text) {
+    const out = [];
+    for (const m of text.matchAll(BACKTICKED)) {
+        const id = m[1].trim();
+        if (!id)
+            continue;
+        const start = m.index ?? 0;
+        out.push({ id, start, end: start + m[0].length });
+    }
+    return out;
+}
+/**
+ * True when the title claims a relation between one identifier and itself.
+ *
+ * `X is a bug-for-bug duplicate of X` is unfalsifiable: it cannot describe any
+ * diff, because there is no pair of things for the relation to hold between.
+ * Detecting it needs no understanding of what X is — only that the same string
+ * appears on both sides of a word asserting sameness.
+ *
+ * A title naming two genuinely distinct things that happen to share a name — the
+ * same function defined in two modules — trips this. That is a real cost and an
+ * accepted one: such a title is already unreadable, since nothing in it says
+ * which of the two is meant, and the disposition is to withhold one finding with
+ * the reason logged rather than to fail anything.
+ */
+function assertsRelationToItself(title) {
+    const spots = new Map();
+    for (const { id, start, end } of backticked(title)) {
+        spots.set(id, [...(spots.get(id) ?? []), { start, end }]);
+    }
+    for (const places of spots.values()) {
+        for (let i = 1; i < places.length; i++) {
+            if (RELATION.test(title.slice(places[i - 1].end, places[i].start)))
+                return true;
+        }
+    }
+    return false;
+}
+/**
+ * True when the title names code in backticks and none of it is in the file.
+ *
+ * The reported finding named an identifier shaped like a branch or task slug — a
+ * truncated word pair and a short hex suffix — that occurs nowhere in the
+ * repository, let alone the diff. Whatever produced it, a finding whose every
+ * named identifier is absent from the file it is anchored to is not about that
+ * file, and the action is holding both at the moment it renders the comment.
+ *
+ * `none of them` rather than `any of them` deliberately. A well-formed finding
+ * routinely names something that is not in the diff — the replacement it
+ * proposes, the standard library call to use instead — alongside the code it is
+ * actually about. Requiring every identifier to be present would discard those;
+ * requiring one keeps the check to titles that touch the file nowhere at all.
+ *
+ * The whole file patch is searched rather than the single hunk the finding
+ * anchors to. A definition a few lines outside the anchor is still this file's
+ * code, and the mis-anchor check already covers findings pointing at lines the
+ * diff does not contain.
+ */
+function namesNothingInTheFile(title, patch) {
+    const ids = backticked(title).map((b) => b.id);
+    if (!ids.length)
+        return false;
+    // No patch text to check against: unverifiable, so nothing is claimed.
+    if (!patch.trim())
+        return false;
+    return !ids.some((id) => patch.includes(id));
+}
+/**
+ * Why this finding should not be published, or null when it should.
+ *
+ * Phrased to follow "Discarded …: ", and never quoting the finding.
+ */
+function screenFinding(finding, patch) {
+    const title = finding.title.trim();
+    // An empty finding is dropped before this, by the check that reads both fields.
+    if (!title)
+        return null;
+    if (assertsRelationToItself(title)) {
+        return 'its title asserts that something is a duplicate of itself, which cannot be true of any diff';
+    }
+    if (namesNothingInTheFile(title, patch)) {
+        return 'every identifier its title names is absent from the file it points at';
+    }
+    return null;
+}
 
 
 /***/ }),

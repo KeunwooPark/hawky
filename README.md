@@ -638,6 +638,14 @@ being shown, and any finding anchored to a line outside the diff is discarded an
 the run log. If it still happens often, the model is likely too small for the job — and it
 is worth reporting, because a review should not discuss code it was never shown.
 
+**A finding said something that cannot be true — that a name is a duplicate of itself, or
+it named code from nowhere.** Two checks run on every finding's title before it can reach a
+comment or the gate, neither of them reading it for meaning: a title asserting a relation
+between one identifier and itself is withheld, and so is one whose backticked identifiers
+are all absent from the file it points at. Discarded findings are named in the run log and
+counted in the filtered tally rather than published, because a finding that makes no claim
+cannot be acted on and cannot honestly be waived either.
+
 **"never finished the JSON answer within N output tokens".** Every rung of the retry
 ladder was spent: thinking turned down, budget doubled three times, and the reply was
 still cut off. The message names which wall it hit. If it went on reasoning, lowering
