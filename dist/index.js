@@ -41005,6 +41005,40 @@ function renderBugReport(cfg) {
         '',
     ];
 }
+/**
+ * The model's own prose, quoted rather than spoken in Hawky's voice.
+ *
+ * Everything else in this comment is constructed from fields this action
+ * computed — the verdict, the counts, the filtered tally — and a run arrived
+ * proving the difference matters: the structured parts were all correct while
+ * `summary` carried a block of another project's context, ending in instructions
+ * addressed to an assistant, rendered at the top of the comment above the
+ * verdict, in Hawky's voice.
+ *
+ * These comments are read by coding agents as well as by people; the bug-report
+ * section below is written to them directly. Text reaching that audience unmarked
+ * and in the tool's own voice is text the tool is vouching for. Quoting it under
+ * an attribution does not make the content safe — nothing here can — but it makes
+ * the provenance legible, which is the part Hawky is actually able to be
+ * responsible for. The verdict and the counts come first, so what the run can
+ * stand behind is what gets read first.
+ */
+function renderModelSummary(summary, cfg) {
+    const lines = [];
+    const text = summary.text.trim();
+    if (text) {
+        lines.push(`**Summary** — \`${cfg.provider}/${cfg.model}\` wrote this, quoted as given:`, '', 
+        // Every line prefixed, blank ones included, so the whole block stays inside
+        // the quote instead of ending it partway down.
+        ...text.split('\n').map((line) => (line.trim() ? `> ${line}` : '>')), '');
+    }
+    // Said rather than passed over in silence: a reader comparing this comment to
+    // the run log should not have to wonder why the model's description is missing.
+    for (const reason of new Set(summary.withheld)) {
+        lines.push(`_A summary the model wrote was withheld: ${reason}._`, '');
+    }
+    return lines;
+}
 function renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, 
 /** How many of `dropped` went because their line was not in the diff at all. */
 misanchored, 
@@ -41013,8 +41047,6 @@ textless, highest, incomplete) {
     const lines = [
         fingerprint_js_1.SUMMARY_MARKER,
         '## Hawky review',
-        '',
-        summary.trim(),
         '',
         renderVerdict(highest, cfg, incomplete, dismissed, dropped),
         '',
@@ -41032,6 +41064,7 @@ textless, highest, incomplete) {
     else {
         lines.push('No new inline comments.', '');
     }
+    lines.push(...renderModelSummary(summary, cfg));
     if (unanchored.length) {
         lines.push('<details><summary>Findings that could not be anchored to a changed line</summary>', '');
         for (const f of unanchored) {
@@ -42217,10 +42250,20 @@ const diff_js_1 = __nccwpck_require__(164);
 const review_js_1 = __nccwpck_require__(3199);
 const issues_js_1 = __nccwpck_require__(8859);
 const fingerprint_js_1 = __nccwpck_require__(7284);
-function mergeSummaries(summaries, fallback) {
+const summary_js_1 = __nccwpck_require__(7724);
+/**
+ * Join what each batch said about the files it saw.
+ *
+ * No fallback text any more. Whatever stands here is published as the model's own
+ * description of the change, and the sentence that used to fill the gap — "No
+ * defects found in the reviewed diff" — is a claim about the code that a run
+ * returning no summary has not made. The verdict line is assembled from counts
+ * and states the same thing without inventing a reviewer's voice to say it.
+ */
+function mergeSummaries(summaries) {
     const clean = summaries.map((s) => s.trim()).filter(Boolean);
     if (clean.length <= 1)
-        return clean[0] ?? fallback;
+        return clean[0] ?? '';
     return clean.map((s) => `- ${s}`).join('\n');
 }
 function logUsage(total, calls) {
@@ -42291,6 +42334,7 @@ async function run() {
     const findings = [];
     const refactors = [];
     const summaries = [];
+    const withheldSummaries = [];
     const total = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
     let failedBatches = 0;
     for (const [index, batch] of batches.entries()) {
@@ -42306,8 +42350,19 @@ async function run() {
             });
             findings.push(...(data.findings ?? []));
             refactors.push(...(data.refactors ?? []));
-            if (data.summary)
-                summaries.push(data.summary);
+            // Screened here, per batch, rather than once over the merged text: one
+            // batch coming back with a transcript should not cost the run the summaries
+            // the other batches wrote, and the warning names which batch it was.
+            if (data.summary) {
+                const screened = (0, summary_js_1.screenSummary)(data.summary);
+                if (screened.withheld) {
+                    withheldSummaries.push(screened.withheld);
+                    core.warning(`Batch ${index + 1}: kept the model's summary out of the review — ${screened.withheld}.`);
+                }
+                else if (screened.text) {
+                    summaries.push(screened.text);
+                }
+            }
             total.inputTokens += usage.inputTokens;
             total.outputTokens += usage.outputTokens;
             total.cachedInputTokens += usage.cachedInputTokens;
@@ -42329,9 +42384,12 @@ async function run() {
     if (failedBatches === batches.length) {
         throw new Error(`Every batch failed (${failedBatches} of ${batches.length}). See the warnings above for the underlying error.`);
     }
-    const summary = mergeSummaries(summaries, findings.length || refactors.length
-        ? 'The model returned no summary; see the individual findings below.'
-        : 'No defects found in the reviewed diff.');
+    const summary = { text: mergeSummaries(summaries), withheld: withheldSummaries };
+    // Hawky's own sentence, in Hawky's own voice, for the step output and the job
+    // summary: a workflow reading `summary` needs something whatever came back, and
+    // what it must never be handed is the text screening has just rejected.
+    const summaryLine = summary.text ||
+        (withheldSummaries.length ? `No summary: ${withheldSummaries[0]}.` : 'The model returned no summary.');
     let findingsPosted = 0;
     let dismissedCount = 0;
     let issuesCreated = 0;
@@ -42366,11 +42424,16 @@ async function run() {
     core.setOutput('findings-count', findingsPosted);
     core.setOutput('dismissed-count', dismissedCount);
     core.setOutput('issues-created', issuesCreated);
-    core.setOutput('summary', summary);
+    core.setOutput('summary', summaryLine);
     setVerdict(!gated && !incomplete, highest);
-    await core.summary
-        .addHeading('Hawky', 3)
-        .addRaw(summary)
+    const jobSummary = core.summary.addHeading('Hawky', 3);
+    // Quoted for the reason the pull request comment quotes it: this is the model's
+    // text, and the job summary is rendered markdown read by the same people.
+    if (summary.text)
+        jobSummary.addQuote(summary.text);
+    else
+        jobSummary.addRaw(summaryLine);
+    await jobSummary
         .addList([
         `${findingsPosted} finding(s) reported`,
         `${dismissedCount} finding(s) waived by a reviewer`,
@@ -42732,6 +42795,103 @@ exports.SUMMARY_MARKER = `<!-- ${MARKER}:${VERSION}:summary -->`;
 /** True for a comment this action wrote, marker and all. */
 function isHawkyComment(body) {
     return Boolean(body?.includes(`<!-- ${MARKER}:${VERSION}:`));
+}
+
+
+/***/ }),
+
+/***/ 7724:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+/**
+ * Screening for the one part of a review that is free-form model prose.
+ *
+ * Every other field this action publishes is constrained: a severity is an enum,
+ * a line number is checked against the diff, a finding with no text is dropped.
+ * `summary` is a string the model fills however it likes, and it is rendered into
+ * a comment on someone's pull request.
+ *
+ * A run arrived where that string was not a summary of anything. It carried a
+ * block of context belonging to an unrelated project, decayed into repeating one
+ * clause a dozen times, and ended in imperative text addressed to an assistant.
+ * Elsewhere the same class of failure put the model's entire chain of thought in
+ * the comment with `{"findings": []}` at the bottom.
+ *
+ * None of that is detectable by reading it for meaning, and this module does not
+ * try. It checks the three properties a two-to-four-sentence summary of a diff
+ * has regardless of what it says — it is not a transcript, it does not repeat
+ * itself, and it is short — and withholds the text when one of them fails.
+ * Withheld rather than truncated: in the run that prompted this the foreign block
+ * was at the *front*, so keeping the first N characters keeps precisely the part
+ * that should not be published.
+ *
+ * The reasons below are assembled from counts and never quote the text they
+ * rejected. A reason is rendered into the same comment, and echoing a fragment of
+ * a summary that was withheld for being instruction-shaped would publish a
+ * smaller copy of the problem.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.screenSummary = screenSummary;
+const json_js_1 = __nccwpck_require__(9585);
+/**
+ * The longest a summary may be before it is treated as something other than a
+ * summary. The schema asks for two to four sentences; this is several times that,
+ * so it fires on transcripts and pasted context rather than on a verbose reviewer.
+ */
+const MAX_SUMMARY_CHARS = 1500;
+/**
+ * The shortest fragment worth counting as a repeat. Below this, legitimate prose
+ * repeats itself constantly — "and", "the run", a short file name.
+ */
+const MIN_REPEATED_CHARS = 12;
+/** How many times one fragment may appear before the text counts as decayed. */
+const MAX_REPEATS = 4;
+/**
+ * How many times the most-repeated sentence-like fragment appears, or 0 when
+ * nothing repeats enough to matter.
+ *
+ * Degenerate repetition is what a decayed reply looks like from the outside: the
+ * same clause emitted five, eleven, seventeen times in a row. Splitting on
+ * sentence terminators and newlines catches it whether the model repeated whole
+ * lines or ran them together.
+ */
+function worstRepetition(text) {
+    const counts = new Map();
+    let worst = 0;
+    for (const fragment of text.split(/[\n.;!?]+/)) {
+        const normalized = fragment.trim().replace(/\s+/g, ' ').toLowerCase();
+        if (normalized.length < MIN_REPEATED_CHARS)
+            continue;
+        const seen = (counts.get(normalized) ?? 0) + 1;
+        counts.set(normalized, seen);
+        if (seen > worst)
+            worst = seen;
+    }
+    return worst;
+}
+/**
+ * Decide whether a model-written summary is publishable, without judging what it
+ * says. Order runs most-diagnostic first: a transcript is also over-long, and
+ * naming it as a transcript says more about the run than its length does.
+ */
+function screenSummary(raw) {
+    const text = raw.trim();
+    if (!text)
+        return { text: '', withheld: null };
+    const withhold = (reason) => ({ text: '', withheld: reason });
+    if ((0, json_js_1.containsReasoning)(text)) {
+        return withhold("it was the model's chain of thought rather than an answer");
+    }
+    const repeats = worstRepetition(text);
+    if (repeats > MAX_REPEATS) {
+        return withhold(`it decayed into repeating one line ${repeats} times`);
+    }
+    if (text.length > MAX_SUMMARY_CHARS) {
+        return withhold(`it ran to ${text.length.toLocaleString()} characters, where the schema asks for two to four sentences`);
+    }
+    return { text, withheld: null };
 }
 
 

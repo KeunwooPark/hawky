@@ -6,6 +6,10 @@ import type { Config } from '../src/config.js';
 import { findingFingerprint, marker } from '../src/util/fingerprint.js';
 import { captureWarnings } from './warnings.js';
 import type { DiffFile, Finding, Severity } from '../src/types.js';
+import type { ReviewSummary } from '../src/util/summary.js';
+
+/** A summary that passed screening, in the shape postReview takes it. */
+const SUMMARY: ReviewSummary = { text: 'summary', withheld: [] };
 
 const LIST_REVIEW_COMMENTS = Symbol('pulls.listReviewComments');
 const LIST_ISSUE_COMMENTS = Symbol('issues.listComments');
@@ -78,7 +82,7 @@ function finding(severity: Severity, title: string, confidence = 0.9): Finding {
  */
 const postCapturing = (findings: Finding[], existing: ReviewCommentStub[] = []) =>
   captureWarnings(() =>
-    postReview(stubOctokit(existing), 'o', 'r', 1, 'sha', 'summary', findings, [file('src/a.ts')], cfg),
+    postReview(stubOctokit(existing), 'o', 'r', 1, 'sha', SUMMARY, findings, [file('src/a.ts')], cfg),
   );
 
 const post = (findings: Finding[], existing: ReviewCommentStub[] = []) =>
@@ -174,7 +178,12 @@ function capturingOctokit(existingReviewComments: ReviewCommentStub[] = []) {
   return { octokit, bodies };
 }
 
-const postWith = async (overrides: Partial<Config>, findings: Finding[], incomplete = false) => {
+const postWith = async (
+  overrides: Partial<Config>,
+  findings: Finding[],
+  incomplete = false,
+  summary: ReviewSummary = SUMMARY,
+) => {
   const { octokit, bodies } = capturingOctokit();
   await captureWarnings(() =>
     postReview(
@@ -183,7 +192,7 @@ const postWith = async (overrides: Partial<Config>, findings: Finding[], incompl
       'r',
       1,
       'sha',
-      'summary',
+      summary,
       findings,
       [file('src/a.ts')],
       { ...cfg, ...overrides } as Config,
@@ -240,10 +249,52 @@ test('the verdict still says nothing was found when the model returned nothing',
   assert.doesNotMatch(body, /filtered out/);
 });
 
+const wrote = (text: string): ReviewSummary => ({ text, withheld: [] });
+
+test("the model's summary is quoted and attributed, not spoken in Hawky's voice", async () => {
+  // Reported: a block of another project's context, ending in text addressed to
+  // an assistant, rendered at the top of the comment as Hawky's own description
+  // of the diff. Quoting it cannot make the content safe; it makes the provenance
+  // legible, which is the part Hawky can be responsible for.
+  const body = await postWith({}, [finding('high', 'a')], false, wrote('Adds a retry loop.'));
+
+  assert.match(body, /\*\*Summary\*\* — `anthropic\/claude-opus-5` wrote this, quoted as given:/);
+  assert.match(body, /^> Adds a retry loop\./m);
+});
+
+test("the verdict is read before the model's text, not after it", async () => {
+  const body = await postWith({ failOnSeverity: 'high' }, [finding('medium', 'a')], false, wrote('Adds a retry loop.'));
+
+  // The corruption in the reported run sat above the verdict — the part of a
+  // collapsed sticky comment a reader sees first.
+  assert.ok(body.indexOf('**Passed.**') < body.indexOf('> Adds a retry loop.'));
+});
+
+test('every line of a multi-line summary stays inside the quote', async () => {
+  // A summary that breaks out of its own quote block is back to rendering model
+  // text as the comment's own structure.
+  const body = await postWith({}, [], false, wrote('First line.\n\n## Not a heading in this comment'));
+
+  assert.match(body, /^> First line\./m);
+  assert.match(body, /^>$/m);
+  assert.match(body, /^> ## Not a heading in this comment$/m);
+});
+
+test('a withheld summary is reported rather than replaced with an invented one', async () => {
+  const body = await postWith({}, [], false, {
+    text: '',
+    withheld: ['it decayed into repeating one line 11 times'],
+  });
+
+  assert.match(body, /_A summary the model wrote was withheld: it decayed into repeating one line 11 times\._/);
+  // What used to fill the gap was a claim about the code that no model made.
+  assert.doesNotMatch(body, /No defects found/);
+});
+
 test('the summary names who waived a finding and why', async () => {
   const f = finding('critical', 'b');
   const { octokit, bodies } = capturingOctokit(waived(f, 'the caller already checks this'));
-  await postReview(octokit, 'o', 'r', 1, 'sha', 'summary', [f], [file('src/a.ts')], {
+  await postReview(octokit, 'o', 'r', 1, 'sha', SUMMARY, [f], [file('src/a.ts')], {
     ...cfg,
     failOnSeverity: 'high',
   } as Config);
@@ -371,7 +422,7 @@ test('a review GitHub rejects wholesale keeps its findings, with ids to waive th
   const { octokit, bodies } = rejectingOctokit();
 
   const { result } = await captureWarnings(() =>
-    postReview(octokit, 'o', 'r', 1, 'sha', 'summary', [f], [file('src/a.ts')], cfg),
+    postReview(octokit, 'o', 'r', 1, 'sha', SUMMARY, [f], [file('src/a.ts')], cfg),
   );
 
   assert.equal(result.posted.length, 0);

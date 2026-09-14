@@ -169,6 +169,15 @@ text survives untouched. The prompt also tells the model that every field holds 
 finished answer and not its working-out — the one path stripping cannot reach is
 deliberation written *into* a finding's body.
 
+The summary is screened once more before it is published, because it is the one field
+that is free model prose rather than something this action assembled. A summary that
+comes back as a transcript, repeats one line over and over, or runs far past the few
+sentences the schema asks for is withheld from the comment whole — not truncated, since
+a leaked block tends to sit at the front — and the comment says that a summary was
+withheld and why. What survives is quoted under an attribution below the verdict rather
+than written as Hawky's own description of the change, so the parts of the comment this
+action stands behind are the parts that read in its own voice.
+
 ## Modes
 
 `mode` decides what the action does; **you** decide when it runs, from your workflow's

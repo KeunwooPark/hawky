@@ -3,6 +3,7 @@ import pkg from '../../package.json';
 import type { Config } from '../config.js';
 import { SEVERITY_ORDER, type DiffFile, type Finding, type Severity } from '../types.js';
 import { findingFingerprint, marker, SUMMARY_MARKER } from '../util/fingerprint.js';
+import type { ReviewSummary } from '../util/summary.js';
 import type { Octokit } from './client.js';
 import { type Dismissal, readThreadState } from './dismissals.js';
 
@@ -215,8 +216,50 @@ function renderBugReport(cfg: Config): string[] {
   ];
 }
 
+/**
+ * The model's own prose, quoted rather than spoken in Hawky's voice.
+ *
+ * Everything else in this comment is constructed from fields this action
+ * computed — the verdict, the counts, the filtered tally — and a run arrived
+ * proving the difference matters: the structured parts were all correct while
+ * `summary` carried a block of another project's context, ending in instructions
+ * addressed to an assistant, rendered at the top of the comment above the
+ * verdict, in Hawky's voice.
+ *
+ * These comments are read by coding agents as well as by people; the bug-report
+ * section below is written to them directly. Text reaching that audience unmarked
+ * and in the tool's own voice is text the tool is vouching for. Quoting it under
+ * an attribution does not make the content safe — nothing here can — but it makes
+ * the provenance legible, which is the part Hawky is actually able to be
+ * responsible for. The verdict and the counts come first, so what the run can
+ * stand behind is what gets read first.
+ */
+function renderModelSummary(summary: ReviewSummary, cfg: Config): string[] {
+  const lines: string[] = [];
+  const text = summary.text.trim();
+
+  if (text) {
+    lines.push(
+      `**Summary** — \`${cfg.provider}/${cfg.model}\` wrote this, quoted as given:`,
+      '',
+      // Every line prefixed, blank ones included, so the whole block stays inside
+      // the quote instead of ending it partway down.
+      ...text.split('\n').map((line) => (line.trim() ? `> ${line}` : '>')),
+      '',
+    );
+  }
+
+  // Said rather than passed over in silence: a reader comparing this comment to
+  // the run log should not have to wonder why the model's description is missing.
+  for (const reason of new Set(summary.withheld)) {
+    lines.push(`_A summary the model wrote was withheld: ${reason}._`, '');
+  }
+
+  return lines;
+}
+
 function renderSummary(
-  summary: string,
+  summary: ReviewSummary,
   posted: Finding[],
   unanchored: Finding[],
   dismissed: DismissedFinding[],
@@ -233,8 +276,6 @@ function renderSummary(
     SUMMARY_MARKER,
     '## Hawky review',
     '',
-    summary.trim(),
-    '',
     renderVerdict(highest, cfg, incomplete, dismissed, dropped),
     '',
   ];
@@ -250,6 +291,8 @@ function renderSummary(
   } else {
     lines.push('No new inline comments.', '');
   }
+
+  lines.push(...renderModelSummary(summary, cfg));
 
   if (unanchored.length) {
     lines.push(
@@ -364,7 +407,7 @@ export async function postReview(
   repo: string,
   pull_number: number,
   commit_id: string,
-  summary: string,
+  summary: ReviewSummary,
   findings: Finding[],
   files: DiffFile[],
   cfg: Config,
@@ -515,7 +558,18 @@ export async function postReview(
         repo,
         pull_number,
         issueComments,
-        renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, textless, highestSeverity, incomplete),
+        renderSummary(
+          summary,
+          [],
+          unanchored,
+          dismissed,
+          cfg,
+          dropped,
+          misanchored,
+          textless,
+          highestSeverity,
+          incomplete,
+        ),
       );
       return { posted, unanchored, dismissed, highestSeverity };
     }
