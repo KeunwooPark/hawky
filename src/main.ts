@@ -10,10 +10,20 @@ import { batchFiles, getCompareDiff, getPullRequestDiff } from './gh/diff.js';
 import { postReview } from './gh/review.js';
 import { postRefactorIssues } from './gh/issues.js';
 import { isHawkyComment } from './util/fingerprint.js';
+import { type ReviewSummary, screenSummary } from './util/summary.js';
 
-function mergeSummaries(summaries: string[], fallback: string): string {
+/**
+ * Join what each batch said about the files it saw.
+ *
+ * No fallback text any more. Whatever stands here is published as the model's own
+ * description of the change, and the sentence that used to fill the gap — "No
+ * defects found in the reviewed diff" — is a claim about the code that a run
+ * returning no summary has not made. The verdict line is assembled from counts
+ * and states the same thing without inventing a reviewer's voice to say it.
+ */
+function mergeSummaries(summaries: string[]): string {
   const clean = summaries.map((s) => s.trim()).filter(Boolean);
-  if (clean.length <= 1) return clean[0] ?? fallback;
+  if (clean.length <= 1) return clean[0] ?? '';
   return clean.map((s) => `- ${s}`).join('\n');
 }
 
@@ -98,6 +108,7 @@ async function run(): Promise<void> {
   const findings: Finding[] = [];
   const refactors: Refactor[] = [];
   const summaries: string[] = [];
+  const withheldSummaries: string[] = [];
   const total: Usage = { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
   let failedBatches = 0;
 
@@ -115,7 +126,18 @@ async function run(): Promise<void> {
 
       findings.push(...(data.findings ?? []));
       refactors.push(...(data.refactors ?? []));
-      if (data.summary) summaries.push(data.summary);
+      // Screened here, per batch, rather than once over the merged text: one
+      // batch coming back with a transcript should not cost the run the summaries
+      // the other batches wrote, and the warning names which batch it was.
+      if (data.summary) {
+        const screened = screenSummary(data.summary);
+        if (screened.withheld) {
+          withheldSummaries.push(screened.withheld);
+          core.warning(`Batch ${index + 1}: kept the model's summary out of the review — ${screened.withheld}.`);
+        } else if (screened.text) {
+          summaries.push(screened.text);
+        }
+      }
 
       total.inputTokens += usage.inputTokens;
       total.outputTokens += usage.outputTokens;
@@ -141,12 +163,13 @@ async function run(): Promise<void> {
     );
   }
 
-  const summary = mergeSummaries(
-    summaries,
-    findings.length || refactors.length
-      ? 'The model returned no summary; see the individual findings below.'
-      : 'No defects found in the reviewed diff.',
-  );
+  const summary: ReviewSummary = { text: mergeSummaries(summaries), withheld: withheldSummaries };
+  // Hawky's own sentence, in Hawky's own voice, for the step output and the job
+  // summary: a workflow reading `summary` needs something whatever came back, and
+  // what it must never be handed is the text screening has just rejected.
+  const summaryLine =
+    summary.text ||
+    (withheldSummaries.length ? `No summary: ${withheldSummaries[0]}.` : 'The model returned no summary.');
   let findingsPosted = 0;
   let dismissedCount = 0;
   let issuesCreated = 0;
@@ -208,12 +231,16 @@ async function run(): Promise<void> {
   core.setOutput('findings-count', findingsPosted);
   core.setOutput('dismissed-count', dismissedCount);
   core.setOutput('issues-created', issuesCreated);
-  core.setOutput('summary', summary);
+  core.setOutput('summary', summaryLine);
   setVerdict(!gated && !incomplete, highest);
 
-  await core.summary
-    .addHeading('Hawky', 3)
-    .addRaw(summary)
+  const jobSummary = core.summary.addHeading('Hawky', 3);
+  // Quoted for the reason the pull request comment quotes it: this is the model's
+  // text, and the job summary is rendered markdown read by the same people.
+  if (summary.text) jobSummary.addQuote(summary.text);
+  else jobSummary.addRaw(summaryLine);
+
+  await jobSummary
     .addList([
       `${findingsPosted} finding(s) reported`,
       `${dismissedCount} finding(s) waived by a reviewer`,
