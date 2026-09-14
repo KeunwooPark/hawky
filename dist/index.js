@@ -39853,6 +39853,7 @@ const KNOWN_FILE_KEYS = [
     'max_files',
     'reasoning',
     'max_response_tokens',
+    'request_timeout',
     'request_options',
 ];
 function warnUnknownFileKeys(file, configPath) {
@@ -40054,6 +40055,15 @@ function loadConfig() {
         maxFiles: num('', 'max_files', 60),
         reasoning: pickReasoning(pick('reasoning', 'reasoning')),
         maxResponseTokens: num('max-response-tokens', 'max_response_tokens', 16_000),
+        requestTimeoutSeconds: (() => {
+            const seconds = num('request-timeout', 'request_timeout', 0);
+            if (seconds < 0) {
+                core.warning(`Ignoring request-timeout "${seconds}": it must be a positive number of seconds. ` +
+                    'Deriving the deadline from max-response-tokens instead.');
+                return 0;
+            }
+            return seconds;
+        })(),
         requestOptions: file.request_options && typeof file.request_options === 'object' && !Array.isArray(file.request_options)
             ? file.request_options
             : {},
@@ -41313,6 +41323,7 @@ const sdk_1 = __importDefault(__nccwpck_require__(121));
 const core = __importStar(__nccwpck_require__(7484));
 const json_js_1 = __nccwpck_require__(9585);
 const budget_js_1 = __nccwpck_require__(4646);
+const timeout_js_1 = __nccwpck_require__(9608);
 const validate_js_1 = __nccwpck_require__(1769);
 function isBadRequestAbout(err, needle) {
     return (err instanceof sdk_1.default.APIError &&
@@ -41327,25 +41338,66 @@ class AnthropicProvider {
     /** Set once a 400 tells us this model does not accept a knob, so we stop sending it. */
     supportsThinking;
     supportsSchema = true;
+    /** Seconds the user pinned the deadline to, or 0 to derive it from the budget. */
+    timeoutOverrideSeconds;
+    callCount = 0;
+    /** The deadline the last attempt was given, so a message can name it. */
+    lastTimeoutMs;
     constructor(cfg) {
         this.model = cfg.model;
         this.budget = new budget_js_1.OutputBudget(cfg.maxResponseTokens);
         // Extended thinking is billed against `max_tokens` alongside the answer, so
         // `reasoning: none` turns it off rather than merely asking for less of it.
         this.supportsThinking = cfg.reasoning !== 'none';
+        this.timeoutOverrideSeconds = cfg.requestTimeoutSeconds;
+        this.lastTimeoutMs = (0, timeout_js_1.requestTimeoutMs)(cfg.maxResponseTokens, cfg.requestTimeoutSeconds);
         this.client = new sdk_1.default({
             apiKey: cfg.apiKey,
             ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}),
-            maxRetries: 4,
-            timeout: 10 * 60 * 1000,
+            // Ours to do, not the SDK's: it cannot be told to repeat a 429 but not a
+            // timeout, and repeating a timeout unchanged multiplies the wall clock by
+            // five without a log line. Backing off a busy server is done in `complete`.
+            maxRetries: 0,
+            // This must stay set. `messages.create` computes its own non-streaming
+            // deadline — and throws "Streaming is required for operations that may
+            // take longer than 10 minutes" — only when the client has no timeout of
+            // its own, which a raised budget would otherwise walk straight into.
+            timeout: this.lastTimeoutMs,
         });
     }
+    get calls() {
+        return this.callCount;
+    }
     async complete(req) {
+        const retries = new timeout_js_1.TransientRetries();
         for (;;) {
             try {
                 return await this.attempt(req);
             }
             catch (err) {
+                // Worth the identical request again: the server is busy, rate-limiting,
+                // or briefly broken. A timeout has no status, so it never lands here.
+                if (err instanceof sdk_1.default.APIError && (0, timeout_js_1.isTransientStatus)(err.status)) {
+                    const wait = retries.next((0, timeout_js_1.retryAfterMs)(err.headers));
+                    if (wait !== null) {
+                        core.warning(`${this.model} answered ${err.status}; retrying in ${(0, timeout_js_1.describeMs)(wait)} (retry ${retries.attempts}).`);
+                        await (0, timeout_js_1.sleep)(wait);
+                        continue;
+                    }
+                }
+                // Out of clock rather than out of budget. Extended thinking is the part
+                // worth dropping — it is most of what a long reply generates, and unlike
+                // the answer it is not what was asked for. With it already off there is
+                // nothing left to cut, and repeating the wait would only spend it again.
+                if (err instanceof sdk_1.default.APIConnectionTimeoutError) {
+                    if (this.supportsThinking) {
+                        this.supportsThinking = false;
+                        core.warning(`${this.model} did not answer within ${(0, timeout_js_1.describeMs)(this.lastTimeoutMs)}. ` +
+                            'Retrying without extended thinking — less to generate inside the same deadline.');
+                        continue;
+                    }
+                    throw new Error(this.timeoutAdvice());
+                }
                 // A cut-off answer is recoverable: stop the model thinking if that is
                 // where `max_tokens` went, and otherwise just buy more of it.
                 if (err instanceof budget_js_1.TruncatedError) {
@@ -41401,6 +41453,21 @@ class AnthropicProvider {
         }
         return null;
     }
+    /**
+     * What to tell the user when the request ran out of clock rather than budget.
+     *
+     * "Request timed out." on its own sent people to `max-response-tokens`, which
+     * is the one change that makes this worse: a bigger budget is more to
+     * generate. The deadline now moves with the budget, so what is left to say is
+     * which of the two to change, and that the wait was not silently repeated.
+     */
+    timeoutAdvice() {
+        return (`${this.model} did not answer within ${(0, timeout_js_1.describeMs)(this.lastTimeoutMs)}, even with extended thinking off. ` +
+            'That deadline is derived from `max_response_tokens`, so raising the budget already buys a longer wait — ' +
+            'if this endpoint is simply slow, set `request_timeout` (in seconds) to override it. Otherwise lower ' +
+            '`max_response_tokens`, or `max_chars_per_batch` so each batch has less to report on. The request was ' +
+            'not retried unchanged: repeating a timeout only spends the same wall clock again.');
+    }
     truncationAdvice(err) {
         const tried = this.budget.capped
             ? ` — the most ${this.model} will accept`
@@ -41434,7 +41501,11 @@ class AnthropicProvider {
         else {
             params.messages = [{ role: 'user', content: req.user + (0, json_js_1.schemaInstruction)(req.schema) }];
         }
-        const res = (await this.client.messages.create(params));
+        // Per request rather than per client: the budget is raised mid-run after a
+        // truncated reply, and a deadline fixed at construction would not follow it.
+        this.lastTimeoutMs = (0, timeout_js_1.requestTimeoutMs)(this.budget.tokens, this.timeoutOverrideSeconds);
+        this.callCount++;
+        const res = (await this.client.messages.create(params, { timeout: this.lastTimeoutMs }));
         if (res.stop_reason === 'refusal') {
             throw new Error('The model declined to review this diff (stop_reason: refusal). This usually means the diff tripped a safety classifier; narrow the reviewed paths with `exclude` or switch models.');
         }
@@ -41775,6 +41846,7 @@ const core = __importStar(__nccwpck_require__(7484));
 const json_js_1 = __nccwpck_require__(9585);
 const budget_js_1 = __nccwpck_require__(4646);
 const reasoning_js_1 = __nccwpck_require__(6391);
+const timeout_js_1 = __nccwpck_require__(9608);
 const validate_js_1 = __nccwpck_require__(1769);
 /**
  * Reasoning models return two things in one response: the chain of thought and
@@ -41816,34 +41888,89 @@ class OpenAIProvider {
     useLegacyMaxTokens = false;
     /** Which `reasoning_effort` to ask for, and where to go when one is refused. */
     reasoning;
+    /** Seconds the user pinned the deadline to, or 0 to derive it from the budget. */
+    timeoutOverrideSeconds;
+    callCount = 0;
+    /** The deadline the last attempt was given, so a message can name it. */
+    lastTimeoutMs;
     constructor(cfg) {
         this.model = cfg.model;
         this.requestOptions = cfg.requestOptions;
         this.budget = new budget_js_1.OutputBudget(cfg.maxResponseTokens);
         this.reasoning = new reasoning_js_1.ReasoningLadder(cfg.reasoning);
+        this.timeoutOverrideSeconds = cfg.requestTimeoutSeconds;
+        this.lastTimeoutMs = (0, timeout_js_1.requestTimeoutMs)(cfg.maxResponseTokens, cfg.requestTimeoutSeconds);
         this.client = new openai_1.default({
             apiKey: cfg.apiKey,
             ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}),
-            maxRetries: 4,
-            timeout: 10 * 60 * 1000,
+            // Retrying is this class's job now. The SDK cannot be told to repeat a 429
+            // but not a timeout, and repeating a timeout unchanged is what turned one
+            // ten-minute wall into fifty minutes and `0 tokens`. What it did usefully
+            // — backing off a busy server — is done explicitly in `complete`.
+            maxRetries: 0,
+            // A default for anything that does not pass its own; every call below does.
+            timeout: this.lastTimeoutMs,
         });
     }
+    get calls() {
+        return this.callCount;
+    }
     async complete(req) {
+        const retries = new timeout_js_1.TransientRetries();
         for (;;) {
             try {
                 return await this.attempt(req);
             }
             catch (err) {
+                // A busy, rate-limited or briefly broken server is worth the same
+                // request again. A timeout is not, and cannot land here anyway: it
+                // carries no status, which is the same reason it used to fall past
+                // every ladder below.
+                if (err instanceof openai_1.default.APIError && (0, timeout_js_1.isTransientStatus)(err.status)) {
+                    const wait = retries.next((0, timeout_js_1.retryAfterMs)(err.headers));
+                    if (wait !== null) {
+                        core.warning(`${this.model} answered ${err.status}; retrying in ${(0, timeout_js_1.describeMs)(wait)} (retry ${retries.attempts}).`);
+                        await (0, timeout_js_1.sleep)(wait);
+                        continue;
+                    }
+                }
                 const next = err instanceof budget_js_1.TruncatedError
                     ? this.degradeAfterTruncation(err)
                     : err instanceof validate_js_1.SchemaViolationError
                         ? this.degradeAfterViolation(err)
                         : this.degrade(err);
                 if (!next)
-                    throw err instanceof budget_js_1.TruncatedError ? new Error(this.truncationAdvice(err)) : err;
+                    throw this.giveUp(err);
                 core.warning(next);
             }
         }
+    }
+    /**
+     * The error to fail the batch with once nothing is left to try. Both kinds of
+     * exhaustion get a sentence naming the wall that was hit and the knob that
+     * moves it; everything else is the endpoint's own error, unedited.
+     */
+    giveUp(err) {
+        if (err instanceof budget_js_1.TruncatedError)
+            return new Error(this.truncationAdvice(err));
+        if (err instanceof openai_1.default.APIConnectionTimeoutError)
+            return new Error(this.timeoutAdvice());
+        return err;
+    }
+    /**
+     * What to tell the user when the request ran out of clock rather than budget.
+     *
+     * "Request timed out." on its own sent people to `max-response-tokens`, which
+     * is the one change that makes this worse: a bigger budget is more to
+     * generate. The deadline now moves with the budget, so what is left to say is
+     * which of the two to change, and that the wait was not silently repeated.
+     */
+    timeoutAdvice() {
+        return (`${this.model} did not answer within ${(0, timeout_js_1.describeMs)(this.lastTimeoutMs)}, with nothing left to turn down. ` +
+            'That deadline is derived from `max_response_tokens`, so raising the budget already buys a longer wait — ' +
+            'if this endpoint is simply slow, set `request_timeout` (in seconds) to override it. Otherwise lower ' +
+            '`max_response_tokens` so there is less to generate, or turn `reasoning` down. The request was not ' +
+            'retried unchanged: repeating a timeout only spends the same wall clock again.');
     }
     /**
      * The answer was cut off. Free up room for it in the cheapest order: turn the
@@ -41944,6 +42071,19 @@ class OpenAIProvider {
     }
     /** Returns a log line when it changed something to retry, or null to give up. */
     degrade(err) {
+        // A timeout arrives with no status and no `finish_reason`, so it satisfies
+        // neither this ladder's first line nor the truncation one: the single
+        // failure mode the provider could not read was the one its own advice —
+        // raise the budget — made certain. It is evidence all the same. The model
+        // could not deliver this budget inside the deadline the budget bought, and
+        // the thinking is the part worth cutting: it is most of what a reasoning
+        // model generates, and unlike the answer it is not what we asked for.
+        if (err instanceof openai_1.default.APIConnectionTimeoutError) {
+            const next = this.reasoning.turnDown();
+            if (next === null)
+                return null;
+            return `${this.model} did not answer within ${(0, timeout_js_1.describeMs)(this.lastTimeoutMs)}. Retrying with reasoning_effort: ${next} — less to generate inside the same deadline.`;
+        }
         if (!(err instanceof openai_1.default.APIError) || err.status === undefined || err.status >= 500) {
             return null;
         }
@@ -42007,7 +42147,11 @@ class OpenAIProvider {
         }
         // Last, so an endpoint-specific override wins over what we chose above.
         Object.assign(params, this.requestOptions);
-        const res = await this.client.chat.completions.create(params);
+        // Per request rather than per client: the budget is raised mid-run after a
+        // truncated reply, and a deadline fixed at construction would not follow it.
+        this.lastTimeoutMs = (0, timeout_js_1.requestTimeoutMs)(this.budget.tokens, this.timeoutOverrideSeconds);
+        this.callCount++;
+        const res = await this.client.chat.completions.create(params, { timeout: this.lastTimeoutMs });
         const choice = res.choices[0];
         const { content, reasoning, hasAnswer } = readMessage(choice?.message);
         const reasoningTokens = res.usage?.completion_tokens_details?.reasoning_tokens ?? 0;
@@ -42145,6 +42289,154 @@ class ReasoningLadder {
     }
 }
 exports.ReasoningLadder = ReasoningLadder;
+
+
+/***/ }),
+
+/***/ 9608:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * How long one request may take, and what is worth trying again when it does not
+ * come back.
+ *
+ * Both providers used to build their client with a flat ten-minute timeout and
+ * `maxRetries: 4`, with nothing tying either number to how much output the call
+ * was allowed to generate. That holds up until `max-response-tokens` is raised —
+ * which is the first thing the truncation advice tells you to do — because the
+ * budget then buys more generation than the clock allows. Every attempt times
+ * out by construction, the SDK silently repeats it four more times, and a
+ * two-file diff spends fifty minutes to report nothing.
+ *
+ * A timeout also carries no HTTP status and no `finish_reason`, so it reached
+ * neither the 4xx ladder nor the truncation ladder: the one failure the
+ * providers could not read was the one their own advice made likely. Deriving
+ * the deadline from the budget is what stops it being guaranteed; owning the
+ * retries is what stops one timeout costing five.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.TransientRetries = void 0;
+exports.requestTimeoutMs = requestTimeoutMs;
+exports.describeMs = describeMs;
+exports.isTransientStatus = isTransientStatus;
+exports.retryAfterMs = retryAfterMs;
+exports.sleep = sleep;
+/**
+ * Output tokens per second to assume when turning a budget into a deadline.
+ *
+ * Far below the ~70 tok/s measured on the thinking-only endpoints that produced
+ * this failure, because the two ways of being wrong do not cost the same:
+ * assuming too slow a model costs a request that is allowed to overrun and then
+ * succeeds, while assuming too fast a one costs the batch.
+ */
+const SLOWEST_USEFUL_TOKENS_PER_SECOND = 20;
+/** Connection, queueing and the round trip — time the model is not generating. */
+const OVERHEAD_MS = 60_000;
+/** The old flat timeout, kept as a floor: it was never too short for small budgets. */
+const MIN_TIMEOUT_MS = 10 * 60 * 1000;
+/**
+ * A ceiling the budget cannot argue past. Beyond this the likelier reading is a
+ * stalled connection than a slow model, and a batch that waits longer has cost
+ * more than the review it is trying to produce.
+ */
+const MAX_TIMEOUT_MS = 40 * 60 * 1000;
+/**
+ * The deadline for one request, derived from the tokens it is allowed to
+ * generate.
+ *
+ * `overrideSeconds` wins outright when set. An endpoint slower than any rate
+ * worth hard-coding needs somewhere to say so; without it, the only remedy for a
+ * wrong constant is a fork.
+ */
+function requestTimeoutMs(maxOutputTokens, overrideSeconds = 0) {
+    if (overrideSeconds > 0)
+        return Math.round(overrideSeconds * 1000);
+    const needed = (maxOutputTokens / SLOWEST_USEFUL_TOKENS_PER_SECOND) * 1000 + OVERHEAD_MS;
+    return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, Math.round(needed)));
+}
+/** A duration a human can compare to a job log: "12m30s". */
+function describeMs(ms) {
+    const total = Math.round(ms / 1000);
+    const minutes = Math.floor(total / 60);
+    const seconds = total % 60;
+    return minutes ? `${minutes}m${String(seconds).padStart(2, '0')}s` : `${seconds}s`;
+}
+/**
+ * Statuses where the same request, sent again, can legitimately succeed: the
+ * server is busy, rate-limiting, or briefly broken.
+ *
+ * This list is the SDK's own, restated because the retrying is now ours. Taking
+ * `maxRetries` to zero is the only way to stop a timeout being multiplied by
+ * five — the SDK cannot be told to retry some failures and not others — and
+ * dropping rate-limit handling along with it would trade one bug for another.
+ */
+function isTransientStatus(status) {
+    if (status === undefined)
+        return false;
+    return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+const BASE_BACKOFF_MS = 1000;
+const MAX_BACKOFF_MS = 30_000;
+/**
+ * How many times a transient failure may be retried, and how long to wait first.
+ *
+ * Exponential from one second, and never below what the server asked for in
+ * `Retry-After` — a rate limiter that names a delay knows better than the
+ * backoff curve does.
+ */
+class TransientRetries {
+    limit;
+    used = 0;
+    constructor(limit = 3) {
+        this.limit = limit;
+    }
+    /** How many retries have been spent, for a message that says so. */
+    get attempts() {
+        return this.used;
+    }
+    /** Milliseconds to wait before trying again, or null when there are none left. */
+    next(serverAskedForMs) {
+        if (this.used >= this.limit)
+            return null;
+        const backoff = BASE_BACKOFF_MS * 2 ** this.used;
+        this.used++;
+        return Math.min(MAX_BACKOFF_MS, Math.max(backoff, serverAskedForMs ?? 0));
+    }
+}
+exports.TransientRetries = TransientRetries;
+function readHeader(headers, name) {
+    if (!headers)
+        return null;
+    // `headers` is a Headers instance on some SDK versions and a plain object on
+    // others; neither is worth a type assertion that could be wrong at runtime.
+    const get = headers.get;
+    if (typeof get === 'function') {
+        const value = get.call(headers, name);
+        return typeof value === 'string' ? value : null;
+    }
+    const value = headers[name];
+    return typeof value === 'string' ? value : null;
+}
+/**
+ * The delay a rate limiter asked for, in milliseconds. Accepts both forms the
+ * header is defined in — a count of seconds, or an HTTP date — and returns null
+ * when it is absent or unparseable, which leaves the caller on its own backoff.
+ */
+function retryAfterMs(headers, now = Date.now()) {
+    const raw = readHeader(headers, 'retry-after')?.trim();
+    if (!raw)
+        return null;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds))
+        return Math.max(0, seconds * 1000);
+    const at = Date.parse(raw);
+    return Number.isFinite(at) ? Math.max(0, at - now) : null;
+}
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 
 /***/ }),
@@ -42309,8 +42601,14 @@ function mergeSummaries(summaries) {
         return clean[0] ?? '';
     return clean.map((s) => `- ${s}`).join('\n');
 }
-function logUsage(total, calls) {
-    core.info(`LLM: ${calls} call(s), ${total.inputTokens.toLocaleString()} input tokens ` +
+/**
+ * Calls and batches are counted separately because they come apart, and it
+ * mattered: a batch that timed out and was silently retried four times printed
+ * as `1 call(s), 0 input tokens, 0 output tokens`, which is exactly what a batch
+ * that answered first time prints. Five billed generations behind one line.
+ */
+function logUsage(total, calls, batches) {
+    core.info(`LLM: ${calls} call(s) across ${batches} batch(es), ${total.inputTokens.toLocaleString()} input tokens ` +
         `(${total.cachedInputTokens.toLocaleString()} cached), ` +
         `${total.outputTokens.toLocaleString()} output tokens` +
         // Worth surfacing: it is the usual reason an output budget runs out.
@@ -42421,7 +42719,7 @@ async function run() {
             core.endGroup();
         }
     }
-    logUsage(total, batches.length);
+    logUsage(total, provider.calls, batches.length);
     // Counted, not inferred from empty output: a clean diff legitimately produces
     // no findings and no refactors, and that is a pass, not a failure.
     if (failedBatches === batches.length) {

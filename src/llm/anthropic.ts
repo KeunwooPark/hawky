@@ -4,6 +4,14 @@ import type { Config } from '../config.js';
 import type { CompleteRequest, CompleteResponse, Provider } from '../types.js';
 import { parseJsonObject, schemaInstruction } from './json.js';
 import { isBudgetOutOfRange, OutputBudget, TruncatedError } from './budget.js';
+import {
+  describeMs,
+  isTransientStatus,
+  requestTimeoutMs,
+  retryAfterMs,
+  sleep,
+  TransientRetries,
+} from './timeout.js';
 import { assertMatchesSchema, SchemaViolationError } from './validate.js';
 
 function isBadRequestAbout(err: unknown, needle: string): boolean {
@@ -22,6 +30,11 @@ export class AnthropicProvider implements Provider {
   /** Set once a 400 tells us this model does not accept a knob, so we stop sending it. */
   private supportsThinking: boolean;
   private supportsSchema = true;
+  /** Seconds the user pinned the deadline to, or 0 to derive it from the budget. */
+  private readonly timeoutOverrideSeconds: number;
+  private callCount = 0;
+  /** The deadline the last attempt was given, so a message can name it. */
+  private lastTimeoutMs: number;
 
   constructor(cfg: Config) {
     this.model = cfg.model;
@@ -29,19 +42,60 @@ export class AnthropicProvider implements Provider {
     // Extended thinking is billed against `max_tokens` alongside the answer, so
     // `reasoning: none` turns it off rather than merely asking for less of it.
     this.supportsThinking = cfg.reasoning !== 'none';
+    this.timeoutOverrideSeconds = cfg.requestTimeoutSeconds;
+    this.lastTimeoutMs = requestTimeoutMs(cfg.maxResponseTokens, cfg.requestTimeoutSeconds);
     this.client = new Anthropic({
       apiKey: cfg.apiKey,
       ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}),
-      maxRetries: 4,
-      timeout: 10 * 60 * 1000,
+      // Ours to do, not the SDK's: it cannot be told to repeat a 429 but not a
+      // timeout, and repeating a timeout unchanged multiplies the wall clock by
+      // five without a log line. Backing off a busy server is done in `complete`.
+      maxRetries: 0,
+      // This must stay set. `messages.create` computes its own non-streaming
+      // deadline — and throws "Streaming is required for operations that may
+      // take longer than 10 minutes" — only when the client has no timeout of
+      // its own, which a raised budget would otherwise walk straight into.
+      timeout: this.lastTimeoutMs,
     });
   }
 
+  get calls(): number {
+    return this.callCount;
+  }
+
   async complete<T>(req: CompleteRequest): Promise<CompleteResponse<T>> {
+    const retries = new TransientRetries();
     for (;;) {
       try {
         return await this.attempt<T>(req);
       } catch (err) {
+        // Worth the identical request again: the server is busy, rate-limiting,
+        // or briefly broken. A timeout has no status, so it never lands here.
+        if (err instanceof Anthropic.APIError && isTransientStatus(err.status)) {
+          const wait = retries.next(retryAfterMs(err.headers));
+          if (wait !== null) {
+            core.warning(
+              `${this.model} answered ${err.status}; retrying in ${describeMs(wait)} (retry ${retries.attempts}).`,
+            );
+            await sleep(wait);
+            continue;
+          }
+        }
+        // Out of clock rather than out of budget. Extended thinking is the part
+        // worth dropping — it is most of what a long reply generates, and unlike
+        // the answer it is not what was asked for. With it already off there is
+        // nothing left to cut, and repeating the wait would only spend it again.
+        if (err instanceof Anthropic.APIConnectionTimeoutError) {
+          if (this.supportsThinking) {
+            this.supportsThinking = false;
+            core.warning(
+              `${this.model} did not answer within ${describeMs(this.lastTimeoutMs)}. ` +
+                'Retrying without extended thinking — less to generate inside the same deadline.',
+            );
+            continue;
+          }
+          throw new Error(this.timeoutAdvice());
+        }
         // A cut-off answer is recoverable: stop the model thinking if that is
         // where `max_tokens` went, and otherwise just buy more of it.
         if (err instanceof TruncatedError) {
@@ -101,6 +155,24 @@ export class AnthropicProvider implements Provider {
     return null;
   }
 
+  /**
+   * What to tell the user when the request ran out of clock rather than budget.
+   *
+   * "Request timed out." on its own sent people to `max-response-tokens`, which
+   * is the one change that makes this worse: a bigger budget is more to
+   * generate. The deadline now moves with the budget, so what is left to say is
+   * which of the two to change, and that the wait was not silently repeated.
+   */
+  private timeoutAdvice(): string {
+    return (
+      `${this.model} did not answer within ${describeMs(this.lastTimeoutMs)}, even with extended thinking off. ` +
+      'That deadline is derived from `max_response_tokens`, so raising the budget already buys a longer wait — ' +
+      'if this endpoint is simply slow, set `request_timeout` (in seconds) to override it. Otherwise lower ' +
+      '`max_response_tokens`, or `max_chars_per_batch` so each batch has less to report on. The request was ' +
+      'not retried unchanged: repeating a timeout only spends the same wall clock again.'
+    );
+  }
+
   private truncationAdvice(err: TruncatedError): string {
     const tried = this.budget.capped
       ? ` — the most ${this.model} will accept`
@@ -137,8 +209,13 @@ export class AnthropicProvider implements Provider {
       params.messages = [{ role: 'user', content: req.user + schemaInstruction(req.schema) }];
     }
 
+    // Per request rather than per client: the budget is raised mid-run after a
+    // truncated reply, and a deadline fixed at construction would not follow it.
+    this.lastTimeoutMs = requestTimeoutMs(this.budget.tokens, this.timeoutOverrideSeconds);
+    this.callCount++;
     const res = (await this.client.messages.create(
       params as unknown as Anthropic.MessageCreateParamsNonStreaming,
+      { timeout: this.lastTimeoutMs },
     )) as Anthropic.Message;
 
     if (res.stop_reason === 'refusal') {

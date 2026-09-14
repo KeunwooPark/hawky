@@ -11,6 +11,14 @@ import {
   TruncatedError,
 } from './budget.js';
 import { ReasoningLadder } from './reasoning.js';
+import {
+  describeMs,
+  isTransientStatus,
+  requestTimeoutMs,
+  retryAfterMs,
+  sleep,
+  TransientRetries,
+} from './timeout.js';
 import { assertMatchesSchema, SchemaViolationError } from './validate.js';
 
 type Variant = 'json_schema' | 'json_object' | 'plain';
@@ -60,35 +68,95 @@ export class OpenAIProvider implements Provider {
   private useLegacyMaxTokens = false;
   /** Which `reasoning_effort` to ask for, and where to go when one is refused. */
   private readonly reasoning: ReasoningLadder;
+  /** Seconds the user pinned the deadline to, or 0 to derive it from the budget. */
+  private readonly timeoutOverrideSeconds: number;
+  private callCount = 0;
+  /** The deadline the last attempt was given, so a message can name it. */
+  private lastTimeoutMs: number;
 
   constructor(cfg: Config) {
     this.model = cfg.model;
     this.requestOptions = cfg.requestOptions;
     this.budget = new OutputBudget(cfg.maxResponseTokens);
     this.reasoning = new ReasoningLadder(cfg.reasoning);
+    this.timeoutOverrideSeconds = cfg.requestTimeoutSeconds;
+    this.lastTimeoutMs = requestTimeoutMs(cfg.maxResponseTokens, cfg.requestTimeoutSeconds);
     this.client = new OpenAI({
       apiKey: cfg.apiKey,
       ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}),
-      maxRetries: 4,
-      timeout: 10 * 60 * 1000,
+      // Retrying is this class's job now. The SDK cannot be told to repeat a 429
+      // but not a timeout, and repeating a timeout unchanged is what turned one
+      // ten-minute wall into fifty minutes and `0 tokens`. What it did usefully
+      // — backing off a busy server — is done explicitly in `complete`.
+      maxRetries: 0,
+      // A default for anything that does not pass its own; every call below does.
+      timeout: this.lastTimeoutMs,
     });
   }
 
+  get calls(): number {
+    return this.callCount;
+  }
+
   async complete<T>(req: CompleteRequest): Promise<CompleteResponse<T>> {
+    const retries = new TransientRetries();
     for (;;) {
       try {
         return await this.attempt<T>(req);
       } catch (err) {
+        // A busy, rate-limited or briefly broken server is worth the same
+        // request again. A timeout is not, and cannot land here anyway: it
+        // carries no status, which is the same reason it used to fall past
+        // every ladder below.
+        if (err instanceof OpenAI.APIError && isTransientStatus(err.status)) {
+          const wait = retries.next(retryAfterMs(err.headers));
+          if (wait !== null) {
+            core.warning(
+              `${this.model} answered ${err.status}; retrying in ${describeMs(wait)} (retry ${retries.attempts}).`,
+            );
+            await sleep(wait);
+            continue;
+          }
+        }
         const next =
           err instanceof TruncatedError
             ? this.degradeAfterTruncation(err)
             : err instanceof SchemaViolationError
               ? this.degradeAfterViolation(err)
               : this.degrade(err);
-        if (!next) throw err instanceof TruncatedError ? new Error(this.truncationAdvice(err)) : err;
+        if (!next) throw this.giveUp(err);
         core.warning(next);
       }
     }
+  }
+
+  /**
+   * The error to fail the batch with once nothing is left to try. Both kinds of
+   * exhaustion get a sentence naming the wall that was hit and the knob that
+   * moves it; everything else is the endpoint's own error, unedited.
+   */
+  private giveUp(err: unknown): unknown {
+    if (err instanceof TruncatedError) return new Error(this.truncationAdvice(err));
+    if (err instanceof OpenAI.APIConnectionTimeoutError) return new Error(this.timeoutAdvice());
+    return err;
+  }
+
+  /**
+   * What to tell the user when the request ran out of clock rather than budget.
+   *
+   * "Request timed out." on its own sent people to `max-response-tokens`, which
+   * is the one change that makes this worse: a bigger budget is more to
+   * generate. The deadline now moves with the budget, so what is left to say is
+   * which of the two to change, and that the wait was not silently repeated.
+   */
+  private timeoutAdvice(): string {
+    return (
+      `${this.model} did not answer within ${describeMs(this.lastTimeoutMs)}, with nothing left to turn down. ` +
+      'That deadline is derived from `max_response_tokens`, so raising the budget already buys a longer wait — ' +
+      'if this endpoint is simply slow, set `request_timeout` (in seconds) to override it. Otherwise lower ' +
+      '`max_response_tokens` so there is less to generate, or turn `reasoning` down. The request was not ' +
+      'retried unchanged: repeating a timeout only spends the same wall clock again.'
+    );
   }
 
   /**
@@ -201,6 +269,18 @@ export class OpenAIProvider implements Provider {
 
   /** Returns a log line when it changed something to retry, or null to give up. */
   private degrade(err: unknown): string | null {
+    // A timeout arrives with no status and no `finish_reason`, so it satisfies
+    // neither this ladder's first line nor the truncation one: the single
+    // failure mode the provider could not read was the one its own advice —
+    // raise the budget — made certain. It is evidence all the same. The model
+    // could not deliver this budget inside the deadline the budget bought, and
+    // the thinking is the part worth cutting: it is most of what a reasoning
+    // model generates, and unlike the answer it is not what we asked for.
+    if (err instanceof OpenAI.APIConnectionTimeoutError) {
+      const next = this.reasoning.turnDown();
+      if (next === null) return null;
+      return `${this.model} did not answer within ${describeMs(this.lastTimeoutMs)}. Retrying with reasoning_effort: ${next} — less to generate inside the same deadline.`;
+    }
     if (!(err instanceof OpenAI.APIError) || err.status === undefined || err.status >= 500) {
       return null;
     }
@@ -270,8 +350,13 @@ export class OpenAIProvider implements Provider {
     // Last, so an endpoint-specific override wins over what we chose above.
     Object.assign(params, this.requestOptions);
 
+    // Per request rather than per client: the budget is raised mid-run after a
+    // truncated reply, and a deadline fixed at construction would not follow it.
+    this.lastTimeoutMs = requestTimeoutMs(this.budget.tokens, this.timeoutOverrideSeconds);
+    this.callCount++;
     const res = await this.client.chat.completions.create(
       params as unknown as OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+      { timeout: this.lastTimeoutMs },
     );
 
     const choice = res.choices[0];

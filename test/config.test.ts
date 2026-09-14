@@ -77,6 +77,25 @@ test('the spellings people reach for instead of none warn the same way', () => {
   assert.match(warnings[0], /"minimal" as the floor/);
 });
 
+test('request-timeout is derived from the budget unless it is set', () => {
+  const { cfg, warnings } = withInputs({});
+  assert.equal(cfg.requestTimeoutSeconds, 0);
+  assert.deepEqual(warnings, []);
+});
+
+test('request-timeout is read from the input and from the file', () => {
+  assert.equal(withInputs({ 'request-timeout': '900' }).cfg.requestTimeoutSeconds, 900);
+  assert.equal(withInputs({}, 'request_timeout: 900\n').cfg.requestTimeoutSeconds, 900);
+});
+
+test('a negative request-timeout warns instead of pinning the deadline to nonsense', () => {
+  const { cfg, warnings } = withInputs({ 'request-timeout': '-1' });
+
+  assert.equal(cfg.requestTimeoutSeconds, 0);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /request-timeout/);
+});
+
 test('reasoning: minimal is accepted without complaint', () => {
   const { cfg, warnings } = withInputs({ reasoning: 'minimal' });
 
