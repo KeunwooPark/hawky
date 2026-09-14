@@ -221,6 +221,25 @@ test('a partly reviewed diff is reported as a failure, not a pass', async () => 
   assert.match(body, /could not be reviewed/);
 });
 
+test('the verdict does not claim nothing was found when findings were filtered out', async () => {
+  // Reported verbatim: a comment opening "No defects found" and closing with
+  // "5 lower-signal findings filtered out". The collapsed view shows only the
+  // opening, so the reader takes away the claim the run cannot support.
+  const body = await postWith({ failOnSeverity: 'critical' }, [finding('low', 'a')]);
+
+  assert.match(body, /Nothing above the reporting bar \(1 finding filtered out\)/);
+  assert.doesNotMatch(body, /Nothing found/);
+});
+
+test('the verdict still says nothing was found when the model returned nothing', async () => {
+  // The other half of the distinction: an empty review is not the same claim as
+  // a review whose findings all fell below the bar, and it must keep saying so.
+  const body = await postWith({ failOnSeverity: 'critical' }, []);
+
+  assert.match(body, /Nothing found\./);
+  assert.doesNotMatch(body, /filtered out/);
+});
+
 test('the summary names who waived a finding and why', async () => {
   const f = finding('critical', 'b');
   const { octokit, bodies } = capturingOctokit(waived(f, 'the caller already checks this'));
