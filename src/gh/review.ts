@@ -133,8 +133,20 @@ function renderVerdict(
   cfg: Config,
   incomplete: boolean,
   dismissed: DismissedFinding[],
+  /** How many findings the model returned that nothing below will report. */
+  dropped: number,
 ): string {
-  const found = highest ? `Highest severity found: **${SEVERITY_LABEL[highest]}**.` : 'Nothing found.';
+  // "Nothing found" and "5 findings filtered out" were both printed in one
+  // comment, the first at the top and the second in the footer, and the
+  // collapsed view shows only the first. They are different claims: one says the
+  // model came back empty, the other says it came back with things that did not
+  // clear this run's severity and confidence floors. Whoever stops reading at
+  // the verdict line has to get the true one.
+  const found = highest
+    ? `Highest severity found: **${SEVERITY_LABEL[highest]}**.`
+    : dropped
+      ? `Nothing above the reporting bar (${dropped} finding${dropped === 1 ? '' : 's'} filtered out).`
+      : 'Nothing found.';
   // A check that is only green because someone waived a finding has to say so on
   // the pull request, or the waiver is invisible to whoever approves it.
   const waived = dismissed.length
@@ -223,7 +235,7 @@ function renderSummary(
     '',
     summary.trim(),
     '',
-    renderVerdict(highest, cfg, incomplete, dismissed),
+    renderVerdict(highest, cfg, incomplete, dismissed, dropped),
     '',
   ];
 
