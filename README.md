@@ -155,6 +155,14 @@ request body as-is, and it overrides anything hawky set itself.
 If you would rather let the model think and pay for it, raise the ceiling instead:
 `max-response-tokens: 48000`.
 
+The deadline moves with it. A request is allowed a span derived from the budget it has to
+deliver, so raising the budget cannot leave the model with more to generate than the clock
+permits — which is what a fixed timeout did, turning the advice above into a call that
+could only ever time out. A timed-out request is never repeated unchanged: hawky turns the
+thinking down and tries once more, and failing that says which of the two to change. If
+your endpoint is simply slower than the derivation assumes, pin the wait yourself with
+`request-timeout` (in seconds).
+
 ### Truncated replies fix themselves
 
 `max_response_tokens` is a guillotine, not a target: the model emits its thinking first
@@ -267,6 +275,7 @@ Every input is optional except `api-key`.
 | `base-url` | — | Override the API base URL. |
 | `reasoning` | endpoint default | `minimal`, `low`, `medium`, or `high` — ask for the least thinking your endpoint implements, which is not `minimal` everywhere (GLM starts at `low`). See [Reasoning models](#reasoning-models). `none` is still accepted for compatibility, but is not recommended for review: it can finish in seconds having found nothing. |
 | `max-response-tokens` | `16000` | Starting output budget per call, reasoning included. Raised automatically when a reply is cut off. |
+| `request-timeout` | derived | Seconds to wait for one call. By default it is derived from `max-response-tokens`, so a larger budget also gets longer to deliver it. Set it only for an endpoint slower than that assumes. |
 | `mode` | `review` | `review`, `refactor`, or `both`. |
 | `github-token` | `${{ github.token }}` | Token used to read the diff and write comments and issues. |
 | `config-path` | `.github/hawky.yml` | YAML config file. |
@@ -636,6 +645,13 @@ still cut off. The message names which wall it hit. If it went on reasoning, low
 down to the lowest level your endpoint implements (`minimal`, or `low` where there is no
 `minimal`), or use `request_options` if your endpoint ignores `reasoning_effort`.
 See [Reasoning models](#reasoning-models).
+
+**"did not answer within 32m00s".** The call ran out of clock rather than budget. That
+deadline is derived from `max-response-tokens`, so the remedy is not a bigger budget —
+that is more to generate, not less. Lower `max-response-tokens`, turn `reasoning` down, or
+if the endpoint is genuinely slow, set `request-timeout` to the wait you are willing to
+spend. Hawky turns the thinking down and retries once; it never repeats the same wait
+unchanged, which is what once cost a run fifty minutes to report nothing.
 
 **A finding trails off mid-sentence, or the summary asks you to paste the code.** The
 model's chain of thought reached the reply instead of its answer. Hawky strips `<think>`

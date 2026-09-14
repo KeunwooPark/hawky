@@ -29,6 +29,10 @@ inputs:
     description: 'Starting output budget for one LLM call, reasoning included. Doubles automatically (up to 3 times) when a reply is truncated. Default: 16000.'
     required: false
     default: ''
+  request-timeout:
+    description: 'Seconds to wait for one LLM call before giving up on it. Default: derived from max-response-tokens, so raising the budget also moves the deadline it has to be delivered inside. Set this only if your endpoint is slower than that derivation assumes; a request that times out is not retried unchanged.'
+    required: false
+    default: ''
   mode:
     description: 'What to do: "review" (inline PR feedback), "refactor" (open refactoring issues), or "both". Default: review.'
     required: false

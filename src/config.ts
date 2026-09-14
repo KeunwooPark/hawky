@@ -60,6 +60,14 @@ export interface Config {
   /** Output-token ceiling for one LLM call. Reasoning tokens count against it. */
   maxResponseTokens: number;
   /**
+   * Seconds to allow one LLM call before giving up on it. 0 derives the deadline
+   * from `maxResponseTokens`, which is what it should be: a budget big enough to
+   * outlast a fixed timeout makes every attempt fail on the clock rather than on
+   * anything the model did. Set this only for an endpoint slower than the
+   * derivation assumes.
+   */
+  requestTimeoutSeconds: number;
+  /**
    * Extra top-level fields merged into the OpenAI-compatible request body, for
    * endpoint-specific knobs this action does not model. Config file only: it is
    * a passthrough, so a typo here reaches the server verbatim.
@@ -144,6 +152,7 @@ const KNOWN_FILE_KEYS = [
   'max_files',
   'reasoning',
   'max_response_tokens',
+  'request_timeout',
   'request_options',
 ];
 
@@ -352,6 +361,17 @@ export function loadConfig(): Config {
     maxFiles: num('', 'max_files', 60),
     reasoning: pickReasoning(pick('reasoning', 'reasoning')),
     maxResponseTokens: num('max-response-tokens', 'max_response_tokens', 16_000),
+    requestTimeoutSeconds: (() => {
+      const seconds = num('request-timeout', 'request_timeout', 0);
+      if (seconds < 0) {
+        core.warning(
+          `Ignoring request-timeout "${seconds}": it must be a positive number of seconds. ` +
+            'Deriving the deadline from max-response-tokens instead.',
+        );
+        return 0;
+      }
+      return seconds;
+    })(),
     requestOptions:
       file.request_options && typeof file.request_options === 'object' && !Array.isArray(file.request_options)
         ? (file.request_options as Record<string, unknown>)

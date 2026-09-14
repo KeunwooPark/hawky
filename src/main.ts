@@ -27,9 +27,15 @@ function mergeSummaries(summaries: string[]): string {
   return clean.map((s) => `- ${s}`).join('\n');
 }
 
-function logUsage(total: Usage, calls: number): void {
+/**
+ * Calls and batches are counted separately because they come apart, and it
+ * mattered: a batch that timed out and was silently retried four times printed
+ * as `1 call(s), 0 input tokens, 0 output tokens`, which is exactly what a batch
+ * that answered first time prints. Five billed generations behind one line.
+ */
+function logUsage(total: Usage, calls: number, batches: number): void {
   core.info(
-    `LLM: ${calls} call(s), ${total.inputTokens.toLocaleString()} input tokens ` +
+    `LLM: ${calls} call(s) across ${batches} batch(es), ${total.inputTokens.toLocaleString()} input tokens ` +
       `(${total.cachedInputTokens.toLocaleString()} cached), ` +
       `${total.outputTokens.toLocaleString()} output tokens` +
       // Worth surfacing: it is the usual reason an output budget runs out.
@@ -153,7 +159,7 @@ async function run(): Promise<void> {
     }
   }
 
-  logUsage(total, batches.length);
+  logUsage(total, provider.calls, batches.length);
 
   // Counted, not inferred from empty output: a clean diff legitimately produces
   // no findings and no refactors, and that is a pass, not a failure.

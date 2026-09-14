@@ -63,6 +63,15 @@ export interface CompleteResponse<T> {
 export interface Provider {
   readonly name: string;
   readonly model: string;
+  /**
+   * Requests actually sent, retries included.
+   *
+   * Reported instead of the batch count, which is what the usage line used to
+   * print: five billed attempts behind one batch logged as `1 call(s)`, and a
+   * batch that timed out and silently retried four times looked identical to one
+   * that answered first time.
+   */
+  readonly calls: number;
   complete<T>(req: CompleteRequest): Promise<CompleteResponse<T>>;
 }
 
