@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { screenSummary } from '../src/util/summary.js';
+import { screenSummary, screenSummaryClaims } from '../src/util/summary.js';
 
 test('an ordinary summary is published as written', () => {
   const text = 'Adds a retry loop around the upload call and a test for the backoff. The change is small and self-contained.';
@@ -83,6 +83,34 @@ test('brackets inside a sentence are not mistaken for structural debris', () => 
 
   assert.equal(screenSummary(text).withheld, null);
   assert.equal(screenSummary(text).text, text);
+});
+
+test('a summary claiming a finding the run did not produce is withheld', () => {
+  // Both halves of the reported tail, cleaned up so the shape check cannot see
+  // them. The run's own counts were zero, so a reader of that comment had no way
+  // to tell which of its two contradictory statements was the true one.
+  assert.match(screenSummaryClaims('The diff had a critical review gate finding.', 0) ?? '', /produced none/);
+  assert.match(screenSummaryClaims('That feedback has been ignored without a waiver.', 0) ?? '', /produced none/);
+});
+
+test('the same claim is left alone when the run actually found something', () => {
+  // The check is a contradiction check, not a vocabulary ban: once a finding
+  // exists, a summary is free to describe it.
+  assert.equal(screenSummaryClaims('The diff had a critical review gate finding.', 1), null);
+  assert.equal(screenSummaryClaims('That feedback has been ignored without a waiver.', 3), null);
+});
+
+test('saying that nothing was found stays sayable', () => {
+  // What a clean run's summary is for. A negated claim is the ordinary way to
+  // write one, so the check must not read it as asserting the opposite.
+  for (const clean of [
+    'Found no defects in the changed hunks.',
+    'No issues identified; the change is small and self-contained.',
+    'I did not identify any issues worth reporting.',
+    'Adds a retry loop around the upload call and a test for the backoff.',
+  ]) {
+    assert.equal(screenSummaryClaims(clean, 0), null, clean);
+  }
 });
 
 test('the reason for withholding never quotes the text it rejected', () => {

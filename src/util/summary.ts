@@ -142,3 +142,51 @@ export function screenSummary(raw: string): ScreenedSummary {
 
   return { text, withheld: null };
 }
+
+/** An assertion that this review produced a finding. */
+const CLAIMS_FINDING =
+  /\b(?:had|has|have|found|identified|flagged|raised|reported)\s+(?:\d+\s+|an?\s+|the\s+|some\s+)?(?:\w+[- ]){0,3}(?:finding|defect|violation|issue)s?\b/i;
+
+/** An assertion that a finding in this review was set aside. */
+const CLAIMS_DISMISSAL = /\bwithout a waiver\b|\bhas been (?:ignored|dismissed|waived|overridden)\b/i;
+
+/** What turns a claim into its denial, which is a thing a clean run may say. */
+const NEGATED = /\b(?:no|not|none|nothing|never|n't|zero)\b/i;
+
+/**
+ * Claims about this review that a run returning no findings cannot support.
+ *
+ * The tail that prompted the shape check above also asserted something the action
+ * already knew to be false: that the review had a critical finding, and that it
+ * had been ignored without a waiver, in a run whose own count was zero. The shape
+ * check catches that particular text by its seams, but a cleanly joined sentence
+ * making the same claim would pass, and a reader has no way to tell which of two
+ * contradictory statements in one comment is the true one.
+ *
+ * This is the only check here that reads what a summary says, so it is kept as
+ * narrow as it can be made. It runs only when the model returned no findings at
+ * all — a dismissal is a waived finding, so zero findings means zero of those too
+ * — and it matches assertions that a finding or a waiver *exists*, with negated
+ * sentences left alone so that saying nothing was found stays sayable.
+ *
+ * It will be wrong eventually in a way the shape checks will not, because a diff
+ * that changes this action's own gate is reviewed in the vocabulary these patterns
+ * look for. That is the reason it withholds one field with the reason named rather
+ * than failing the run, and the reason it is kept apart from the checks that judge
+ * no meaning at all.
+ */
+export function screenSummaryClaims(raw: string, findingCount: number): string | null {
+  if (findingCount > 0) return null;
+  const text = raw.trim();
+  if (!text) return null;
+
+  for (const sentence of text.split(/[.;!?\n]+/)) {
+    if (CLAIMS_DISMISSAL.test(sentence)) {
+      return 'it described a waived finding in a run that produced none';
+    }
+    if (CLAIMS_FINDING.test(sentence) && !NEGATED.test(sentence)) {
+      return 'it described a finding in a run that produced none';
+    }
+  }
+  return null;
+}

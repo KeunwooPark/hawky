@@ -187,7 +187,17 @@ that is free model prose rather than something this action assembled. A summary 
 comes back as a transcript, carries fragments of a structure rather than prose, repeats
 one line over and over, or runs far past the few sentences the schema asks for is
 withheld from the comment whole — not truncated, since a leaked block sits at the front
-as readily as at the end — and the comment says that a summary was withheld and why. What survives is quoted under an attribution below the verdict rather
+as readily as at the end — and the comment says that a summary was withheld and why.
+
+A summary is checked against the run as well as against itself. When the model returned
+no findings at all, one that describes a finding or a waiver is withheld too: the
+comment would otherwise state both that nothing was found and that something was, four
+lines apart, with nothing in it to tell a reader which to believe. This is the only
+check of the set that reads what a summary says rather than how it is shaped, so it is
+deliberately narrow — it runs only on a run that found nothing, and a summary is still
+free to say that nothing was found.
+
+What survives is quoted under an attribution below the verdict rather
 than written as Hawky's own description of the change, so the parts of the comment this
 action stands behind are the parts that read in its own voice.
 

@@ -10,7 +10,7 @@ import { batchFiles, getCompareDiff, getPullRequestDiff } from './gh/diff.js';
 import { postReview } from './gh/review.js';
 import { postRefactorIssues } from './gh/issues.js';
 import { isHawkyComment } from './util/fingerprint.js';
-import { type ReviewSummary, screenSummary } from './util/summary.js';
+import { type ReviewSummary, screenSummary, screenSummaryClaims } from './util/summary.js';
 
 /**
  * Join what each batch said about the files it saw.
@@ -163,7 +163,20 @@ async function run(): Promise<void> {
     );
   }
 
-  const summary: ReviewSummary = { text: mergeSummaries(summaries), withheld: withheldSummaries };
+  // Screened a second time, against the run rather than against itself. This is
+  // the first point where the count exists — the per-batch screen above runs while
+  // findings are still arriving, and a claim about the review can only be checked
+  // once every batch has reported. Done before `summary` is built so one decision
+  // covers all three places the text is published: the pull request comment, the
+  // `summary` output, and the job summary.
+  const merged = mergeSummaries(summaries);
+  const contradiction = screenSummaryClaims(merged, findings.length);
+  if (contradiction) {
+    withheldSummaries.push(contradiction);
+    core.warning(`Kept the model's summary out of the review — ${contradiction}.`);
+  }
+
+  const summary: ReviewSummary = { text: contradiction ? '' : merged, withheld: withheldSummaries };
   // Hawky's own sentence, in Hawky's own voice, for the step output and the job
   // summary: a workflow reading `summary` needs something whatever came back, and
   // what it must never be handed is the text screening has just rejected.
