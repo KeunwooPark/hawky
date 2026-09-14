@@ -106,23 +106,33 @@ with:
   base-url: https://api.fireworks.ai/inference/v1
   model: accounts/fireworks/models/glm-5p2
   api-key: ${{ secrets.FIREWORKS_API_KEY }}
-  reasoning: minimal
+  reasoning: low
 ```
 
-`minimal` is the lowest level worth using for code review. **Do not set `reasoning:
-none`.** Reading a diff for defects is the work the thinking does, and a model told not
-to think comes back almost at once having found nothing: a nineteen-file diff finished
-clean in about five seconds at `none`, and reviewed properly at `minimal`. A merge gate
-cannot tell that apart from a genuinely clean diff, so what it leaves behind is a green
-check on a review that never happened. The value is still accepted, so configurations
-that already set it keep working, and it warns in the run log.
+Ask for the least thinking your endpoint will sell you — but the floor is not called the
+same thing everywhere. `minimal` is the bottom of hawky's scale and the value OpenAI's
+reasoning models take. The GLM family does not implement it at all: `reasoning_effort:
+minimal` comes back 400, naming the values it does accept, and those start at `low`. That
+is why the example above asks for `low` — it is that model's floor, not a concession
+above it.
 
-That sends `reasoning_effort: minimal`. An endpoint that does not implement that value
-answers 4xx, and hawky steps to the nearest level it might accept rather than dropping
-the parameter: dropping it does not mean "no reasoning", it means the model's own
-default, which is more thinking than you asked for rather than less. Only when no value
-on the scale is accepted does it retry without the parameter, and it says so. A value the
-endpoint has already refused is never asked for a second time.
+**Do not set `reasoning: none`.** Reading a diff for defects is the work the thinking
+does, and a model told not to think comes back almost at once having found nothing: a
+nineteen-file diff finished clean in about five seconds at `none`, and reviewed properly
+one rung up. A merge gate cannot tell that apart from a genuinely clean diff, so what it
+leaves behind is a green check on a review that never happened. The value is still
+accepted, so configurations that already set it keep working, and it warns in the run
+log. Some endpoints refuse it outright — GLM-5.3 answers that it is thinking-only and
+cannot have its thinking disabled — which is that advice arriving by another route.
+
+A level your endpoint does not implement is not fatal. It answers 4xx, and hawky steps to
+the nearest level it might accept rather than dropping the parameter: dropping it does
+not mean "no reasoning", it means the model's own default, which is more thinking than
+you asked for rather than less. Only when no value on the scale is accepted does it retry
+without the parameter, and it says so. A value the endpoint has already refused is never
+asked for a second time. What the recovery costs is a rejected call before any review
+happens and a warning that reads like you misconfigured something — so it is worth naming
+your model's real floor rather than leaving the ladder to find it.
 
 Servers in that position usually expose the switch through the chat template instead,
 which `request_options` passes through verbatim:
@@ -255,7 +265,7 @@ Every input is optional except `api-key`.
 | `provider` | `anthropic` | `anthropic` or `openai`. |
 | `model` | `claude-opus-5` / `gpt-4.1` | Model id. |
 | `base-url` | — | Override the API base URL. |
-| `reasoning` | endpoint default | `minimal`, `low`, `medium`, or `high`. See [Reasoning models](#reasoning-models). `none` is still accepted for compatibility, but is not recommended for review: it can finish in seconds having found nothing. |
+| `reasoning` | endpoint default | `minimal`, `low`, `medium`, or `high` — ask for the least thinking your endpoint implements, which is not `minimal` everywhere (GLM starts at `low`). See [Reasoning models](#reasoning-models). `none` is still accepted for compatibility, but is not recommended for review: it can finish in seconds having found nothing. |
 | `max-response-tokens` | `16000` | Starting output budget per call, reasoning included. Raised automatically when a reply is cut off. |
 | `mode` | `review` | `review`, `refactor`, or `both`. |
 | `github-token` | `${{ github.token }}` | Token used to read the diff and write comments and issues. |
@@ -623,14 +633,15 @@ is worth reporting, because a review should not discuss code it was never shown.
 ladder was spent: thinking turned down, budget doubled three times, and the reply was
 still cut off. The message names which wall it hit. If it went on reasoning, lowering
 `max_chars_per_batch` will not fix it — raise `max-response-tokens`, turn `reasoning`
-down to `minimal`, or use `request_options` if your endpoint ignores `reasoning_effort`.
+down to the lowest level your endpoint implements (`minimal`, or `low` where there is no
+`minimal`), or use `request_options` if your endpoint ignores `reasoning_effort`.
 See [Reasoning models](#reasoning-models).
 
 **A finding trails off mid-sentence, or the summary asks you to paste the code.** The
 model's chain of thought reached the reply instead of its answer. Hawky strips `<think>`
 blocks and `reasoning_content` before parsing, and withholds a summary that comes back as
-a transcript, so an older version is the likely cause. Turning `reasoning` down to
-`minimal` reduces it at the source — `none` is not the remedy, for the reasons under
+a transcript, so an older version is the likely cause. Turning `reasoning` down to your
+endpoint's floor reduces it at the source — `none` is not the remedy, for the reasons under
 [Reasoning models](#reasoning-models).
 
 **The same comments keep reappearing on every push.** Fingerprints live in a hidden HTML
