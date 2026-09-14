@@ -175,12 +175,35 @@ function asStringList(value: unknown): string[] {
   return [];
 }
 
+/**
+ * `none` is still honoured — configurations that set it keep working — but it is
+ * no longer a level to reach for. Reviewing a diff is the kind of work the
+ * thinking is for, and a model told not to think at all comes back in seconds
+ * having found nothing: a nineteen-file diff reviewed clean in about five seconds
+ * at `none` and properly at `minimal`. A merge gate cannot tell that from a clean
+ * diff, so it is a green check on a review that never happened.
+ *
+ * Warned about rather than quietly raised to `minimal`. Reviewing at a level the
+ * caller did not ask for, and billing them for it, is its own surprise; what they
+ * are owed here is to be told what the setting costs them.
+ */
+function warnIfThinkingOff(level: Reasoning): Reasoning {
+  if (level === 'none') {
+    core.warning(
+      'reasoning: none turns the model\'s thinking off entirely. Reviewing a diff is what that thinking ' +
+        'is for, and without it a review can finish in seconds having found nothing — which a merge gate ' +
+        'cannot tell apart from a clean diff. Use "minimal" as the floor instead.',
+    );
+  }
+  return level;
+}
+
 function pickReasoning(value: unknown): Reasoning {
   const v = String(value ?? '').toLowerCase();
   if (!v) return 'auto';
-  if ((REASONING_LEVELS as string[]).includes(v)) return v as Reasoning;
+  if ((REASONING_LEVELS as string[]).includes(v)) return warnIfThinkingOff(v as Reasoning);
   // 'off'/'false'/'disabled' are what people reach for first; accept them.
-  if (['off', 'false', 'no', 'disabled'].includes(v)) return 'none';
+  if (['off', 'false', 'no', 'disabled'].includes(v)) return warnIfThinkingOff('none');
   core.warning(`Unknown reasoning level "${v}"; leaving the endpoint default in place.`);
   return 'auto';
 }

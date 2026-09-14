@@ -57,6 +57,33 @@ test('a misspelled fail-on-severity warns instead of silently disabling the gate
   assert.match(warnings[0], /will not gate/);
 });
 
+test('reasoning: none is still honoured, but says what it costs', () => {
+  // Kept working because configurations already set it, warned about because a
+  // review that ends in seconds having found nothing reads, to the gate, exactly
+  // like a clean diff.
+  const { cfg, warnings } = withInputs({ reasoning: 'none' });
+
+  assert.equal(cfg.reasoning, 'none');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /turns the model's thinking off entirely/);
+  assert.match(warnings[0], /"minimal" as the floor/);
+});
+
+test('the spellings people reach for instead of none warn the same way', () => {
+  const { cfg, warnings } = withInputs({ reasoning: 'off' });
+
+  assert.equal(cfg.reasoning, 'none');
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /"minimal" as the floor/);
+});
+
+test('reasoning: minimal is accepted without complaint', () => {
+  const { cfg, warnings } = withInputs({ reasoning: 'minimal' });
+
+  assert.equal(cfg.reasoning, 'minimal');
+  assert.deepEqual(warnings, []);
+});
+
 test('the over-engineering pass is on by default', () => {
   const { cfg, warnings } = withInputs({});
   assert.equal(cfg.ponytail, 'full');

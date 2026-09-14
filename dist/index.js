@@ -39883,15 +39883,35 @@ function asStringList(value) {
         return splitList(value);
     return [];
 }
+/**
+ * `none` is still honoured — configurations that set it keep working — but it is
+ * no longer a level to reach for. Reviewing a diff is the kind of work the
+ * thinking is for, and a model told not to think at all comes back in seconds
+ * having found nothing: a nineteen-file diff reviewed clean in about five seconds
+ * at `none` and properly at `minimal`. A merge gate cannot tell that from a clean
+ * diff, so it is a green check on a review that never happened.
+ *
+ * Warned about rather than quietly raised to `minimal`. Reviewing at a level the
+ * caller did not ask for, and billing them for it, is its own surprise; what they
+ * are owed here is to be told what the setting costs them.
+ */
+function warnIfThinkingOff(level) {
+    if (level === 'none') {
+        core.warning('reasoning: none turns the model\'s thinking off entirely. Reviewing a diff is what that thinking ' +
+            'is for, and without it a review can finish in seconds having found nothing — which a merge gate ' +
+            'cannot tell apart from a clean diff. Use "minimal" as the floor instead.');
+    }
+    return level;
+}
 function pickReasoning(value) {
     const v = String(value ?? '').toLowerCase();
     if (!v)
         return 'auto';
     if (REASONING_LEVELS.includes(v))
-        return v;
+        return warnIfThinkingOff(v);
     // 'off'/'false'/'disabled' are what people reach for first; accept them.
     if (['off', 'false', 'no', 'disabled'].includes(v))
-        return 'none';
+        return warnIfThinkingOff('none');
     core.warning(`Unknown reasoning level "${v}"; leaving the endpoint default in place.`);
     return 'auto';
 }
@@ -41686,7 +41706,8 @@ function parseJsonObject(text) {
             return parsed;
     }
     const why = hadReasoning
-        ? ' The reply was mostly the model\'s own reasoning; set `reasoning: none` so it answers directly.'
+        ? ' The reply was mostly the model\'s own reasoning; turn `reasoning` down (`minimal` is the lowest ' +
+            'level worth using for review) or raise `max-response-tokens` so there is budget left for an answer.'
         : '';
     throw new Error(`Model did not return JSON.${why} First 300 characters: ${trimmed.slice(0, 300)}`);
 }
@@ -42007,8 +42028,9 @@ class OpenAIProvider {
         // A reply that is nothing but thinking is not an answer, and the parser's
         // error would blame the JSON rather than name the cause.
         if (!hasAnswer && reasoning) {
-            throw new Error(`${this.model} returned only reasoning and no answer. Set \`reasoning: none\` in .github/hawky.yml, ` +
-                'or disable thinking with the knob your endpoint documents, via `request_options`.');
+            throw new Error(`${this.model} returned only reasoning and no answer. Set \`reasoning: minimal\` in .github/hawky.yml ` +
+                'and raise `max-response-tokens`, or disable thinking with the knob your endpoint documents, via ' +
+                '`request_options`.');
         }
         const data = (0, json_js_1.parseJsonObject)(content);
         (0, validate_js_1.assertMatchesSchema)(data, req.schema);
