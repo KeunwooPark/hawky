@@ -65,6 +65,29 @@ function capOverEngineering(finding: Finding): Finding {
 }
 
 /**
+ * Whether the model actually wrote anything in this finding.
+ *
+ * `title` and `body` are required by the schema and typed `string`, and an empty
+ * string satisfies both — so a response can carry a finding that says nothing at
+ * all, and every check between here and GitHub passes it. Rendered, it is its own
+ * header and no more: `**Medium · correctness** — `. Counted, it fails a merge
+ * gate on a claim that was never made, and neither remedy applies — there is
+ * nothing to change, and a waiver is a statement that a specific claim was
+ * considered, which cannot honestly be written about an empty one.
+ *
+ * A blank `title` is disqualifying for a second reason: the fingerprint is keyed
+ * on it, so every textless finding in a file collapses to one id, which is what
+ * duplicate suppression and dismissals both read.
+ *
+ * Dropped rather than failing the batch: the rest of the review is unaffected,
+ * and one empty finding is not a reason to discard the findings that do say
+ * something.
+ */
+function hasText(finding: Finding): boolean {
+  return finding.title.trim().length > 0 && finding.body.trim().length > 0;
+}
+
+/**
  * Resolve a finding to a line range GitHub will accept, or null.
  *
  * A review POST fails as a whole with 422 if any single comment anchors outside
@@ -189,6 +212,8 @@ function renderSummary(
   dropped: number,
   /** How many of `dropped` went because their line was not in the diff at all. */
   misanchored: number,
+  /** How many of `dropped` went because the model wrote nothing in them. */
+  textless: number,
   highest: Severity | null,
   incomplete: boolean,
 ): string {
@@ -256,11 +281,16 @@ function renderSummary(
   }
 
   if (dropped) {
+    // Named apart from the rest: these went as unreliable or as empty, which is
+    // not the same claim as "real but below the bar".
+    const named = [
+      misanchored ? `${misanchored} that did not anchor to a changed line` : '',
+      textless ? `${textless} the model left empty` : '',
+    ].filter(Boolean);
     lines.push(
       `_${dropped} lower-signal finding${dropped === 1 ? '' : 's'} filtered out ` +
         `(below \`${cfg.minSeverity}\` severity or \`${cfg.minConfidence}\` confidence, or already commented on)` +
-        // Named apart from the rest: these went as unreliable, not as low-signal.
-        (misanchored ? `, including ${misanchored} that did not anchor to a changed line` : '') +
+        (named.length ? `, including ${named.join(' and ')}` : '') +
         '._',
       '',
     );
@@ -336,7 +366,25 @@ export async function postReview(
     : await readThreadState(octokit, owner, repo, pull_number, issueComments, cfg.dismissals);
 
   const before = findings.length;
-  const qualified = findings
+
+  // Judged before anything else looks at these: a finding with no text cannot be
+  // read, cannot be acted on, and cannot honestly be waived, so it must not reach
+  // a comment or the gate. Warned about individually because an empty finding is
+  // a defect in the response, not a routine filtering decision.
+  const written: Finding[] = [];
+  for (const f of findings) {
+    if (hasText(f)) {
+      written.push(f);
+      continue;
+    }
+    core.warning(
+      `Discarded ${f.severity} ${f.path}:${f.line}: the model returned a finding with no ` +
+        `${f.title.trim() ? 'description' : 'title or description'}, which makes no claim anyone could act on.`,
+    );
+  }
+  const textless = before - written.length;
+
+  const qualified = written
     .filter((f) => byPath.has(f.path))
     .map(capOverEngineering)
     .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
@@ -417,6 +465,7 @@ export async function postReview(
     cfg,
     dropped,
     misanchored,
+    textless,
     highestSeverity,
     incomplete,
   );
@@ -454,7 +503,7 @@ export async function postReview(
         repo,
         pull_number,
         issueComments,
-        renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, highestSeverity, incomplete),
+        renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, textless, highestSeverity, incomplete),
       );
       return { posted, unanchored, dismissed, highestSeverity };
     }

@@ -273,6 +273,48 @@ test('a mis-anchored finding does not suppress the ones that do anchor', async (
   assert.equal(result.highestSeverity, 'high');
 });
 
+/** What the schema lets through: the fields are all present, and all empty. */
+const empty = (severity: Severity): Finding => ({ ...finding(severity, ''), body: '' });
+
+test('a finding the model left empty is discarded rather than posted as a bare header', async () => {
+  // Verbatim, the comment this produced: `**Medium · correctness** — ` and nothing
+  // else. It blocked a merge on a finding that makes no claim, which cannot be
+  // answered by changing the code and cannot honestly be waived either.
+  const result = await post([empty('critical')]);
+
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.unanchored.length, 0);
+  assert.equal(result.highestSeverity, null);
+});
+
+test('a finding with a title but nothing under it is discarded too', async () => {
+  const result = await post([{ ...finding('critical', 'Off-by-one in the loop bound'), body: '   ' }]);
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.highestSeverity, null);
+});
+
+test('discarding an empty finding says so in the log', async () => {
+  const { warnings } = await postCapturing([empty('critical')]);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /no title or description/);
+});
+
+test('an empty finding does not suppress the ones that say something', async () => {
+  const result = await post([empty('critical'), finding('high', 'unchecked index')]);
+
+  assert.equal(result.posted.length, 1);
+  assert.equal(result.posted[0].title, 'unchecked index');
+  assert.equal(result.highestSeverity, 'high');
+});
+
+test('an empty finding is counted as filtered out, and named as empty', async () => {
+  const body = await postWith({}, [empty('high')]);
+
+  assert.match(body, /1 the model left empty/);
+  // Not dressed up as a finding the reader still has to go and evaluate.
+  assert.doesNotMatch(body, /could not be anchored/);
+});
+
 /** Octokit whose review POST fails, as GitHub's does when it rejects one anchor. */
 function rejectingOctokit() {
   const bodies: string[] = [];

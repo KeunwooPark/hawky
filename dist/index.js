@@ -40865,6 +40865,28 @@ function capOverEngineering(finding) {
     return { ...finding, severity: OVER_ENGINEERING_CEILING };
 }
 /**
+ * Whether the model actually wrote anything in this finding.
+ *
+ * `title` and `body` are required by the schema and typed `string`, and an empty
+ * string satisfies both — so a response can carry a finding that says nothing at
+ * all, and every check between here and GitHub passes it. Rendered, it is its own
+ * header and no more: `**Medium · correctness** — `. Counted, it fails a merge
+ * gate on a claim that was never made, and neither remedy applies — there is
+ * nothing to change, and a waiver is a statement that a specific claim was
+ * considered, which cannot honestly be written about an empty one.
+ *
+ * A blank `title` is disqualifying for a second reason: the fingerprint is keyed
+ * on it, so every textless finding in a file collapses to one id, which is what
+ * duplicate suppression and dismissals both read.
+ *
+ * Dropped rather than failing the batch: the rest of the review is unaffected,
+ * and one empty finding is not a reason to discard the findings that do say
+ * something.
+ */
+function hasText(finding) {
+    return finding.title.trim().length > 0 && finding.body.trim().length > 0;
+}
+/**
  * Resolve a finding to a line range GitHub will accept, or null.
  *
  * A review POST fails as a whole with 422 if any single comment anchors outside
@@ -40973,7 +40995,9 @@ function renderBugReport(cfg) {
 }
 function renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, 
 /** How many of `dropped` went because their line was not in the diff at all. */
-misanchored, highest, incomplete) {
+misanchored, 
+/** How many of `dropped` went because the model wrote nothing in them. */
+textless, highest, incomplete) {
     const lines = [
         fingerprint_js_1.SUMMARY_MARKER,
         '## Hawky review',
@@ -41017,10 +41041,15 @@ misanchored, highest, incomplete) {
             '(or unresolving its thread) and re-running this check.', '', '</details>', '');
     }
     if (dropped) {
+        // Named apart from the rest: these went as unreliable or as empty, which is
+        // not the same claim as "real but below the bar".
+        const named = [
+            misanchored ? `${misanchored} that did not anchor to a changed line` : '',
+            textless ? `${textless} the model left empty` : '',
+        ].filter(Boolean);
         lines.push(`_${dropped} lower-signal finding${dropped === 1 ? '' : 's'} filtered out ` +
             `(below \`${cfg.minSeverity}\` severity or \`${cfg.minConfidence}\` confidence, or already commented on)` +
-            // Named apart from the rest: these went as unreliable, not as low-signal.
-            (misanchored ? `, including ${misanchored} that did not anchor to a changed line` : '') +
+            (named.length ? `, including ${named.join(' and ')}` : '') +
             '._', '');
     }
     if (cfg.dismissals !== 'off') {
@@ -41061,7 +41090,21 @@ incomplete = false) {
         ? { seen: new Set(), dismissed: new Map() }
         : await (0, dismissals_js_1.readThreadState)(octokit, owner, repo, pull_number, issueComments, cfg.dismissals);
     const before = findings.length;
-    const qualified = findings
+    // Judged before anything else looks at these: a finding with no text cannot be
+    // read, cannot be acted on, and cannot honestly be waived, so it must not reach
+    // a comment or the gate. Warned about individually because an empty finding is
+    // a defect in the response, not a routine filtering decision.
+    const written = [];
+    for (const f of findings) {
+        if (hasText(f)) {
+            written.push(f);
+            continue;
+        }
+        core.warning(`Discarded ${f.severity} ${f.path}:${f.line}: the model returned a finding with no ` +
+            `${f.title.trim() ? 'description' : 'title or description'}, which makes no claim anyone could act on.`);
+    }
+    const textless = before - written.length;
+    const qualified = written
         .filter((f) => byPath.has(f.path))
         .map(capOverEngineering)
         .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
@@ -41120,7 +41163,7 @@ incomplete = false) {
     // comment and whether or not an earlier run already commented on it: an
     // unresolved critical finding is still critical on the second push.
     const highestSeverity = anchorable.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
-    const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, misanchored, highestSeverity, incomplete);
+    const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, misanchored, textless, highestSeverity, incomplete);
     if (cfg.dryRun) {
         core.info('[dry-run] Would post the following review:');
         core.info(summaryBody);
@@ -41147,7 +41190,7 @@ incomplete = false) {
             core.warning(`Could not post inline comments (${err.message}). Including them in the summary instead.`);
             unanchored.push(...posted);
             posted.length = 0;
-            await upsertSummary(octokit, owner, repo, pull_number, issueComments, renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, highestSeverity, incomplete));
+            await upsertSummary(octokit, owner, repo, pull_number, issueComments, renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, textless, highestSeverity, incomplete));
             return { posted, unanchored, dismissed, highestSeverity };
         }
     }
