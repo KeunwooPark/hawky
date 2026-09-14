@@ -300,8 +300,9 @@ export class OpenAIProvider implements Provider {
     // error would blame the JSON rather than name the cause.
     if (!hasAnswer && reasoning) {
       throw new Error(
-        `${this.model} returned only reasoning and no answer. Set \`reasoning: minimal\` in .github/hawky.yml ` +
-          'and raise `max-response-tokens`, or disable thinking with the knob your endpoint documents, via ' +
+        `${this.model} returned only reasoning and no answer. Set \`reasoning\` in .github/hawky.yml to the ` +
+          'lowest level this endpoint implements (`minimal`, or `low` where there is no `minimal`) and raise ' +
+          '`max-response-tokens`, or disable thinking with the knob your endpoint documents, via ' +
           '`request_options`.',
       );
     }

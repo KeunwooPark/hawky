@@ -22,7 +22,7 @@ inputs:
     required: false
     default: ''
   reasoning:
-    description: 'How much the model should think before answering: minimal | low | medium | high. Default: the endpoint default. Reasoning tokens are billed against the same output cap as the answer, so turn this down if replies are being truncated. "none" is still accepted for compatibility but is not recommended for code review: it can end a review in seconds having found nothing, which a merge gate cannot tell from a clean diff.'
+    description: 'How much the model should think before answering: minimal | low | medium | high. Default: the endpoint default. Reasoning tokens are billed against the same output cap as the answer, so turn this down if replies are being truncated. Not every endpoint implements "minimal" — GLM starts at "low" — and a refused value steps to the nearest level that endpoint does accept. "none" is still accepted for compatibility but is not recommended for code review: it can end a review in seconds having found nothing, which a merge gate cannot tell from a clean diff.'
     required: false
     default: ''
   max-response-tokens:

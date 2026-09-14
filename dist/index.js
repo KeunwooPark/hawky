@@ -41706,8 +41706,9 @@ function parseJsonObject(text) {
             return parsed;
     }
     const why = hadReasoning
-        ? ' The reply was mostly the model\'s own reasoning; turn `reasoning` down (`minimal` is the lowest ' +
-            'level worth using for review) or raise `max-response-tokens` so there is budget left for an answer.'
+        ? ' The reply was mostly the model\'s own reasoning; turn `reasoning` down to the lowest level your ' +
+            'endpoint implements (`minimal`, or `low` where there is no `minimal`) or raise `max-response-tokens` ' +
+            'so there is budget left for an answer.'
         : '';
     throw new Error(`Model did not return JSON.${why} First 300 characters: ${trimmed.slice(0, 300)}`);
 }
@@ -42028,8 +42029,9 @@ class OpenAIProvider {
         // A reply that is nothing but thinking is not an answer, and the parser's
         // error would blame the JSON rather than name the cause.
         if (!hasAnswer && reasoning) {
-            throw new Error(`${this.model} returned only reasoning and no answer. Set \`reasoning: minimal\` in .github/hawky.yml ` +
-                'and raise `max-response-tokens`, or disable thinking with the knob your endpoint documents, via ' +
+            throw new Error(`${this.model} returned only reasoning and no answer. Set \`reasoning\` in .github/hawky.yml to the ` +
+                'lowest level this endpoint implements (`minimal`, or `low` where there is no `minimal`) and raise ' +
+                '`max-response-tokens`, or disable thinking with the knob your endpoint documents, via ' +
                 '`request_options`.');
         }
         const data = (0, json_js_1.parseJsonObject)(content);
