@@ -144,14 +144,30 @@ test('a scale with nothing left to offer drops the parameter', () => {
   assert.equal(ladder.effort, null);
 });
 
-test('turning down from the endpoint default goes to the floor', () => {
+test('turning down from the endpoint default goes to the floor, not past it', () => {
   const ladder = new ReasoningLadder('auto');
   assert.equal(ladder.effort, null);
-  assert.equal(ladder.turnDown(), 'none');
+  assert.equal(ladder.turnDown(), 'minimal');
 });
 
-test('turning down stops the thinking rather than easing it', () => {
-  assert.equal(new ReasoningLadder('high').turnDown(), 'none');
+test('turning down eases the thinking rather than switching it off', () => {
+  // `none` answers a diff in seconds having found nothing, and a merge gate
+  // cannot tell that from a clean diff. A truncated reply is a budget problem;
+  // trading it for a review that passes quietly is not a repair.
+  assert.equal(new ReasoningLadder('high').turnDown(), 'minimal');
+});
+
+test('a ladder standing on its floor has nothing left to turn down to', () => {
+  // Which sends the caller on to the budget instead — the remedy that buys an
+  // answer without giving up the review that was asked for.
+  assert.equal(new ReasoningLadder('minimal').turnDown(), null);
+});
+
+test('the floor guards the automatic descent, not a configured none', () => {
+  // Arriving at `none` by configuration is the caller's decision, made once and
+  // warned about where it is read; arriving by retry is this class making that
+  // decision on a diff nobody was looking at.
+  assert.equal(new ReasoningLadder('none').effort, 'none');
 });
 
 test('the configured effort is left alone until something refuses it', () => {
