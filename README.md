@@ -184,10 +184,10 @@ deliberation written *into* a finding's body.
 
 The summary is screened once more before it is published, because it is the one field
 that is free model prose rather than something this action assembled. A summary that
-comes back as a transcript, repeats one line over and over, or runs far past the few
-sentences the schema asks for is withheld from the comment whole — not truncated, since
-a leaked block tends to sit at the front — and the comment says that a summary was
-withheld and why. What survives is quoted under an attribution below the verdict rather
+comes back as a transcript, carries fragments of a structure rather than prose, repeats
+one line over and over, or runs far past the few sentences the schema asks for is
+withheld from the comment whole — not truncated, since a leaked block sits at the front
+as readily as at the end — and the comment says that a summary was withheld and why. What survives is quoted under an attribution below the verdict rather
 than written as Hawky's own description of the change, so the parts of the comment this
 action stands behind are the parts that read in its own voice.
 

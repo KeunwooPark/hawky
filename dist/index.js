@@ -42861,12 +42861,14 @@ function isHawkyComment(body) {
  * the comment with `{"findings": []}` at the bottom.
  *
  * None of that is detectable by reading it for meaning, and this module does not
- * try. It checks the three properties a two-to-four-sentence summary of a diff
- * has regardless of what it says — it is not a transcript, it does not repeat
- * itself, and it is short — and withholds the text when one of them fails.
- * Withheld rather than truncated: in the run that prompted this the foreign block
- * was at the *front*, so keeping the first N characters keeps precisely the part
- * that should not be published.
+ * try. It checks the four properties a two-to-four-sentence summary of a diff has
+ * regardless of what it says — it is not a transcript, it is prose all the way
+ * through, it does not repeat itself, and it is short — and withholds the text
+ * when one of them fails. Withheld rather than truncated: in the run that
+ * prompted this the foreign block was at the *front*, so keeping the first N
+ * characters keeps precisely the part that should not be published — and a later
+ * run put its damage at the *end*, so there is no end of the field to trust
+ * either.
  *
  * The reasons below are assembled from counts and never quote the text they
  * rejected. A reason is rendered into the same comment, and echoing a fragment of
@@ -42889,6 +42891,28 @@ const MAX_SUMMARY_CHARS = 1500;
 const MIN_REPEATED_CHARS = 12;
 /** How many times one fragment may appear before the text counts as decayed. */
 const MAX_REPEATS = 4;
+/**
+ * The seam where something that was not prose has been spliced into prose.
+ *
+ * A run arrived whose summary opened with an accurate sentence about the diff and
+ * then carried a stray `}`, a tab, and two lines asserting a critical finding and
+ * an unwaived dismissal — in a run that found nothing at all. It is short,
+ * repeats nothing, and carries no reasoning tag, so every check above lets it
+ * through, and what it claims is contradicted by counts this action holds at the
+ * moment it renders the comment.
+ *
+ * Detectable there is not the claim but the join: a tab, or a line opening on a
+ * closing bracket. Two-to-four sentences of review English contain neither, and
+ * matching on the shape rather than on the assertion keeps this module out of the
+ * business of judging what a summary says.
+ *
+ * A summary that fences a snippet of code trips this. That is a real cost and an
+ * accepted one: the schema asks for sentences, the disposition is to withhold one
+ * field with the reason stated rather than to fail the run, and the alternative —
+ * tracking fence state to exempt the inside of a block — is more machinery than a
+ * prose check should carry.
+ */
+const STRUCTURAL_DEBRIS = /\t|^[ ]*[}\])]/m;
 /**
  * How many times the most-repeated sentence-like fragment appears, or 0 when
  * nothing repeats enough to matter.
@@ -42924,6 +42948,13 @@ function screenSummary(raw) {
     const withhold = (reason) => ({ text: '', withheld: reason });
     if ((0, json_js_1.containsReasoning)(text)) {
         return withhold("it was the model's chain of thought rather than an answer");
+    }
+    // Kept with the transcript check rather than below: these two say the text is
+    // not a summary at all, where the two after them say it is a summary that came
+    // apart. A transcript names itself more precisely than its seams do, so it
+    // keeps the first word.
+    if (STRUCTURAL_DEBRIS.test(text)) {
+        return withhold('it carried fragments of a structure rather than prose');
     }
     const repeats = worstRepetition(text);
     if (repeats > MAX_REPEATS) {

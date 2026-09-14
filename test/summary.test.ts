@@ -56,6 +56,35 @@ test('a long but ordinary summary is not mistaken for a transcript', () => {
   assert.equal(screenSummary(wordy).withheld, null);
 });
 
+test('a leaked tail spliced onto an accurate sentence is withheld', () => {
+  // Reported shape: one correct sentence about the diff, then a stray brace, a
+  // tab, and prose asserting a finding and an unwaived dismissal — in a run whose
+  // own counts were zero. Short, unrepeated and untagged, so nothing above this
+  // check sees it.
+  const screened = screenSummary(
+    ['Adds a paragraph to the configuration section of the README.', '}\thad a critical review gate finding.', '', '\tThat feedback has been ignored without a waiver.'].join('\n'),
+  );
+
+  assert.equal(screened.text, '');
+  assert.match(screened.withheld ?? '', /structure rather than prose/);
+});
+
+test('a line opening on a closing bracket is withheld with no tab in sight', () => {
+  const screened = screenSummary('Renames the helper and drops its callback.\n}\nreturns early now.');
+
+  assert.equal(screened.text, '');
+  assert.match(screened.withheld ?? '', /structure rather than prose/);
+});
+
+test('brackets inside a sentence are not mistaken for structural debris', () => {
+  // A reviewer writing about code names it. What marks the spliced text is a line
+  // that *opens* on a bracket, not a bracket anywhere in the prose.
+  const text = 'Changes the default from `{}` to `null`, and drops the unused `items[0]` lookup.';
+
+  assert.equal(screenSummary(text).withheld, null);
+  assert.equal(screenSummary(text).text, text);
+});
+
 test('the reason for withholding never quotes the text it rejected', () => {
   // A reason is rendered into the same pull request comment. Echoing a fragment
   // of a summary withheld for being instruction-shaped publishes a smaller copy
