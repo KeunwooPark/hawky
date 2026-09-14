@@ -2,6 +2,7 @@ import * as core from '@actions/core';
 import pkg from '../../package.json';
 import type { Config } from '../config.js';
 import { SEVERITY_ORDER, type DiffFile, type Finding, type Severity } from '../types.js';
+import { screenFinding } from '../util/finding.js';
 import { findingFingerprint, marker, SUMMARY_MARKER } from '../util/fingerprint.js';
 import type { ReviewSummary } from '../util/summary.js';
 import type { Octokit } from './client.js';
@@ -269,6 +270,8 @@ function renderSummary(
   misanchored: number,
   /** How many of `dropped` went because the model wrote nothing in them. */
   textless: number,
+  /** How many of `dropped` went because their text could not describe the diff. */
+  degenerate: number,
   highest: Severity | null,
   incomplete: boolean,
 ): string {
@@ -341,11 +344,16 @@ function renderSummary(
     const named = [
       misanchored ? `${misanchored} that did not anchor to a changed line` : '',
       textless ? `${textless} the model left empty` : '',
+      degenerate ? `${degenerate} whose text could not describe this diff` : '',
     ].filter(Boolean);
+    const list =
+      named.length <= 2
+        ? named.join(' and ')
+        : `${named.slice(0, -1).join(', ')} and ${named[named.length - 1]}`;
     lines.push(
       `_${dropped} lower-signal finding${dropped === 1 ? '' : 's'} filtered out ` +
         `(below \`${cfg.minSeverity}\` severity or \`${cfg.minConfidence}\` confidence, or already commented on)` +
-        (named.length ? `, including ${named.join(' and ')}` : '') +
+        (named.length ? `, including ${list}` : '') +
         '._',
       '',
     );
@@ -439,7 +447,27 @@ export async function postReview(
   }
   const textless = before - written.length;
 
-  const qualified = written
+  // Judged next, and for the same reason: a finding whose text cannot be true of
+  // any diff is not a finding, and at `fail-on-severity: medium` one of them is
+  // enough to stop a merge. Neither remedy applies to it — there is no code to
+  // change, and a waiver is a statement that a specific claim was considered,
+  // which cannot honestly be written about a claim that says nothing. Warned
+  // about individually, like an empty finding: this is a defect in the response,
+  // not a routine filtering decision.
+  const describing: Finding[] = [];
+  for (const f of written) {
+    const reason = screenFinding(f, byPath.get(f.path)?.patch ?? '');
+    if (!reason) {
+      describing.push(f);
+      continue;
+    }
+    core.warning(
+      `Discarded ${f.severity} ${f.path}:${f.line}: ${reason}. It is not reported and does not gate the merge.`,
+    );
+  }
+  const degenerate = written.length - describing.length;
+
+  const qualified = describing
     .filter((f) => byPath.has(f.path))
     .map(capOverEngineering)
     .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
@@ -521,6 +549,7 @@ export async function postReview(
     dropped,
     misanchored,
     textless,
+    degenerate,
     highestSeverity,
     incomplete,
   );
@@ -567,6 +596,7 @@ export async function postReview(
           dropped,
           misanchored,
           textless,
+          degenerate,
           highestSeverity,
           incomplete,
         ),
