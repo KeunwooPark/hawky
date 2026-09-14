@@ -22,7 +22,12 @@ test('a reply cut off mid-thought is reported as missing JSON, not parsed from t
   const body = '<think>The guard clause {here} is wrong because the caller may';
   assert.throws(
     () => parseJsonObject(body),
-    (err: unknown) => err instanceof Error && /reasoning: none/.test(err.message),
+    // It must name the remedy without prescribing `none`, which buys a parseable
+    // answer by giving up the thinking the review is made of.
+    (err: unknown) =>
+      err instanceof Error &&
+      /turn `reasoning` down/.test(err.message) &&
+      !/reasoning: none/.test(err.message),
   );
 });
 

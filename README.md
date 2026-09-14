@@ -98,7 +98,7 @@ batch fails. **Shrinking `max_chars_per_batch` does not help**: the thinking sca
 the question, not with the size of the answer, so one small file gets the same long
 deliberation as ten.
 
-Turn it off:
+Turn it down:
 
 ```yaml
 with:
@@ -106,15 +106,23 @@ with:
   base-url: https://api.fireworks.ai/inference/v1
   model: accounts/fireworks/models/glm-5p2
   api-key: ${{ secrets.FIREWORKS_API_KEY }}
-  reasoning: none
+  reasoning: minimal
 ```
 
-That sends `reasoning_effort: none`. An endpoint that does not implement that value
-answers 4xx, and hawky steps to the nearest level it might accept — `minimal` — rather
-than dropping the parameter: dropping it does not mean "no reasoning", it means the
-model's own default, which is more thinking than you asked for rather than less. Only
-when no value on the scale is accepted does it retry without the parameter, and it says
-so. A value the endpoint has already refused is never asked for a second time.
+`minimal` is the lowest level worth using for code review. **Do not set `reasoning:
+none`.** Reading a diff for defects is the work the thinking does, and a model told not
+to think comes back almost at once having found nothing: a nineteen-file diff finished
+clean in about five seconds at `none`, and reviewed properly at `minimal`. A merge gate
+cannot tell that apart from a genuinely clean diff, so what it leaves behind is a green
+check on a review that never happened. The value is still accepted, so configurations
+that already set it keep working, and it warns in the run log.
+
+That sends `reasoning_effort: minimal`. An endpoint that does not implement that value
+answers 4xx, and hawky steps to the nearest level it might accept rather than dropping
+the parameter: dropping it does not mean "no reasoning", it means the model's own
+default, which is more thinking than you asked for rather than less. Only when no value
+on the scale is accepted does it retry without the parameter, and it says so. A value the
+endpoint has already refused is never asked for a second time.
 
 Servers in that position usually expose the switch through the chat template instead,
 which `request_options` passes through verbatim:
@@ -125,6 +133,11 @@ request_options:
   chat_template_kwargs:
     thinking: false
 ```
+
+Note what that particular key does, though: it is the `none` case above reached by
+another route, and it carries the same risk of a review that finishes quickly having
+found nothing. Reach for it only when the endpoint offers no graded setting at all, and
+if truncation is what sent you here, raise `max-response-tokens` first.
 
 Check your provider's docs for the exact key — `request_options` is merged into the
 request body as-is, and it overrides anything hawky set itself.
@@ -232,7 +245,7 @@ Every input is optional except `api-key`.
 | `provider` | `anthropic` | `anthropic` or `openai`. |
 | `model` | `claude-opus-5` / `gpt-4.1` | Model id. |
 | `base-url` | — | Override the API base URL. |
-| `reasoning` | endpoint default | `none`, `minimal`, `low`, `medium`, or `high`. See [Reasoning models](#reasoning-models). |
+| `reasoning` | endpoint default | `minimal`, `low`, `medium`, or `high`. See [Reasoning models](#reasoning-models). `none` is still accepted for compatibility, but is not recommended for review: it can finish in seconds having found nothing. |
 | `max-response-tokens` | `16000` | Starting output budget per call, reasoning included. Raised automatically when a reply is cut off. |
 | `mode` | `review` | `review`, `refactor`, or `both`. |
 | `github-token` | `${{ github.token }}` | Token used to read the diff and write comments and issues. |
@@ -597,15 +610,18 @@ the run log. If it still happens often, the model is likely too small for the jo
 is worth reporting, because a review should not discuss code it was never shown.
 
 **"never finished the JSON answer within N output tokens".** Every rung of the retry
-ladder was spent: thinking off, budget doubled three times, and the reply was still cut
-off. The message names which wall it hit. If it went on reasoning, lowering
-`max_chars_per_batch` will not fix it — set `reasoning: none`, or use `request_options`
-if your endpoint ignores `reasoning_effort`. See [Reasoning models](#reasoning-models).
+ladder was spent: thinking turned down, budget doubled three times, and the reply was
+still cut off. The message names which wall it hit. If it went on reasoning, lowering
+`max_chars_per_batch` will not fix it — raise `max-response-tokens`, turn `reasoning`
+down to `minimal`, or use `request_options` if your endpoint ignores `reasoning_effort`.
+See [Reasoning models](#reasoning-models).
 
 **A finding trails off mid-sentence, or the summary asks you to paste the code.** The
 model's chain of thought reached the reply instead of its answer. Hawky strips `<think>`
-blocks and `reasoning_content` before parsing, so an older version is the likely cause;
-`reasoning: none` removes it at the source.
+blocks and `reasoning_content` before parsing, and withholds a summary that comes back as
+a transcript, so an older version is the likely cause. Turning `reasoning` down to
+`minimal` reduces it at the source — `none` is not the remedy, for the reasons under
+[Reasoning models](#reasoning-models).
 
 **The same comments keep reappearing on every push.** Fingerprints live in a hidden HTML
 comment on each posted comment. Deleting or editing those comments loses the record.

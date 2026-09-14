@@ -97,7 +97,8 @@ export function parseJsonObject<T>(text: string): T {
   }
 
   const why = hadReasoning
-    ? ' The reply was mostly the model\'s own reasoning; set `reasoning: none` so it answers directly.'
+    ? ' The reply was mostly the model\'s own reasoning; turn `reasoning` down (`minimal` is the lowest ' +
+      'level worth using for review) or raise `max-response-tokens` so there is budget left for an answer.'
     : '';
   throw new Error(`Model did not return JSON.${why} First 300 characters: ${trimmed.slice(0, 300)}`);
 }

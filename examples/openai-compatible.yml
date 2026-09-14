@@ -21,5 +21,7 @@ jobs:
           api-key: ${{ secrets.OPENROUTER_API_KEY }}
           # Reasoning models spend the output budget thinking before they answer,
           # which truncates the review no matter how small the batch is. Turn it
-          # off unless you have raised max-response-tokens to pay for both.
-          reasoning: none
+          # down unless you have raised max-response-tokens to pay for both.
+          # Not "none": reviewing a diff is what the thinking is for, and a model
+          # told not to think finds nothing, fast.
+          reasoning: minimal
