@@ -109,10 +109,15 @@ with:
   reasoning: none
 ```
 
-That sends `reasoning_effort: none`. Endpoints that do not implement the parameter
-answer 4xx; hawky logs that and retries without it, so nothing breaks, but the model
-keeps thinking. Those servers usually expose the switch through the chat template
-instead, which `request_options` passes through verbatim:
+That sends `reasoning_effort: none`. An endpoint that does not implement that value
+answers 4xx, and hawky steps to the nearest level it might accept — `minimal` — rather
+than dropping the parameter: dropping it does not mean "no reasoning", it means the
+model's own default, which is more thinking than you asked for rather than less. Only
+when no value on the scale is accepted does it retry without the parameter, and it says
+so. A value the endpoint has already refused is never asked for a second time.
+
+Servers in that position usually expose the switch through the chat template instead,
+which `request_options` passes through verbatim:
 
 ```yaml
 # .github/hawky.yml
@@ -134,13 +139,19 @@ and the answer after it, and when the counter runs out generation stops mid-toke
 closing brace, nothing parseable. Rather than failing the batch, hawky treats that as a
 budget problem and works its way out of it:
 
-1. **Stop the thinking**, if that is where the budget went — one retry with
-   `reasoning_effort: none`. Cheapest fix, and usually the only one needed.
+1. **Turn the thinking down**, if that is where the budget went — a retry at the lowest
+   `reasoning_effort` this endpoint has not already refused. Cheapest fix, and usually the
+   only one needed.
 2. **Buy more room.** The budget doubles and the call is retried, up to three times
    (16k → 32k → 64k → 128k by default). You are billed for tokens generated, not for the
    ceiling you ask for, so a raise costs nothing on batches that already fit.
 3. **Back off the model's own limit.** If the endpoint refuses a budget that large, hawky
    falls back to the biggest value it will take instead of failing on a 400.
+
+Step 2 is skipped when the usage accounting attributes nearly the whole budget to
+reasoning and step 1 has nothing left to turn down: more room would buy more
+deliberation, not more answer, so hawky stops there and says what to change instead of
+spending two more doubled calls on the same wall.
 
 A raise earned by one batch carries to the rest of the run, so a large pull request does
 not rediscover the same ceiling once per file. Only when every rung is spent does the
