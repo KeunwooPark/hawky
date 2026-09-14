@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { containsReasoning, parseJsonObject, stripReasoning } from '../src/llm/json.js';
 import { readMessage } from '../src/llm/openai.js';
-import { isBudgetOutOfRange, OutputBudget } from '../src/llm/budget.js';
+import { isBudgetOutOfRange, OutputBudget, TruncatedError } from '../src/llm/budget.js';
+import { ReasoningLadder } from '../src/llm/reasoning.js';
 
 test('a closed think block is removed and the answer behind it survives', () => {
   const body = '<think>Let me look at Redaction.swift. Hmm, { maybe } this leaks.</think>\n{"summary":"ok"}';
@@ -104,6 +105,65 @@ test('a refused budget falls back and is never asked for again', () => {
 test('a starting budget the model will not accept is a config error, not a retry', () => {
   const budget = new OutputBudget(16_000);
   assert.equal(budget.lower(), null);
+});
+
+test('a rejected effort steps to the nearest level rather than off the scale', () => {
+  const ladder = new ReasoningLadder('none');
+  assert.equal(ladder.effort, 'none');
+  // Dropping the parameter is not a neutral fallback: it hands the model its own
+  // default, which is the far end of the scale from the floor that was asked for.
+  assert.equal(ladder.reject(), 'minimal');
+});
+
+test('a refused value is never asked for again', () => {
+  // The reported cycle: `none` was rejected, so the parameter was dropped, so the
+  // model reasoned by default until it ran out of budget — whose remedy was to
+  // ask for `none` again.
+  const ladder = new ReasoningLadder('none');
+  assert.equal(ladder.reject(), 'minimal');
+  assert.equal(ladder.turnDown(), null);
+  assert.equal(ladder.effort, 'minimal');
+});
+
+test('rejections walk up the scale without repeating one', () => {
+  const ladder = new ReasoningLadder('none');
+  assert.deepEqual(
+    [ladder.reject(), ladder.reject(), ladder.reject(), ladder.reject(), ladder.reject()],
+    ['minimal', 'low', 'medium', 'high', null],
+  );
+});
+
+test('a scale with nothing left to offer drops the parameter', () => {
+  const ladder = new ReasoningLadder('high');
+  assert.equal(ladder.reject(), null);
+  assert.equal(ladder.effort, null);
+});
+
+test('turning down from the endpoint default goes to the floor', () => {
+  const ladder = new ReasoningLadder('auto');
+  assert.equal(ladder.effort, null);
+  assert.equal(ladder.turnDown(), 'none');
+});
+
+test('turning down stops the thinking rather than easing it', () => {
+  assert.equal(new ReasoningLadder('high').turnDown(), 'none');
+});
+
+test('the configured effort is left alone until something refuses it', () => {
+  const ladder = new ReasoningLadder('medium');
+  assert.equal(ladder.effort, 'medium');
+  assert.equal(ladder.moved, false);
+  ladder.turnDown();
+  assert.equal(ladder.moved, true);
+});
+
+test('reasoning that ate the budget is told apart from an answer that was simply long', () => {
+  // Only a counted split can show this; the other kinds of evidence know the
+  // answer never arrived, not what displaced it.
+  assert.equal(new TruncatedError(16_000, 15_900, 'counted').reasoningDominated, true);
+  assert.equal(new TruncatedError(16_000, 2_000, 'counted').reasoningDominated, false);
+  assert.equal(new TruncatedError(16_000, 0, 'returned').reasoningDominated, false);
+  assert.equal(new TruncatedError(16_000, 0, 'none').reasoningDominated, false);
 });
 
 test('an out-of-range cap is told apart from an unsupported parameter', () => {

@@ -67,6 +67,12 @@ export class OutputBudget {
  */
 export type ReasoningEvidence = 'counted' | 'returned' | 'inferred' | 'none';
 
+/**
+ * The share of the output budget the thinking has to account for before buying
+ * more of it is provably the wrong move.
+ */
+const REASONING_DOMINANT_SHARE = 0.9;
+
 /** A reply that ran out of output budget, with what the model spent it on. */
 export class TruncatedError extends Error {
   constructor(
@@ -76,6 +82,17 @@ export class TruncatedError extends Error {
   ) {
     super(`The response hit the ${cap}-token cap and was truncated.`);
     this.name = 'TruncatedError';
+  }
+
+  /**
+   * True when the thinking is provably almost all of what the budget bought.
+   *
+   * Only a `counted` split can show this: the other kinds of evidence establish
+   * that the answer never arrived, not what displaced it. Where it holds, a
+   * raise is futile — the extra room goes to more deliberation, not to the JSON.
+   */
+  get reasoningDominated(): boolean {
+    return this.evidence === 'counted' && this.reasoningTokens >= this.cap * REASONING_DOMINANT_SHARE;
   }
 }
 

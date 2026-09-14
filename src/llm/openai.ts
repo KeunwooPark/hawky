@@ -10,6 +10,7 @@ import {
   type ReasoningEvidence,
   TruncatedError,
 } from './budget.js';
+import { ReasoningLadder } from './reasoning.js';
 import { assertMatchesSchema, SchemaViolationError } from './validate.js';
 
 type Variant = 'json_schema' | 'json_object' | 'plain';
@@ -57,16 +58,14 @@ export class OpenAIProvider implements Provider {
   private readonly budget: OutputBudget;
   private variant: Variant = 'json_schema';
   private useLegacyMaxTokens = false;
-  /** null once the endpoint rejects the parameter, or when the user picked `auto`. */
-  private reasoningEffort: string | null;
-  /** Set after a truncated reply made us turn thinking off, so we only try once. */
-  private forcedReasoningOff = false;
+  /** Which `reasoning_effort` to ask for, and where to go when one is refused. */
+  private readonly reasoning: ReasoningLadder;
 
   constructor(cfg: Config) {
     this.model = cfg.model;
     this.requestOptions = cfg.requestOptions;
     this.budget = new OutputBudget(cfg.maxResponseTokens);
-    this.reasoningEffort = cfg.reasoning === 'auto' ? null : cfg.reasoning;
+    this.reasoning = new ReasoningLadder(cfg.reasoning);
     this.client = new OpenAI({
       apiKey: cfg.apiKey,
       ...(cfg.baseUrl ? { baseURL: cfg.baseUrl } : {}),
@@ -93,20 +92,28 @@ export class OpenAIProvider implements Provider {
   }
 
   /**
-   * The answer was cut off. Free up room for it in the cheapest order: stop the
-   * model thinking if that is where the budget went, and otherwise just buy more
+   * The answer was cut off. Free up room for it in the cheapest order: turn the
+   * thinking down if that is where the budget went, and otherwise buy more
    * budget. Shrinking the batch is not on this list — the thinking scales with
    * the question, not the answer, so the same question asked about less code
    * gets the same long deliberation.
+   *
+   * When the thinking is provably almost all of what the budget bought and there
+   * is no rung left to turn down to, this gives up instead of raising. The extra
+   * room would go to more deliberation rather than to the JSON, and doubling
+   * twice more from there is how a batch reaches the request timeout half an
+   * hour later with nothing to show for it.
    */
   private degradeAfterTruncation(err: TruncatedError): string | null {
-    if (err.evidence !== 'none' && !this.forcedReasoningOff && this.reasoningEffort !== 'none') {
-      this.forcedReasoningOff = true;
-      this.reasoningEffort = 'none';
-      const spent = err.reasoningTokens
-        ? `${err.reasoningTokens.toLocaleString()} of them on reasoning`
-        : 'most of it on reasoning';
-      return `${this.model} used its whole ${err.cap}-token output budget, ${spent}, and never finished the JSON. Retrying with reasoning_effort: none.`;
+    if (err.evidence !== 'none') {
+      const next = this.reasoning.turnDown();
+      if (next !== null) {
+        const spent = err.reasoningTokens
+          ? `${err.reasoningTokens.toLocaleString()} of them on reasoning`
+          : 'most of it on reasoning';
+        return `${this.model} used its whole ${err.cap}-token output budget, ${spent}, and never finished the JSON. Retrying with reasoning_effort: ${next}.`;
+      }
+      if (err.reasoningDominated) return null;
     }
     const raised = this.budget.raise();
     if (raised !== null) {
@@ -148,15 +155,27 @@ export class OpenAIProvider implements Provider {
           ? 'spent most of them on reasoning'
           : 'spent them on something it did not return, almost certainly reasoning';
 
+    // Name the effort it was still doing this at, so the next thing the reader
+    // tries is not the knob that has already been turned as far as it goes.
+    const evenAt = !this.reasoning.moved
+      ? ''
+      : this.reasoning.effort !== null
+        ? `, even at reasoning_effort: ${this.reasoning.effort}`
+        : ', even with reasoning_effort dropped';
+
     // Batch size is deliberately not offered here: the thinking scales with the
     // question, not the answer, so a smaller batch buys nothing.
     return (
       `${this.model} never finished the JSON answer within ${wall}, and ${spent}` +
-      (this.forcedReasoningOff ? ', even with reasoning_effort: none' : '') +
+      evenAt +
       '. Reasoning shares the output budget with the answer, so a smaller `max_chars_per_batch` will not help. ' +
       'Turn thinking off with the knob this endpoint documents (via `request_options`, e.g. ' +
       '`chat_template_kwargs: { thinking: false }`)' +
-      (this.budget.capped ? ', or switch to a model that does not reason.' : ', or raise `max_response_tokens` further.')
+      // A raise is not offered when the thinking is what filled the budget: more
+      // room buys more of it, which is the chase this advice exists to end.
+      (this.budget.capped || err.reasoningDominated
+        ? ', or switch to a model that does not reason.'
+        : ', or raise `max_response_tokens` further.')
     );
   }
 
@@ -199,12 +218,16 @@ export class OpenAIProvider implements Provider {
       this.useLegacyMaxTokens = true;
       return `${this.model} does not accept max_completion_tokens; retrying with max_tokens.`;
     }
-    if (this.reasoningEffort !== null && message.includes('reasoning_effort')) {
-      const asked = this.reasoningEffort;
-      this.reasoningEffort = null;
+    if (this.reasoning.effort !== null && message.includes('reasoning_effort')) {
+      const asked = this.reasoning.effort;
+      const next = this.reasoning.reject();
+      if (next !== null) {
+        return `${this.model} does not accept reasoning_effort: ${asked}; retrying with reasoning_effort: ${next}.`;
+      }
       return (
-        `${this.model} does not accept reasoning_effort: ${asked}; retrying without it. ` +
-        'If this model reasons by default, turn it off with the knob your endpoint documents, via `request_options`.'
+        `${this.model} accepts none of the reasoning_effort values left to try; retrying without it. ` +
+        'It will now reason at whatever its default is, which is more than you asked for rather than less — ' +
+        'turn it off with the knob your endpoint documents, via `request_options`.'
       );
     }
     if (this.variant === 'json_schema' && (message.includes('response_format') || message.includes('json_schema') || message.includes('schema'))) {
@@ -240,8 +263,9 @@ export class OpenAIProvider implements Provider {
       params.response_format = { type: 'json_object' };
     }
 
-    if (this.reasoningEffort !== null) {
-      params.reasoning_effort = this.reasoningEffort;
+    const effort = this.reasoning.effort;
+    if (effort !== null) {
+      params.reasoning_effort = effort;
     }
     // Last, so an endpoint-specific override wins over what we chose above.
     Object.assign(params, this.requestOptions);
