@@ -76,6 +76,41 @@ export function isTransientStatus(status: number | undefined): boolean {
   return status === 408 || status === 409 || status === 429 || status >= 500;
 }
 
+/**
+ * How much of its own deadline a failure has to spend before it is read as one.
+ *
+ * Half is the first cut, and the gap it has to separate is wide: a busy server
+ * answers 500 in seconds, while the gateway that produced this bug held every
+ * connection for fifteen minutes before answering 504.
+ */
+const DEADLINE_SHARE = 0.5;
+
+/**
+ * Whether a failure arrived late enough in its own deadline to be a deadline.
+ *
+ * `isTransientStatus` reads every 5xx as "the server is busy or briefly broken,
+ * send it again". For 500, 502 and 503 that is right. For a 504 from a gateway
+ * that closes every connection at a fixed limit it is not: the request did not
+ * fail, it ran out of somebody else's clock, and the identical batch at the
+ * identical budget runs out of it again. Eight such 504s across three runs landed
+ * between 15m00s and 15m05s — a wall, not a busy server — and each one cost
+ * fifteen minutes before a backoff of one second.
+ *
+ * Worse, the two were mutually exclusive. The client deadline is derived from the
+ * budget, so at `max_response_tokens: 32000` it is 27m40s against this gateway's
+ * fifteen minutes: the gateway always answered first, `APIConnectionTimeoutError`
+ * could never be raised, and the degrade ladder that handles exactly this failure
+ * was unreachable by construction.
+ *
+ * Elapsed time is the only thing that tells the two apart, so it is what decides.
+ * A server that answers quickly keeps the backoff it has; one that held the
+ * connection to the end of its rope is reporting a deadline, and the answer to a
+ * deadline is to generate less, not to ask again.
+ */
+export function isLateFailure(elapsedMs: number, timeoutMs: number): boolean {
+  return timeoutMs > 0 && elapsedMs >= timeoutMs * DEADLINE_SHARE;
+}
+
 const BASE_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;
 
