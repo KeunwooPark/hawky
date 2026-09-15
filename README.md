@@ -32,7 +32,11 @@ jobs:
           api-key: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
-That is the whole setup. No checkout step is needed — the diff comes from the API.
+That is the whole setup — the diff comes from the API, so no checkout is required.
+
+Add `actions/checkout` to the job if you want the reuse check: Hawky searches the working
+tree for code the change is re-implementing and shows it to the reviewer. Without one it
+says so once and reviews the diff alone, exactly as above.
 
 Two things to do first:
 
@@ -288,6 +292,7 @@ Every input is optional except `api-key`.
 | `fail-on-severity` | `none` | Fail the check at or above this severity. |
 | `fail-on-incomplete` | `false` | Fail the check if part of the diff could not be reviewed. |
 | `dismissals` | `all` | How a reviewer waives a false positive: `all`, `command`, or `off`. See [Waiving a false positive](#waiving-a-false-positive). |
+| `codebase-context` | `true` | Search the checkout for definitions the change re-implements. Needs `actions/checkout`. See [Reviewing for over-engineering](#reviewing-for-over-engineering). |
 | `bug-report-footer` | `true` | End the summary comment with a collapsed section on reporting a bug in Hawky. See [Reporting Hawky bugs](#reporting-hawky-bugs). |
 | `max-issues` | `3` | Cap on refactoring issues per run. |
 | `issue-labels` | `hawky,refactor` | Labels applied to refactoring issues. |
@@ -416,9 +421,30 @@ mode you switch on, and it comes down to two checks:
   should be reused rather than written a second time.
 - **Could it be smaller?** The same logic in fewer lines, sometimes in one.
 
-The reviewer reads the diff, not a checkout, so it is told to point at the code it claims
-already exists and to drop the finding when it cannot. That keeps "this is probably
-somewhere in here already" out of your comments.
+The reuse check needs something a diff does not contain: what the rest of the repository
+already defines. So Hawky looks it up before the call rather than asking the model to
+guess. When the job has run `actions/checkout`, it scans the working tree for top-level
+definitions, matches them against the names the change adds — across house styles, so
+`parse_card` matches `parseCard` — and puts what it finds in the prompt:
+
+```
+# Already in this repository
+
+- `parseCard` — also defined at apps/console/src/lib/cards.ts:42
+    export function parseCard(raw: string): Card {
+```
+
+That is retrieval, not a tool loop: still one LLM call per batch. The list is capped at 20
+names and 4,000 characters so it cannot crowd out the diff it exists to inform, and the
+reviewer is told that two things sharing a name are not necessarily the same thing.
+
+Without a checkout the scan is skipped with one warning and the review is what it was: the
+reviewer is told to point at the code it claims already exists, and to drop the finding
+when it cannot. `codebase-context: false` skips the scan outright.
+
+It finds a name defined twice. It does not find twenty lines reimplementing `chunk()`
+under a different name — that needs structural similarity and is a much larger piece of
+work.
 
 These arrive as ordinary inline comments, tagged in the title so they are skimmable and
 categorised `over-engineering`:
@@ -494,6 +520,11 @@ exclude_defaults: true
 # reply only), or "off" (nothing waives a finding).
 dismissals: all
 
+# Search the checked-out repository for definitions this change re-implements, so
+# the reuse check has evidence rather than a guess. Needs actions/checkout in the
+# job; without one the scan is skipped with a warning.
+codebase_context: true
+
 # End the summary comment with a collapsed "Is Hawky itself broken?" section.
 bug_report_footer: true
 
@@ -548,7 +579,9 @@ sent.
 
 ## How it works
 
-1. Fetch the changed files from the GitHub API — no checkout, no `git` shelling out.
+1. Fetch the changed files from the GitHub API — no checkout, no `git` shelling out. When
+   the job has checked the repository out, scan the working tree for top-level definitions
+   the change may be re-implementing, and show the matches to the reviewer.
 2. Filter out excluded, binary, and deleted files, and name the ones that were withheld in
    the prompt. A definition the model cannot see is the usual reason a review calls a
    symbol undefined, so it is told which files changed without being shown.

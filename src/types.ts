@@ -89,6 +89,15 @@ export interface Diff {
   omitted: string[];
 }
 
+/** A name this change defines that the repository already defines elsewhere. */
+export interface PriorDefinition {
+  name: string;
+  path: string;
+  line: number;
+  /** The definition line itself, trimmed. */
+  text: string;
+}
+
 /** A file in the diff, reduced to what the reviewer needs. */
 export interface DiffFile {
   path: string;

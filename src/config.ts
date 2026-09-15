@@ -40,6 +40,12 @@ export interface Config {
   failOnIncomplete: boolean;
   /** Which reviewer gestures waive a finding for the purposes of the gate. */
   dismissals: Dismissals;
+  /**
+   * Search the checked-out repository for definitions this change re-implements,
+   * and show them to the reviewer. Off when there is no checkout to search, which
+   * is warned about rather than failed on.
+   */
+  codebaseContext: boolean;
   /** Append a collapsed "report a Hawky bug" section to the summary comment. */
   bugReportFooter: boolean;
   maxIssues: number;
@@ -134,6 +140,7 @@ const KNOWN_FILE_KEYS = [
   'fail_on_severity',
   'fail_on_incomplete',
   'dismissals',
+  'codebase_context',
   'bug_report_footer',
   'max_issues',
   'issue_labels',
@@ -233,8 +240,13 @@ function pickSeverity(value: unknown, fallback: Severity, label: string): Severi
   return fallback;
 }
 
+/** Where the job's checkout lives, when there is one. */
+export function workspaceRoot(): string {
+  return process.env.GITHUB_WORKSPACE ?? process.cwd();
+}
+
 function readFileConfig(configPath: string): Record<string, unknown> {
-  const abs = path.resolve(process.env.GITHUB_WORKSPACE ?? process.cwd(), configPath);
+  const abs = path.resolve(workspaceRoot(), configPath);
   if (!fs.existsSync(abs)) {
     core.debug(`No config file at ${abs}; using inputs and defaults.`);
     return {};
@@ -317,6 +329,12 @@ export function loadConfig(): Config {
     failOnIncomplete:
       (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
     dismissals: pickDismissals(pick('dismissals', 'dismissals')),
+    // On unless switched off by name. The reuse check is the one a diff-only
+    // reviewer cannot answer, and a workflow with no checkout still reviews
+    // exactly as it did — it is told once that the scan was skipped.
+    codebaseContext: !['false', 'no', 'off'].includes(
+      (pick('codebase-context', 'codebase_context') ?? 'true').toLowerCase(),
+    ),
     // On unless switched off by name: it is how Hawky's own bugs get reported, so
     // a typo should not be what quietly removes it.
     bugReportFooter: !['false', 'no', 'off'].includes(

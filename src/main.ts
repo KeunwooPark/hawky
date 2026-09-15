@@ -1,6 +1,6 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
-import { loadConfig } from './config.js';
+import { loadConfig, workspaceRoot } from './config.js';
 import { makeProvider } from './llm/index.js';
 import { buildSystemPrompt, buildUserPrompt } from './prompts.js';
 import { REVIEW_SCHEMA } from './schema.js';
@@ -9,6 +9,7 @@ import { makeOctokit, resolveTarget } from './gh/client.js';
 import { batchFiles, getCompareDiff, getPullRequestDiff } from './gh/diff.js';
 import { postReview } from './gh/review.js';
 import { postRefactorIssues } from './gh/issues.js';
+import { buildRepoIndex, describeIndex, findPriorDefinitions, warnNoCheckout } from './repo/symbols.js';
 import { isHawkyComment } from './util/fingerprint.js';
 import { type ReviewSummary, screenSummary, screenSummaryClaims } from './util/summary.js';
 
@@ -105,6 +106,12 @@ async function run(): Promise<void> {
     return;
   }
 
+  // Built once for the run, not once per batch: the tree does not change between
+  // batches, and the scan is the expensive half of the reuse check.
+  const repoIndex = cfg.codebaseContext ? buildRepoIndex(workspaceRoot(), cfg.exclude) : null;
+  if (cfg.codebaseContext && !repoIndex) warnNoCheckout();
+  else if (repoIndex) core.info(describeIndex(repoIndex));
+
   const provider = makeProvider(cfg);
   const system = buildSystemPrompt(cfg, cfg.mode);
   const batches = batchFiles(files, cfg.maxCharsPerBatch);
@@ -120,9 +127,13 @@ async function run(): Promise<void> {
   for (const [index, batch] of batches.entries()) {
     core.startGroup(`Batch ${index + 1}/${batches.length} (${batch.map((f) => f.path).join(', ')})`);
     try {
+      const priors = repoIndex ? findPriorDefinitions(repoIndex, batch) : [];
+      if (priors.length) {
+        core.info(`${priors.length} name(s) in this batch are already defined elsewhere in the repository.`);
+      }
       const { data, usage } = await provider.complete<ModelResult>({
         system,
-        user: buildUserPrompt(target, batch, index, batches.length, omitted),
+        user: buildUserPrompt(target, batch, index, batches.length, omitted, priors),
         schema: REVIEW_SCHEMA,
         schemaName: 'code_review',
         // The system prompt is identical for every batch, so cache it once.

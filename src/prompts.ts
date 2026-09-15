@@ -1,5 +1,5 @@
 import type { Config, Mode } from './config.js';
-import type { DiffFile } from './types.js';
+import type { DiffFile, PriorDefinition } from './types.js';
 import type { Target } from './gh/client.js';
 
 /**
@@ -203,6 +203,13 @@ export function buildSystemPrompt(cfg: Config, mode: Mode): string {
  */
 const MAX_OMITTED_LISTED = 20;
 
+/**
+ * Caps on retrieved definitions, so the answer to the reuse check cannot crowd
+ * out the diff it exists to inform. Whichever is reached first ends the list.
+ */
+const MAX_PRIORS_LISTED = 20;
+const MAX_PRIOR_CHARS = 4_000;
+
 export function buildUserPrompt(
   target: Target,
   files: DiffFile[],
@@ -210,6 +217,8 @@ export function buildUserPrompt(
   batchCount: number,
   /** Paths this change touched that are not in `files`; see `Diff.omitted`. */
   omitted: string[],
+  /** What this batch defines that the repository already defines elsewhere. */
+  priors: PriorDefinition[] = [],
 ): string {
   const header = [
     `# Pull request`,
@@ -241,6 +250,31 @@ export function buildUserPrompt(
       ...(omitted.length > listed.length ? [`- ... and ${omitted.length - listed.length} more`] : []),
       ``,
     );
+  }
+
+  if (priors.length) {
+    header.push(
+      `# Already in this repository`,
+      ``,
+      `Names this change defines that the checked-out repository already defines somewhere else, found by`,
+      `searching it. This is the evidence for the reuse check: two definitions of the same thing is a`,
+      `\`reuse:\` finding against the added one. Two different things that happen to share a name is not, so`,
+      `read the definition below before reporting it, and say nothing when they are unrelated.`,
+      ``,
+    );
+
+    let used = 0;
+    let listed = 0;
+    for (const prior of priors) {
+      const entry = [`- \`${prior.name}\` — also defined at ${prior.path}:${prior.line}`, `    ${prior.text}`];
+      const cost = entry.join('\n').length + 1;
+      if (listed >= MAX_PRIORS_LISTED || used + cost > MAX_PRIOR_CHARS) break;
+      header.push(...entry);
+      used += cost;
+      listed++;
+    }
+    if (listed < priors.length) header.push(`- ... and ${priors.length - listed} more`);
+    header.push(``);
   }
 
   header.push(`# Changed files`, ``);
