@@ -64602,7 +64602,7 @@ module.exports = /*#__PURE__*/JSON.parse('[[[0,44],"disallowed_STD3_valid"],[[45
 /***/ ((module) => {
 
 "use strict";
-module.exports = /*#__PURE__*/JSON.parse('{"name":"hawky","version":"1.8.0","private":true,"description":"LLM-powered pull request reviewer and refactoring-issue generator for GitHub Actions","main":"dist/index.js","scripts":{"build":"ncc build src/main.ts -o dist --source-map --license licenses.txt","typecheck":"tsc --noEmit","all":"npm run typecheck && npm run build","test":"node --import tsx --test test/*.test.ts"},"license":"MIT","dependencies":{"@actions/core":"^1.11.1","@actions/github":"^6.0.0","@anthropic-ai/sdk":"^0.72.0","js-yaml":"^4.1.0","minimatch":"^10.0.1","openai":"^4.104.0"},"devDependencies":{"@types/js-yaml":"^4.0.9","@types/node":"^22.10.0","@vercel/ncc":"^0.38.3","tsx":"^4.23.12","typescript":"^5.7.2"}}');
+module.exports = /*#__PURE__*/JSON.parse('{"name":"hawky","version":"1.9.0","private":true,"description":"LLM-powered pull request reviewer and refactoring-issue generator for GitHub Actions","main":"dist/index.js","scripts":{"build":"ncc build src/main.ts -o dist --source-map --license licenses.txt","typecheck":"tsc --noEmit","all":"npm run typecheck && npm run build","test":"node --import tsx --test test/*.test.ts"},"license":"MIT","dependencies":{"@actions/core":"^1.11.1","@actions/github":"^6.0.0","@anthropic-ai/sdk":"^0.72.0","js-yaml":"^4.1.0","minimatch":"^10.0.1","openai":"^4.104.0"},"devDependencies":{"@types/js-yaml":"^4.0.9","@types/node":"^22.10.0","@vercel/ncc":"^0.38.3","tsx":"^4.23.12","typescript":"^5.7.2"}}');
 
 /***/ })
 
