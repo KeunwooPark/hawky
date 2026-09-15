@@ -13,6 +13,7 @@ import {
 import { ReasoningLadder } from './reasoning.js';
 import {
   describeMs,
+  isLateFailure,
   isTransientStatus,
   requestTimeoutMs,
   retryAfterMs,
@@ -101,18 +102,30 @@ export class OpenAIProvider implements Provider {
   async complete<T>(req: CompleteRequest): Promise<CompleteResponse<T>> {
     const retries = new TransientRetries();
     for (;;) {
+      const startedAt = Date.now();
       try {
         return await this.attempt<T>(req);
       } catch (err) {
-        // A busy, rate-limited or briefly broken server is worth the same
-        // request again. A timeout is not, and cannot land here anyway: it
-        // carries no status, which is the same reason it used to fall past
-        // every ladder below.
-        if (err instanceof OpenAI.APIError && isTransientStatus(err.status)) {
+        const elapsed = Date.now() - startedAt;
+        // A busy, rate-limited or briefly broken server answers in seconds and is
+        // worth the same request again. A 5xx that arrives most of the way through
+        // the deadline is not the same thing: a gateway closing every connection at
+        // a fixed limit is saying the generation does not fit inside its wall
+        // clock, and the identical request does not fit either. So it takes the
+        // deadline's remedy below — generate less — rather than three more attempts
+        // at fifteen minutes apiece, with a one-second backoff between them.
+        const outOfClock =
+          err instanceof OpenAI.APIConnectionTimeoutError ||
+          (err instanceof OpenAI.APIError &&
+            isTransientStatus(err.status) &&
+            isLateFailure(elapsed, this.lastTimeoutMs));
+
+        if (err instanceof OpenAI.APIError && isTransientStatus(err.status) && !outOfClock) {
           const wait = retries.next(retryAfterMs(err.headers));
           if (wait !== null) {
             core.warning(
-              `${this.model} answered ${err.status}; retrying in ${describeMs(wait)} (retry ${retries.attempts}).`,
+              `${this.model} answered ${err.status} after ${describeMs(elapsed)}; ` +
+                `retrying in ${describeMs(wait)} (retry ${retries.attempts}).`,
             );
             await sleep(wait);
             continue;
@@ -123,8 +136,8 @@ export class OpenAIProvider implements Provider {
             ? this.degradeAfterTruncation(err)
             : err instanceof SchemaViolationError
               ? this.degradeAfterViolation(err)
-              : this.degrade(err);
-        if (!next) throw this.giveUp(err);
+              : this.degrade(err, outOfClock, elapsed);
+        if (!next) throw this.giveUp(err, elapsed);
         core.warning(next);
       }
     }
@@ -135,10 +148,37 @@ export class OpenAIProvider implements Provider {
    * exhaustion get a sentence naming the wall that was hit and the knob that
    * moves it; everything else is the endpoint's own error, unedited.
    */
-  private giveUp(err: unknown): unknown {
+  private giveUp(err: unknown, elapsedMs: number): unknown {
     if (err instanceof TruncatedError) return new Error(this.truncationAdvice(err));
     if (err instanceof OpenAI.APIConnectionTimeoutError) return new Error(this.timeoutAdvice());
+    if (
+      err instanceof OpenAI.APIError &&
+      isTransientStatus(err.status) &&
+      isLateFailure(elapsedMs, this.lastTimeoutMs)
+    ) {
+      return new Error(this.deadlineAdvice(err.status, elapsedMs));
+    }
     return err;
+  }
+
+  /**
+   * What to tell the user when a 5xx was a deadline and there is nothing left to
+   * turn down.
+   *
+   * Deliberately not `timeoutAdvice`: that one points at `request_timeout`, and
+   * the deadline this crossed is not ours to set. Naming the elapsed time is most
+   * of the diagnosis — "answered 504" reads like a blip, "answered 504 after
+   * 15m01s" is the whole finding.
+   */
+  private deadlineAdvice(status: number | undefined, elapsedMs: number): string {
+    return (
+      `${this.model} answered ${status} after ${describeMs(elapsedMs)}, with nothing left to turn down. ` +
+      'A 5xx arriving that deep into its own deadline is a fixed limit somewhere on the path — usually a ' +
+      'proxy that closes the connection after a set number of minutes — rather than a busy server, so the ' +
+      'identical request would cross it again. Lower `max_response_tokens` so there is less to generate, or ' +
+      'turn `reasoning` down. It was not retried unchanged: repeating a request that cannot fit inside that ' +
+      'limit only spends the same wall clock again.'
+    );
   }
 
   /**
@@ -268,18 +308,21 @@ export class OpenAIProvider implements Provider {
   }
 
   /** Returns a log line when it changed something to retry, or null to give up. */
-  private degrade(err: unknown): string | null {
-    // A timeout arrives with no status and no `finish_reason`, so it satisfies
-    // neither this ladder's first line nor the truncation one: the single
-    // failure mode the provider could not read was the one its own advice —
-    // raise the budget — made certain. It is evidence all the same. The model
-    // could not deliver this budget inside the deadline the budget bought, and
-    // the thinking is the part worth cutting: it is most of what a reasoning
-    // model generates, and unlike the answer it is not what we asked for.
-    if (err instanceof OpenAI.APIConnectionTimeoutError) {
+  private degrade(err: unknown, outOfClock: boolean, elapsedMs: number): string | null {
+    // Out of clock rather than out of budget, whether that arrived as a timeout
+    // with no status at all or as a 504 from a gateway that had held the
+    // connection to its own limit. Either way the model could not deliver this
+    // budget inside the deadline it had, and the thinking is the part worth
+    // cutting: it is most of what a reasoning model generates, and unlike the
+    // answer it is not what we asked for.
+    if (outOfClock) {
       const next = this.reasoning.turnDown();
       if (next === null) return null;
-      return `${this.model} did not answer within ${describeMs(this.lastTimeoutMs)}. Retrying with reasoning_effort: ${next} — less to generate inside the same deadline.`;
+      const what =
+        err instanceof OpenAI.APIError && err.status !== undefined
+          ? `answered ${err.status} after ${describeMs(elapsedMs)}`
+          : `did not answer within ${describeMs(elapsedMs)}`;
+      return `${this.model} ${what}. Retrying with reasoning_effort: ${next} — less to generate inside the same deadline.`;
     }
     if (!(err instanceof OpenAI.APIError) || err.status === undefined || err.status >= 500) {
       return null;

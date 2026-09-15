@@ -41382,16 +41382,26 @@ class AnthropicProvider {
     async complete(req) {
         const retries = new timeout_js_1.TransientRetries();
         for (;;) {
+            const startedAt = Date.now();
             try {
                 return await this.attempt(req);
             }
             catch (err) {
+                const elapsed = Date.now() - startedAt;
                 // Worth the identical request again: the server is busy, rate-limiting,
-                // or briefly broken. A timeout has no status, so it never lands here.
-                if (err instanceof sdk_1.default.APIError && (0, timeout_js_1.isTransientStatus)(err.status)) {
+                // or briefly broken — all of which answer in seconds. A 5xx that arrives
+                // most of the way through the deadline is a fixed limit on the path
+                // instead, and the identical request would cross it again, so it is
+                // handled as the deadline it is rather than repeated.
+                const outOfClock = err instanceof sdk_1.default.APIConnectionTimeoutError ||
+                    (err instanceof sdk_1.default.APIError &&
+                        (0, timeout_js_1.isTransientStatus)(err.status) &&
+                        (0, timeout_js_1.isLateFailure)(elapsed, this.lastTimeoutMs));
+                if (err instanceof sdk_1.default.APIError && (0, timeout_js_1.isTransientStatus)(err.status) && !outOfClock) {
                     const wait = retries.next((0, timeout_js_1.retryAfterMs)(err.headers));
                     if (wait !== null) {
-                        core.warning(`${this.model} answered ${err.status}; retrying in ${(0, timeout_js_1.describeMs)(wait)} (retry ${retries.attempts}).`);
+                        core.warning(`${this.model} answered ${err.status} after ${(0, timeout_js_1.describeMs)(elapsed)}; ` +
+                            `retrying in ${(0, timeout_js_1.describeMs)(wait)} (retry ${retries.attempts}).`);
                         await (0, timeout_js_1.sleep)(wait);
                         continue;
                     }
@@ -41400,14 +41410,18 @@ class AnthropicProvider {
                 // worth dropping — it is most of what a long reply generates, and unlike
                 // the answer it is not what was asked for. With it already off there is
                 // nothing left to cut, and repeating the wait would only spend it again.
-                if (err instanceof sdk_1.default.APIConnectionTimeoutError) {
+                if (outOfClock) {
+                    const status = err instanceof sdk_1.default.APIError ? err.status : undefined;
+                    const what = status === undefined
+                        ? `did not answer within ${(0, timeout_js_1.describeMs)(elapsed)}`
+                        : `answered ${status} after ${(0, timeout_js_1.describeMs)(elapsed)}`;
                     if (this.supportsThinking) {
                         this.supportsThinking = false;
-                        core.warning(`${this.model} did not answer within ${(0, timeout_js_1.describeMs)(this.lastTimeoutMs)}. ` +
-                            'Retrying without extended thinking — less to generate inside the same deadline.');
+                        core.warning(`${this.model} ${what}. Retrying without extended thinking — ` +
+                            'less to generate inside the same deadline.');
                         continue;
                     }
-                    throw new Error(this.timeoutAdvice());
+                    throw new Error(this.timeoutAdvice(status, elapsed));
                 }
                 // A cut-off answer is recoverable: stop the model thinking if that is
                 // where `max_tokens` went, and otherwise just buy more of it.
@@ -41472,7 +41486,16 @@ class AnthropicProvider {
      * generate. The deadline now moves with the budget, so what is left to say is
      * which of the two to change, and that the wait was not silently repeated.
      */
-    timeoutAdvice() {
+    timeoutAdvice(status, elapsedMs) {
+        // A 5xx that was really a deadline crossed someone else's limit, not ours, so
+        // pointing at `request_timeout` would be pointing at the wrong knob.
+        if (status !== undefined) {
+            return (`${this.model} answered ${status} after ${(0, timeout_js_1.describeMs)(elapsedMs)}, even with extended thinking off. ` +
+                'A 5xx arriving that deep into its own deadline is a fixed limit somewhere on the path — usually a ' +
+                'proxy that closes the connection after a set number of minutes — rather than a busy server, so the ' +
+                'identical request would cross it again. Lower `max_response_tokens` so there is less to generate, or ' +
+                '`max_chars_per_batch` so each batch has less to report on. It was not retried unchanged.');
+        }
         return (`${this.model} did not answer within ${(0, timeout_js_1.describeMs)(this.lastTimeoutMs)}, even with extended thinking off. ` +
             'That deadline is derived from `max_response_tokens`, so raising the budget already buys a longer wait — ' +
             'if this endpoint is simply slow, set `request_timeout` (in seconds) to override it. Otherwise lower ' +
@@ -41929,18 +41952,28 @@ class OpenAIProvider {
     async complete(req) {
         const retries = new timeout_js_1.TransientRetries();
         for (;;) {
+            const startedAt = Date.now();
             try {
                 return await this.attempt(req);
             }
             catch (err) {
-                // A busy, rate-limited or briefly broken server is worth the same
-                // request again. A timeout is not, and cannot land here anyway: it
-                // carries no status, which is the same reason it used to fall past
-                // every ladder below.
-                if (err instanceof openai_1.default.APIError && (0, timeout_js_1.isTransientStatus)(err.status)) {
+                const elapsed = Date.now() - startedAt;
+                // A busy, rate-limited or briefly broken server answers in seconds and is
+                // worth the same request again. A 5xx that arrives most of the way through
+                // the deadline is not the same thing: a gateway closing every connection at
+                // a fixed limit is saying the generation does not fit inside its wall
+                // clock, and the identical request does not fit either. So it takes the
+                // deadline's remedy below — generate less — rather than three more attempts
+                // at fifteen minutes apiece, with a one-second backoff between them.
+                const outOfClock = err instanceof openai_1.default.APIConnectionTimeoutError ||
+                    (err instanceof openai_1.default.APIError &&
+                        (0, timeout_js_1.isTransientStatus)(err.status) &&
+                        (0, timeout_js_1.isLateFailure)(elapsed, this.lastTimeoutMs));
+                if (err instanceof openai_1.default.APIError && (0, timeout_js_1.isTransientStatus)(err.status) && !outOfClock) {
                     const wait = retries.next((0, timeout_js_1.retryAfterMs)(err.headers));
                     if (wait !== null) {
-                        core.warning(`${this.model} answered ${err.status}; retrying in ${(0, timeout_js_1.describeMs)(wait)} (retry ${retries.attempts}).`);
+                        core.warning(`${this.model} answered ${err.status} after ${(0, timeout_js_1.describeMs)(elapsed)}; ` +
+                            `retrying in ${(0, timeout_js_1.describeMs)(wait)} (retry ${retries.attempts}).`);
                         await (0, timeout_js_1.sleep)(wait);
                         continue;
                     }
@@ -41949,9 +41982,9 @@ class OpenAIProvider {
                     ? this.degradeAfterTruncation(err)
                     : err instanceof validate_js_1.SchemaViolationError
                         ? this.degradeAfterViolation(err)
-                        : this.degrade(err);
+                        : this.degrade(err, outOfClock, elapsed);
                 if (!next)
-                    throw this.giveUp(err);
+                    throw this.giveUp(err, elapsed);
                 core.warning(next);
             }
         }
@@ -41961,12 +41994,34 @@ class OpenAIProvider {
      * exhaustion get a sentence naming the wall that was hit and the knob that
      * moves it; everything else is the endpoint's own error, unedited.
      */
-    giveUp(err) {
+    giveUp(err, elapsedMs) {
         if (err instanceof budget_js_1.TruncatedError)
             return new Error(this.truncationAdvice(err));
         if (err instanceof openai_1.default.APIConnectionTimeoutError)
             return new Error(this.timeoutAdvice());
+        if (err instanceof openai_1.default.APIError &&
+            (0, timeout_js_1.isTransientStatus)(err.status) &&
+            (0, timeout_js_1.isLateFailure)(elapsedMs, this.lastTimeoutMs)) {
+            return new Error(this.deadlineAdvice(err.status, elapsedMs));
+        }
         return err;
+    }
+    /**
+     * What to tell the user when a 5xx was a deadline and there is nothing left to
+     * turn down.
+     *
+     * Deliberately not `timeoutAdvice`: that one points at `request_timeout`, and
+     * the deadline this crossed is not ours to set. Naming the elapsed time is most
+     * of the diagnosis — "answered 504" reads like a blip, "answered 504 after
+     * 15m01s" is the whole finding.
+     */
+    deadlineAdvice(status, elapsedMs) {
+        return (`${this.model} answered ${status} after ${(0, timeout_js_1.describeMs)(elapsedMs)}, with nothing left to turn down. ` +
+            'A 5xx arriving that deep into its own deadline is a fixed limit somewhere on the path — usually a ' +
+            'proxy that closes the connection after a set number of minutes — rather than a busy server, so the ' +
+            'identical request would cross it again. Lower `max_response_tokens` so there is less to generate, or ' +
+            'turn `reasoning` down. It was not retried unchanged: repeating a request that cannot fit inside that ' +
+            'limit only spends the same wall clock again.');
     }
     /**
      * What to tell the user when the request ran out of clock rather than budget.
@@ -42081,19 +42136,21 @@ class OpenAIProvider {
         return null;
     }
     /** Returns a log line when it changed something to retry, or null to give up. */
-    degrade(err) {
-        // A timeout arrives with no status and no `finish_reason`, so it satisfies
-        // neither this ladder's first line nor the truncation one: the single
-        // failure mode the provider could not read was the one its own advice —
-        // raise the budget — made certain. It is evidence all the same. The model
-        // could not deliver this budget inside the deadline the budget bought, and
-        // the thinking is the part worth cutting: it is most of what a reasoning
-        // model generates, and unlike the answer it is not what we asked for.
-        if (err instanceof openai_1.default.APIConnectionTimeoutError) {
+    degrade(err, outOfClock, elapsedMs) {
+        // Out of clock rather than out of budget, whether that arrived as a timeout
+        // with no status at all or as a 504 from a gateway that had held the
+        // connection to its own limit. Either way the model could not deliver this
+        // budget inside the deadline it had, and the thinking is the part worth
+        // cutting: it is most of what a reasoning model generates, and unlike the
+        // answer it is not what we asked for.
+        if (outOfClock) {
             const next = this.reasoning.turnDown();
             if (next === null)
                 return null;
-            return `${this.model} did not answer within ${(0, timeout_js_1.describeMs)(this.lastTimeoutMs)}. Retrying with reasoning_effort: ${next} — less to generate inside the same deadline.`;
+            const what = err instanceof openai_1.default.APIError && err.status !== undefined
+                ? `answered ${err.status} after ${(0, timeout_js_1.describeMs)(elapsedMs)}`
+                : `did not answer within ${(0, timeout_js_1.describeMs)(elapsedMs)}`;
+            return `${this.model} ${what}. Retrying with reasoning_effort: ${next} — less to generate inside the same deadline.`;
         }
         if (!(err instanceof openai_1.default.APIError) || err.status === undefined || err.status >= 500) {
             return null;
@@ -42332,6 +42389,7 @@ exports.TransientRetries = void 0;
 exports.requestTimeoutMs = requestTimeoutMs;
 exports.describeMs = describeMs;
 exports.isTransientStatus = isTransientStatus;
+exports.isLateFailure = isLateFailure;
 exports.retryAfterMs = retryAfterMs;
 exports.sleep = sleep;
 /**
@@ -42387,6 +42445,39 @@ function isTransientStatus(status) {
     if (status === undefined)
         return false;
     return status === 408 || status === 409 || status === 429 || status >= 500;
+}
+/**
+ * How much of its own deadline a failure has to spend before it is read as one.
+ *
+ * Half is the first cut, and the gap it has to separate is wide: a busy server
+ * answers 500 in seconds, while the gateway that produced this bug held every
+ * connection for fifteen minutes before answering 504.
+ */
+const DEADLINE_SHARE = 0.5;
+/**
+ * Whether a failure arrived late enough in its own deadline to be a deadline.
+ *
+ * `isTransientStatus` reads every 5xx as "the server is busy or briefly broken,
+ * send it again". For 500, 502 and 503 that is right. For a 504 from a gateway
+ * that closes every connection at a fixed limit it is not: the request did not
+ * fail, it ran out of somebody else's clock, and the identical batch at the
+ * identical budget runs out of it again. Eight such 504s across three runs landed
+ * between 15m00s and 15m05s — a wall, not a busy server — and each one cost
+ * fifteen minutes before a backoff of one second.
+ *
+ * Worse, the two were mutually exclusive. The client deadline is derived from the
+ * budget, so at `max_response_tokens: 32000` it is 27m40s against this gateway's
+ * fifteen minutes: the gateway always answered first, `APIConnectionTimeoutError`
+ * could never be raised, and the degrade ladder that handles exactly this failure
+ * was unreachable by construction.
+ *
+ * Elapsed time is the only thing that tells the two apart, so it is what decides.
+ * A server that answers quickly keeps the backoff it has; one that held the
+ * connection to the end of its rope is reporting a deadline, and the answer to a
+ * deadline is to generate less, not to ask again.
+ */
+function isLateFailure(elapsedMs, timeoutMs) {
+    return timeoutMs > 0 && elapsedMs >= timeoutMs * DEADLINE_SHARE;
 }
 const BASE_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;

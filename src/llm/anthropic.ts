@@ -6,6 +6,7 @@ import { parseJsonObject, schemaInstruction } from './json.js';
 import { isBudgetOutOfRange, OutputBudget, TruncatedError } from './budget.js';
 import {
   describeMs,
+  isLateFailure,
   isTransientStatus,
   requestTimeoutMs,
   retryAfterMs,
@@ -66,16 +67,28 @@ export class AnthropicProvider implements Provider {
   async complete<T>(req: CompleteRequest): Promise<CompleteResponse<T>> {
     const retries = new TransientRetries();
     for (;;) {
+      const startedAt = Date.now();
       try {
         return await this.attempt<T>(req);
       } catch (err) {
+        const elapsed = Date.now() - startedAt;
         // Worth the identical request again: the server is busy, rate-limiting,
-        // or briefly broken. A timeout has no status, so it never lands here.
-        if (err instanceof Anthropic.APIError && isTransientStatus(err.status)) {
+        // or briefly broken — all of which answer in seconds. A 5xx that arrives
+        // most of the way through the deadline is a fixed limit on the path
+        // instead, and the identical request would cross it again, so it is
+        // handled as the deadline it is rather than repeated.
+        const outOfClock =
+          err instanceof Anthropic.APIConnectionTimeoutError ||
+          (err instanceof Anthropic.APIError &&
+            isTransientStatus(err.status) &&
+            isLateFailure(elapsed, this.lastTimeoutMs));
+
+        if (err instanceof Anthropic.APIError && isTransientStatus(err.status) && !outOfClock) {
           const wait = retries.next(retryAfterMs(err.headers));
           if (wait !== null) {
             core.warning(
-              `${this.model} answered ${err.status}; retrying in ${describeMs(wait)} (retry ${retries.attempts}).`,
+              `${this.model} answered ${err.status} after ${describeMs(elapsed)}; ` +
+                `retrying in ${describeMs(wait)} (retry ${retries.attempts}).`,
             );
             await sleep(wait);
             continue;
@@ -85,16 +98,21 @@ export class AnthropicProvider implements Provider {
         // worth dropping — it is most of what a long reply generates, and unlike
         // the answer it is not what was asked for. With it already off there is
         // nothing left to cut, and repeating the wait would only spend it again.
-        if (err instanceof Anthropic.APIConnectionTimeoutError) {
+        if (outOfClock) {
+          const status = err instanceof Anthropic.APIError ? err.status : undefined;
+          const what =
+            status === undefined
+              ? `did not answer within ${describeMs(elapsed)}`
+              : `answered ${status} after ${describeMs(elapsed)}`;
           if (this.supportsThinking) {
             this.supportsThinking = false;
             core.warning(
-              `${this.model} did not answer within ${describeMs(this.lastTimeoutMs)}. ` +
-                'Retrying without extended thinking — less to generate inside the same deadline.',
+              `${this.model} ${what}. Retrying without extended thinking — ` +
+                'less to generate inside the same deadline.',
             );
             continue;
           }
-          throw new Error(this.timeoutAdvice());
+          throw new Error(this.timeoutAdvice(status, elapsed));
         }
         // A cut-off answer is recoverable: stop the model thinking if that is
         // where `max_tokens` went, and otherwise just buy more of it.
@@ -163,7 +181,18 @@ export class AnthropicProvider implements Provider {
    * generate. The deadline now moves with the budget, so what is left to say is
    * which of the two to change, and that the wait was not silently repeated.
    */
-  private timeoutAdvice(): string {
+  private timeoutAdvice(status: number | undefined, elapsedMs: number): string {
+    // A 5xx that was really a deadline crossed someone else's limit, not ours, so
+    // pointing at `request_timeout` would be pointing at the wrong knob.
+    if (status !== undefined) {
+      return (
+        `${this.model} answered ${status} after ${describeMs(elapsedMs)}, even with extended thinking off. ` +
+        'A 5xx arriving that deep into its own deadline is a fixed limit somewhere on the path — usually a ' +
+        'proxy that closes the connection after a set number of minutes — rather than a busy server, so the ' +
+        'identical request would cross it again. Lower `max_response_tokens` so there is less to generate, or ' +
+        '`max_chars_per_batch` so each batch has less to report on. It was not retried unchanged.'
+      );
+    }
     return (
       `${this.model} did not answer within ${describeMs(this.lastTimeoutMs)}, even with extended thinking off. ` +
       'That deadline is derived from `max_response_tokens`, so raising the budget already buys a longer wait — ' +

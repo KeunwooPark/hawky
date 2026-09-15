@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   describeMs,
+  isLateFailure,
   isTransientStatus,
   requestTimeoutMs,
   retryAfterMs,
@@ -48,6 +49,28 @@ test('transient statuses are the ones a repeat can fix', () => {
   }
   // A timeout carries no status at all; it is handled as its own case, not here.
   assert.equal(isTransientStatus(undefined), false);
+});
+
+test('a 5xx that spent most of its deadline is a deadline, not a blip', () => {
+  // The run this exists to stop: a gateway held the connection for fifteen
+  // minutes, answered 504, and was sent the identical batch three more times —
+  // sixty minutes and nine seconds for zero output tokens.
+  const deadline = requestTimeoutMs(32_000); // 27m40s, derived from the budget
+  assert.equal(isLateFailure(15 * 60 * 1000 + 1_000, deadline), true);
+
+  // A genuinely busy or briefly broken server answers in seconds, and keeps the
+  // backoff it has: this must not turn every 500 into a degraded retry.
+  assert.equal(isLateFailure(2_000, deadline), false);
+  assert.equal(isLateFailure(30_000, deadline), false);
+});
+
+test('the line between the two sits at half the deadline', () => {
+  assert.equal(isLateFailure(500, 1_000), true);
+  assert.equal(isLateFailure(499, 1_000), false);
+});
+
+test('no deadline recorded is not evidence that one was crossed', () => {
+  assert.equal(isLateFailure(10_000, 0), false);
 });
 
 test('retries back off and then run out', () => {
