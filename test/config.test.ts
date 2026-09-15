@@ -103,6 +103,18 @@ test('reasoning: minimal is accepted without complaint', () => {
   assert.deepEqual(warnings, []);
 });
 
+test('the reuse scan is on by default and switched off by name', () => {
+  // On by default, because the reuse check is the one a diff cannot answer. It
+  // costs nothing in a job with no checkout: there is simply nothing to search.
+  const { cfg, warnings } = withInputs({});
+  assert.equal(cfg.codebaseContext, true);
+  assert.deepEqual(warnings, []);
+
+  assert.equal(withInputs({ 'codebase-context': 'false' }).cfg.codebaseContext, false);
+  assert.equal(withInputs({}, 'codebase_context: false\n').cfg.codebaseContext, false);
+  assert.equal(withInputs({}, 'codebase_context: true\n').cfg.codebaseContext, true);
+});
+
 test('a retired ponytail key is reported rather than silently ignored', () => {
   // The input is gone, not deprecated. A repository still setting it should hear
   // about it once from the unknown-key warning and get the review either way.

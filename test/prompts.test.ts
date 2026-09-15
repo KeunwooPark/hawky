@@ -4,7 +4,7 @@ import { buildSystemPrompt, buildUserPrompt } from '../src/prompts.js';
 import { parsePatch } from '../src/gh/diff.js';
 import type { Config, Mode } from '../src/config.js';
 import type { Target } from '../src/gh/client.js';
-import type { DiffFile } from '../src/types.js';
+import type { DiffFile, PriorDefinition } from '../src/types.js';
 
 const prompt = (mode: Mode = 'review', over: Partial<Config> = {}) =>
   buildSystemPrompt(
@@ -198,7 +198,16 @@ const reviewed: DiffFile[] = [
   },
 ];
 
-const userPrompt = (omitted: string[]) => buildUserPrompt(target, reviewed, 0, 1, omitted);
+const userPrompt = (omitted: string[], priors: PriorDefinition[] = []) =>
+  buildUserPrompt(target, reviewed, 0, 1, omitted, priors);
+
+const prior = (over: Partial<PriorDefinition> = {}): PriorDefinition => ({
+  name: 'parseCard',
+  path: 'apps/console/src/lib/cards.ts',
+  line: 42,
+  text: 'export function parseCard(raw: string): Card {',
+  ...over,
+});
 
 test('the user prompt names the changed files it is not showing', () => {
   // Without this the model sees a use with no definition anywhere in its input.
@@ -220,6 +229,51 @@ test('the withheld list is capped so a wide change cannot flood the prompt', () 
 
 test('nothing is said about withheld files when the whole change was reviewed', () => {
   assert.ok(!userPrompt([]).includes('Changed but not shown'));
+});
+
+test('a retrieved definition is shown with where it lives and what it says', () => {
+  // The whole point of the retrieval: the reuse check stops being a question the
+  // reviewer has to speculate about and becomes one it can read the answer to.
+  const p = userPrompt([], [prior()]);
+
+  assert.match(p, /# Already in this repository/);
+  assert.ok(p.includes('- `parseCard` — also defined at apps/console/src/lib/cards.ts:42'));
+  assert.ok(p.includes('    export function parseCard(raw: string): Card {'));
+});
+
+test('the reviewer is told that sharing a name is not the same as being the same thing', () => {
+  // Without this the retrieved list reads as a list of findings to write up.
+  const p = userPrompt([], [prior()]);
+
+  assert.match(p, /two different things that happen to share a name is not/i);
+  assert.match(p, /`reuse:` finding/);
+});
+
+test('nothing is said about prior definitions when the search found none', () => {
+  assert.ok(!userPrompt([]).includes('Already in this repository'));
+  assert.ok(!userPrompt(['src/x.ts']).includes('Already in this repository'));
+});
+
+test('the retrieved list is capped by count so it cannot crowd out the diff', () => {
+  const many = Array.from({ length: 40 }, (_, i) => prior({ name: `name${i}` }));
+  const p = userPrompt([], many);
+
+  assert.ok(p.includes('`name0`'));
+  assert.ok(!p.includes('`name39`'), 'the list ran past its cap');
+  assert.match(p, /- \.\.\. and 20 more/);
+});
+
+test('the retrieved list is capped by size as well as by count', () => {
+  // Twenty short names fit; twenty long ones are what would actually crowd the
+  // batch, so the character budget has to bite before the count does.
+  const long = Array.from({ length: 20 }, (_, i) =>
+    prior({ name: `name${i}`, text: `export function name${i}(${'arg: string, '.repeat(40)}) {` }),
+  );
+  const p = userPrompt([], long);
+
+  assert.ok(p.includes('`name0`'));
+  assert.ok(!p.includes('`name19`'), 'the character cap did not bite');
+  assert.match(p, /- \.\.\. and \d+ more/);
 });
 
 test('the no-restating rule exempts the summary field it does not govern', () => {

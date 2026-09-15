@@ -39774,6 +39774,7 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.workspaceRoot = workspaceRoot;
 exports.loadConfig = loadConfig;
 const fs = __importStar(__nccwpck_require__(3024));
 const path = __importStar(__nccwpck_require__(6760));
@@ -39843,6 +39844,7 @@ const KNOWN_FILE_KEYS = [
     'fail_on_severity',
     'fail_on_incomplete',
     'dismissals',
+    'codebase_context',
     'bug_report_footer',
     'max_issues',
     'issue_labels',
@@ -39942,8 +39944,12 @@ function pickSeverity(value, fallback, label) {
     core.warning(`Unknown ${label} "${v}"; falling back to "${fallback}". Use one of: ${SEVERITIES.join(' | ')}.`);
     return fallback;
 }
+/** Where the job's checkout lives, when there is one. */
+function workspaceRoot() {
+    return process.env.GITHUB_WORKSPACE ?? process.cwd();
+}
 function readFileConfig(configPath) {
-    const abs = path.resolve(process.env.GITHUB_WORKSPACE ?? process.cwd(), configPath);
+    const abs = path.resolve(workspaceRoot(), configPath);
     if (!fs.existsSync(abs)) {
         core.debug(`No config file at ${abs}; using inputs and defaults.`);
         return {};
@@ -40020,6 +40026,10 @@ function loadConfig() {
         failOnSeverity,
         failOnIncomplete: (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
         dismissals: pickDismissals(pick('dismissals', 'dismissals')),
+        // On unless switched off by name. The reuse check is the one a diff-only
+        // reviewer cannot answer, and a workflow with no checkout still reviews
+        // exactly as it did — it is told once that the scan was skipped.
+        codebaseContext: !['false', 'no', 'off'].includes((pick('codebase-context', 'codebase_context') ?? 'true').toLowerCase()),
         // On unless switched off by name: it is how Hawky's own bugs get reported, so
         // a typo should not be what quietly removes it.
         bugReportFooter: !['false', 'no', 'off'].includes((pick('bug-report-footer', 'bug_report_footer') ?? 'true').toLowerCase()),
@@ -42585,6 +42595,7 @@ const client_js_1 = __nccwpck_require__(7780);
 const diff_js_1 = __nccwpck_require__(164);
 const review_js_1 = __nccwpck_require__(3199);
 const issues_js_1 = __nccwpck_require__(8859);
+const symbols_js_1 = __nccwpck_require__(9625);
 const fingerprint_js_1 = __nccwpck_require__(7284);
 const summary_js_1 = __nccwpck_require__(7724);
 /**
@@ -42668,6 +42679,13 @@ async function run() {
         setVerdict(true, null);
         return;
     }
+    // Built once for the run, not once per batch: the tree does not change between
+    // batches, and the scan is the expensive half of the reuse check.
+    const repoIndex = cfg.codebaseContext ? (0, symbols_js_1.buildRepoIndex)((0, config_js_1.workspaceRoot)(), cfg.exclude) : null;
+    if (cfg.codebaseContext && !repoIndex)
+        (0, symbols_js_1.warnNoCheckout)();
+    else if (repoIndex)
+        core.info((0, symbols_js_1.describeIndex)(repoIndex));
     const provider = (0, index_js_1.makeProvider)(cfg);
     const system = (0, prompts_js_1.buildSystemPrompt)(cfg, cfg.mode);
     const batches = (0, diff_js_1.batchFiles)(files, cfg.maxCharsPerBatch);
@@ -42681,9 +42699,13 @@ async function run() {
     for (const [index, batch] of batches.entries()) {
         core.startGroup(`Batch ${index + 1}/${batches.length} (${batch.map((f) => f.path).join(', ')})`);
         try {
+            const priors = repoIndex ? (0, symbols_js_1.findPriorDefinitions)(repoIndex, batch) : [];
+            if (priors.length) {
+                core.info(`${priors.length} name(s) in this batch are already defined elsewhere in the repository.`);
+            }
             const { data, usage } = await provider.complete({
                 system,
-                user: (0, prompts_js_1.buildUserPrompt)(target, batch, index, batches.length, omitted),
+                user: (0, prompts_js_1.buildUserPrompt)(target, batch, index, batches.length, omitted, priors),
                 schema: schema_js_1.REVIEW_SCHEMA,
                 schemaName: 'code_review',
                 // The system prompt is identical for every batch, so cache it once.
@@ -42902,9 +42924,17 @@ function buildSystemPrompt(cfg, mode) {
  * hundreds of generated files should not spend the batch budget listing them.
  */
 const MAX_OMITTED_LISTED = 20;
+/**
+ * Caps on retrieved definitions, so the answer to the reuse check cannot crowd
+ * out the diff it exists to inform. Whichever is reached first ends the list.
+ */
+const MAX_PRIORS_LISTED = 20;
+const MAX_PRIOR_CHARS = 4_000;
 function buildUserPrompt(target, files, batchIndex, batchCount, 
 /** Paths this change touched that are not in `files`; see `Diff.omitted`. */
-omitted) {
+omitted, 
+/** What this batch defines that the repository already defines elsewhere. */
+priors = []) {
     const header = [
         `# Pull request`,
         ``,
@@ -42921,12 +42951,292 @@ omitted) {
         const listed = omitted.slice(0, MAX_OMITTED_LISTED);
         header.push(`# Changed but not shown`, ``, `This change also touched the files below and they are not in the diff that follows: they were excluded`, `by configuration, are binary, were deleted, or did not fit this run. Whatever they contain is real code.`, `Do not report a symbol as missing, undefined, or never used because it is defined in one of these.`, ``, ...listed.map((p) => `- ${p}`), ...(omitted.length > listed.length ? [`- ... and ${omitted.length - listed.length} more`] : []), ``);
     }
+    if (priors.length) {
+        header.push(`# Already in this repository`, ``, `Names this change defines that the checked-out repository already defines somewhere else, found by`, `searching it. This is the evidence for the reuse check: two definitions of the same thing is a`, `\`reuse:\` finding against the added one. Two different things that happen to share a name is not, so`, `read the definition below before reporting it, and say nothing when they are unrelated.`, ``);
+        let used = 0;
+        let listed = 0;
+        for (const prior of priors) {
+            const entry = [`- \`${prior.name}\` — also defined at ${prior.path}:${prior.line}`, `    ${prior.text}`];
+            const cost = entry.join('\n').length + 1;
+            if (listed >= MAX_PRIORS_LISTED || used + cost > MAX_PRIOR_CHARS)
+                break;
+            header.push(...entry);
+            used += cost;
+            listed++;
+        }
+        if (listed < priors.length)
+            header.push(`- ... and ${priors.length - listed} more`);
+        header.push(``);
+    }
     header.push(`# Changed files`, ``);
     for (const file of files) {
         const renamed = file.previousPath ? ` (renamed from ${file.previousPath})` : '';
         header.push(`## ${file.path}${renamed}`, `status: ${file.status}, +${file.additions} -${file.deletions}`, ``, '```diff', file.annotated, '```', ``);
     }
     return header.join('\n');
+}
+
+
+/***/ }),
+
+/***/ 9625:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.buildRepoIndex = buildRepoIndex;
+exports.findPriorDefinitions = findPriorDefinitions;
+exports.describeIndex = describeIndex;
+exports.warnNoCheckout = warnNoCheckout;
+/**
+ * What the change defines that the repository already defines somewhere else.
+ *
+ * The reviewer sees `pulls.listFiles` output and nothing else, so "is it already
+ * in this codebase?" — the reuse check, and the one a diff-only reviewer is worst
+ * at — was a question with no evidence available to settle it. A model told that
+ * anything failing the check is worth reporting, and handed no way to answer it,
+ * does not converge: three production runs spent 97-98% of all output tokens
+ * reasoning.
+ *
+ * So the answer is retrieved before the call rather than during it. No tool loop,
+ * no second generation, no giving up single-shot structured output: hawky reads
+ * the names the diff defines, looks them up in the checked-out tree, and puts what
+ * it finds in the user prompt. Speculation is replaced with facts, and facts are
+ * cheaper to think about.
+ *
+ * Name matching finds a name defined twice. It does not find twenty lines
+ * reimplementing `chunk()` under another name, which needs structural or embedding
+ * similarity and is a much larger piece of work. This is the cheap half.
+ */
+const fs = __importStar(__nccwpck_require__(3024));
+const path = __importStar(__nccwpck_require__(6760));
+const core = __importStar(__nccwpck_require__(7484));
+const minimatch_1 = __nccwpck_require__(6507);
+/**
+ * Definition patterns, keyed by extension. Every one is anchored to the start of
+ * the line, so only top-level definitions are indexed.
+ *
+ * That is deliberate rather than lazy. An indented `const` is a local, and a
+ * method named `parse` on one class is not a reimplementation of `parse` on
+ * another — matching either produces a retrieved "prior definition" for something
+ * nobody reused, which costs prompt and invites the model to adjudicate noise.
+ * Missing a helper method is the cheaper error.
+ */
+const TS_PATTERNS = [
+    /^(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+\*?([A-Za-z_$][\w$]*)/,
+    /^(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/,
+    /^(?:export\s+)?(?:const|let)\s+([A-Za-z_$][\w$]*)\s*[=:]/,
+    /^(?:export\s+)?type\s+([A-Za-z_$][\w$]*)\s*[=<]/,
+    /^(?:export\s+)?interface\s+([A-Za-z_$][\w$]*)/,
+];
+const PY_PATTERNS = [
+    /^(?:async\s+)?def\s+([A-Za-z_]\w*)/,
+    /^class\s+([A-Za-z_]\w*)/,
+];
+const PATTERNS_BY_EXTENSION = {
+    '.ts': TS_PATTERNS,
+    '.tsx': TS_PATTERNS,
+    '.mts': TS_PATTERNS,
+    '.cts': TS_PATTERNS,
+    '.js': TS_PATTERNS,
+    '.jsx': TS_PATTERNS,
+    '.mjs': TS_PATTERNS,
+    '.cjs': TS_PATTERNS,
+    '.py': PY_PATTERNS,
+    '.pyi': PY_PATTERNS,
+};
+/** Past this, a "source file" is generated or vendored and not worth reading. */
+const MAX_FILE_BYTES = 256 * 1024;
+/** A ceiling on the scan, so an enormous monorepo cannot stall the run. */
+const MAX_FILES_SCANNED = 5_000;
+/**
+ * A name shorter than this is `x`, `id`, `ok` — shared by accident rather than by
+ * duplication, and pure noise when two files both happen to use it.
+ */
+const MIN_NAME_LENGTH = 3;
+/**
+ * `parse_card` and `parseCard` are the same helper written in two house styles,
+ * which is exactly the duplication worth catching across a polyglot repository.
+ */
+function normalise(name) {
+    return name.replace(/[_-]/g, '').toLowerCase();
+}
+function definitionsIn(text, patterns, filePath) {
+    const found = [];
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        // Cheap rejection before running five regexes: every pattern here needs a
+        // keyword in the first token, and most lines in a file are indented.
+        if (!line || line[0] === ' ' || line[0] === '\t')
+            continue;
+        for (const pattern of patterns) {
+            const name = pattern.exec(line)?.[1];
+            if (name && name.length >= MIN_NAME_LENGTH) {
+                found.push({ name, path: filePath, line: i + 1, text: line.trim() });
+                break;
+            }
+        }
+    }
+    return found;
+}
+/**
+ * Whether a directory can be skipped whole.
+ *
+ * Asked by testing a hypothetical file inside it against the configured globs:
+ * `node_modules/**` and `dist/**` match `node_modules/x.ts` and `dist/x.ts`, while
+ * a glob like `**\/*.lock` matches neither and correctly prunes nothing. Walking
+ * into `node_modules` would otherwise spend the whole file budget on dependencies
+ * that are then excluded one by one.
+ */
+function prunes(relDir, exclude) {
+    if (relDir === '.git' || relDir.endsWith('/.git'))
+        return true;
+    const probe = `${relDir}/hawky-probe.ts`;
+    return exclude.some((glob) => (0, minimatch_1.minimatch)(probe, glob, { dot: true }));
+}
+/**
+ * Read every indexable file in the checked-out tree.
+ *
+ * Returns null when there is nothing to search, which is the case this has to get
+ * right: "No checkout step is needed" is the first promise the README makes, so a
+ * workflow with no `actions/checkout` must keep reviewing exactly as it did — not
+ * fail, and not silently pretend the reuse check ran.
+ */
+function buildRepoIndex(root, exclude) {
+    const definitions = new Map();
+    let filesScanned = 0;
+    const walk = (dir) => {
+        if (filesScanned >= MAX_FILES_SCANNED)
+            return;
+        let entries;
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        }
+        catch {
+            // An unreadable directory is not worth failing a review over.
+            return;
+        }
+        for (const entry of entries) {
+            if (filesScanned >= MAX_FILES_SCANNED)
+                return;
+            const full = path.join(dir, entry.name);
+            const rel = path.relative(root, full).split(path.sep).join('/');
+            if (entry.isDirectory()) {
+                if (!prunes(rel, exclude))
+                    walk(full);
+                continue;
+            }
+            if (!entry.isFile())
+                continue;
+            const patterns = PATTERNS_BY_EXTENSION[path.extname(entry.name).toLowerCase()];
+            if (!patterns)
+                continue;
+            if (exclude.some((glob) => (0, minimatch_1.minimatch)(rel, glob, { dot: true })))
+                continue;
+            try {
+                if (fs.statSync(full).size > MAX_FILE_BYTES)
+                    continue;
+                filesScanned++;
+                for (const def of definitionsIn(fs.readFileSync(full, 'utf8'), patterns, rel)) {
+                    const key = normalise(def.name);
+                    const existing = definitions.get(key);
+                    if (existing)
+                        existing.push(def);
+                    else
+                        definitions.set(key, [def]);
+                }
+            }
+            catch {
+                continue;
+            }
+        }
+    };
+    if (!fs.existsSync(root))
+        return null;
+    walk(root);
+    return filesScanned ? { definitions, filesScanned } : null;
+}
+/** The names a batch's added lines define, in the order the diff defines them. */
+function namesAddedBy(file) {
+    const patterns = PATTERNS_BY_EXTENSION[path.extname(file.path).toLowerCase()];
+    if (!patterns)
+        return [];
+    const added = file.patch
+        .split('\n')
+        .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+        .map((line) => line.slice(1))
+        .join('\n');
+    return definitionsIn(added, patterns, file.path).map((d) => d.name);
+}
+/**
+ * Names this batch defines that the repository already defines somewhere else.
+ *
+ * The checkout is the head revision, so every name the diff adds is also in the
+ * index at the path that added it. A definition at the diff's own path is
+ * therefore the change itself, not a prior one, and is dropped.
+ */
+function findPriorDefinitions(index, files) {
+    const priors = [];
+    const seen = new Set();
+    for (const file of files) {
+        const ownPaths = new Set([file.path, file.previousPath].filter(Boolean));
+        for (const name of namesAddedBy(file)) {
+            const key = normalise(name);
+            if (seen.has(key))
+                continue;
+            const elsewhere = index.definitions.get(key)?.find((d) => !ownPaths.has(d.path));
+            if (!elsewhere)
+                continue;
+            seen.add(key);
+            priors.push({ name, path: elsewhere.path, line: elsewhere.line, text: elsewhere.text });
+        }
+    }
+    return priors;
+}
+/** One line for the run log, so a review that used retrieval says that it did. */
+function describeIndex(index) {
+    return `Indexed ${index.definitions.size.toLocaleString()} top-level name(s) across ${index.filesScanned.toLocaleString()} file(s) for the reuse check.`;
+}
+/** What to say when the reuse check was asked for and there is no tree to search. */
+function warnNoCheckout() {
+    core.warning('codebase-context is on, but there is no checked-out repository to search, so the reuse check has ' +
+        'only the diff to go on. Add `actions/checkout` to this job to let Hawky see what the change may be ' +
+        're-implementing, or set `codebase-context: false` to silence this.');
 }
 
 
