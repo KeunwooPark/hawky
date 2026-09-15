@@ -30,7 +30,7 @@ body:
     attributes:
       label: Settings
       description: The ones the summary comment lists, plus anything else you changed from the defaults.
-      placeholder: mode review, fail-on-severity high, dismissals all, ponytail full
+      placeholder: mode review, fail-on-severity high, dismissals all
   - type: textarea
     id: what-happened
     attributes:

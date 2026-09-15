@@ -21,12 +21,6 @@ export type Reasoning = 'auto' | 'none' | 'minimal' | 'low' | 'medium' | 'high';
  * `off` makes the gate absolute, with no route past it but changing the code.
  */
 export type Dismissals = 'all' | 'command' | 'off';
-/**
- * How hard the review hunts over-engineering, following the `ponytail` skill's
- * intensity ladder. Every level but `off` adds a pass that asks what the change
- * could delete; `off` leaves the reviewer looking only for defects.
- */
-export type Ponytail = 'off' | 'lite' | 'full' | 'ultra';
 
 export interface Config {
   provider: ProviderName;
@@ -46,8 +40,6 @@ export interface Config {
   failOnIncomplete: boolean;
   /** Which reviewer gestures waive a finding for the purposes of the gate. */
   dismissals: Dismissals;
-  /** How hard to hunt over-engineering alongside defects. */
-  ponytail: Ponytail;
   /** Append a collapsed "report a Hawky bug" section to the summary comment. */
   bugReportFooter: boolean;
   maxIssues: number;
@@ -120,7 +112,6 @@ const DEFAULT_EXCLUDES = [
 const SEVERITIES: Severity[] = ['low', 'medium', 'high', 'critical'];
 const REASONING_LEVELS: Reasoning[] = ['auto', 'none', 'minimal', 'low', 'medium', 'high'];
 const DISMISSAL_MODES: Dismissals[] = ['all', 'command', 'off'];
-const PONYTAIL_LEVELS: Ponytail[] = ['off', 'lite', 'full', 'ultra'];
 
 /**
  * Every key `loadConfig` reads out of the YAML file. A key that is not here was
@@ -143,7 +134,6 @@ const KNOWN_FILE_KEYS = [
   'fail_on_severity',
   'fail_on_incomplete',
   'dismissals',
-  'ponytail',
   'bug_report_footer',
   'max_issues',
   'issue_labels',
@@ -233,24 +223,6 @@ function pickDismissals(value: string | undefined): Dismissals {
     `Unknown dismissals mode "${v}"; no finding can be waived on this run. Use one of: ${DISMISSAL_MODES.join(' | ')}.`,
   );
   return 'off';
-}
-
-/**
- * Unknown values degrade to the default rather than to `off`. Someone who wrote
- * this key at all wants the pass; reading a typo as "switch it off" would grant a
- * request they did not make and say nothing. Turning it off takes `off`.
- */
-function pickPonytail(value: string | undefined): Ponytail {
-  const v = (value ?? '').toLowerCase();
-  if (!v) return 'full';
-  if ((PONYTAIL_LEVELS as string[]).includes(v)) return v as Ponytail;
-  // 'true'/'on' is what people reach for first for something that reads as a flag.
-  if (['true', 'yes', 'on'].includes(v)) return 'full';
-  if (['false', 'no', 'none'].includes(v)) return 'off';
-  core.warning(
-    `Unknown ponytail level "${v}"; falling back to "full". Use one of: ${PONYTAIL_LEVELS.join(' | ')}.`,
-  );
-  return 'full';
 }
 
 function pickSeverity(value: unknown, fallback: Severity, label: string): Severity {
@@ -345,7 +317,6 @@ export function loadConfig(): Config {
     failOnIncomplete:
       (input('fail-on-incomplete') || String(file.fail_on_incomplete ?? 'false')).toLowerCase() === 'true',
     dismissals: pickDismissals(pick('dismissals', 'dismissals')),
-    ponytail: pickPonytail(pick('ponytail', 'ponytail')),
     // On unless switched off by name: it is how Hawky's own bugs get reported, so
     // a typo should not be what quietly removes it.
     bugReportFooter: !['false', 'no', 'off'].includes(

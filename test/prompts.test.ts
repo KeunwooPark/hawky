@@ -2,15 +2,14 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { buildSystemPrompt, buildUserPrompt } from '../src/prompts.js';
 import { parsePatch } from '../src/gh/diff.js';
-import type { Config, Mode, Ponytail } from '../src/config.js';
+import type { Config, Mode } from '../src/config.js';
 import type { Target } from '../src/gh/client.js';
 import type { DiffFile } from '../src/types.js';
 
-const prompt = (ponytail: Ponytail, mode: Mode = 'review', over: Partial<Config> = {}) =>
+const prompt = (mode: Mode = 'review', over: Partial<Config> = {}) =>
   buildSystemPrompt(
     {
       guidelines: '',
-      ponytail,
       minConfidence: 0.6,
       minSeverity: 'medium',
       maxComments: 15,
@@ -20,75 +19,84 @@ const prompt = (ponytail: Ponytail, mode: Mode = 'review', over: Partial<Config>
     mode,
   );
 
-test('the over-engineering pass is absent unless ponytail is switched on', () => {
-  const off = prompt('off');
-  assert.ok(!off.includes('## Over-engineering'));
-  // Nothing about the ladder should leak into a review that did not ask for it.
-  assert.ok(!off.includes('YAGNI'));
-  assert.ok(!off.includes('over-engineering'));
+test('the reuse and shrink checks are part of what a review reports', () => {
+  const p = prompt();
+
+  // They live beside the defect list rather than in a section of their own, so
+  // there is no longer a heading or a switch standing between them and a review.
+  assert.ok(!p.includes('## Over-engineering'));
+  assert.match(p, /## What to report/);
+  assert.match(p, /Is it already in this repository\?/);
+  assert.match(p, /Can it be one line\?/);
+  assert.match(p, /more than the minimum code that works/);
 });
 
-test('ponytail adds the ladder, the tags, and the severity ceiling', () => {
-  const p = prompt('full');
+test('the four rungs a diff cannot settle are gone', () => {
+  const p = prompt();
 
-  assert.ok(p.includes('## Over-engineering'));
-  assert.ok(p.includes('YAGNI'));
-  for (const tag of ['`delete:`', '`stdlib:`', '`native:`', '`yagni:`', '`shrink:`']) {
-    assert.ok(p.includes(tag), `missing tag ${tag}`);
+  // YAGNI and "an already-installed dependency" need intent and a manifest the
+  // diff does not carry; "name the function" invites a confidently invented one.
+  for (const dropped of ['YAGNI', 'standard library', 'native platform feature', 'already-installed dependency']) {
+    assert.ok(!p.includes(dropped), `the prompt still asks about: ${dropped}`);
+  }
+});
+
+test('the tag vocabulary is the two checks that survived', () => {
+  const p = prompt();
+
+  assert.ok(p.includes('`reuse:`'));
+  assert.ok(p.includes('`shrink:`'));
+  for (const gone of ['`delete:`', '`stdlib:`', '`native:`', '`yagni:`']) {
+    assert.ok(!p.includes(gone), `the prompt still offers the tag ${gone}`);
   }
   assert.ok(p.includes('`category` set to `over-engineering`'));
-
-  // The gate reads severity, so the model has to be told these never reach it.
-  assert.match(p, /never `high` or `critical`/);
 });
 
-test('ponytail never asks for the simplifications that are not safe to make', () => {
-  const p = prompt('full');
+test('a reuse finding must point at the code it claims already exists', () => {
+  // The reviewer sees hunks, not a checkout. Without this, "it is probably
+  // already somewhere in here" is a finding it can neither settle nor drop.
+  assert.match(prompt(), /if you cannot point to it, there is nothing to report/);
+});
+
+test('the severity ceiling still stands between these findings and the gate', () => {
+  // `capOverEngineering` enforces it in code as well; a reuse finding that
+  // reached `high` would fail a merge gate built for defects.
+  assert.match(prompt(), /never `high` or `critical`/);
+});
+
+test('the review never asks for the simplifications that are not safe to make', () => {
+  const p = prompt();
   for (const guard of ['trust boundary', 'data loss', 'security measure', 'accessibility']) {
     assert.ok(p.includes(guard), `missing guard: ${guard}`);
   }
   // Deleting code is in scope; opinions about how it is written are not.
-  assert.ok(p.includes('The no-style rule above still holds.'));
+  assert.ok(p.includes('The no-style rule below still holds.'));
 });
 
-test('each intensity says something different about how much to cut', () => {
-  const [lite, full, ultra] = (['lite', 'full', 'ultra'] as const).map((l) => prompt(l));
+test('refactor-only runs prefer the refactors that delete code, without the finding tags', () => {
+  const p = prompt('refactor');
 
-  assert.match(lite, /Intensity: lite\./);
-  assert.match(full, /Intensity: full\./);
-  assert.match(ultra, /Intensity: ultra\./);
-  assert.notEqual(lite, full);
-  assert.notEqual(full, ultra);
-
-  // lite defers to the author; ultra argues the code should not exist.
-  assert.match(lite, /The author decides/);
-  assert.match(ultra, /needs to exist at all/);
-});
-
-test('refactor-only runs get the ladder without the inline-finding instructions', () => {
-  const p = prompt('full', 'refactor');
-
-  assert.ok(p.includes('## Over-engineering'));
-  // There are no inline comments in this mode, so the tag vocabulary is noise.
-  assert.ok(!p.includes('`stdlib:`'));
   assert.ok(p.includes('A refactor that deletes a layer beats one'));
+  // There are no inline comments in this mode, so the tag vocabulary is noise.
+  assert.ok(!p.includes('`shrink:`'));
+  assert.ok(!p.includes('`reuse:`'));
 });
 
 test('a review-only run says nothing about refactors deleting layers', () => {
-  assert.ok(!prompt('full', 'review').includes('deletes a layer'));
+  assert.ok(!prompt('review').includes('deletes a layer'));
 });
 
 test('refactor-only runs are told to leave the required findings array empty', () => {
   // The schema requires `findings` in every mode and this one discards whatever
   // comes back in it, so an unexplained mandatory field is output nobody reads.
-  const p = prompt('full', 'refactor');
+  const p = prompt('refactor');
 
   assert.match(p, /Return `findings` as an empty array/);
   assert.match(p, /put everything you have to say in `refactors` and `summary`/);
 });
 
 test('refactor-only runs drop the rules about fields only a finding has', () => {
-  const p = prompt('full', 'refactor', { minSeverity: 'high' });
+  const p = prompt('refactor', { minSeverity: 'high' });
 
   for (const findingOnly of [
     'Anchor every finding',
@@ -108,7 +116,7 @@ test('refactor-only runs drop the rules about fields only a finding has', () => 
 });
 
 test('a run that posts inline comments keeps the finding rules', () => {
-  const p = prompt('full', 'review', { minSeverity: 'high' });
+  const p = prompt('review', { minSeverity: 'high' });
 
   for (const rule of ['Anchor every finding', '`confidence`', '`suggestion`', 'severity are discarded']) {
     assert.ok(p.includes(rule), `review prompt lost: ${rule}`);
@@ -127,14 +135,14 @@ test('the documented gutter matches what parsePatch actually renders', () => {
     ['@@ -40,3 +42,4 @@', '+  const x = compute();', '   return x;', '-  const y = old();'].join('\n'),
   );
 
-  const p = prompt('off');
+  const p = prompt();
   for (const line of annotated.split('\n')) {
     assert.ok(p.includes(line), `prompt does not document this rendering: ${JSON.stringify(line)}`);
   }
 });
 
 test('the prompt explains that line numbers jump over code it cannot see', () => {
-  const p = prompt('off');
+  const p = prompt();
 
   // The hunk header appears in every real diff, so it has to be in the format spec.
   assert.ok(p.includes('@@ -40,3 +42,4 @@'));
@@ -144,7 +152,7 @@ test('the prompt explains that line numbers jump over code it cannot see', () =>
 });
 
 test('the discard thresholds quoted to the model are the ones the run filters on', () => {
-  const strict = prompt('off', 'review', { minConfidence: 0.85, minSeverity: 'high' });
+  const strict = prompt('review', { minConfidence: 0.85, minSeverity: 'high' });
   assert.ok(strict.includes('below 0.85 is discarded'));
   assert.ok(strict.includes('below `high` severity are discarded'));
 
@@ -153,7 +161,7 @@ test('the discard thresholds quoted to the model are the ones the run filters on
 });
 
 test('the severity floor is left out when nothing is filtered by it', () => {
-  assert.ok(!prompt('off', 'review', { minSeverity: 'low' }).includes('severity are discarded'));
+  assert.ok(!prompt('review', { minSeverity: 'low' }).includes('severity are discarded'));
 });
 
 /**
@@ -163,7 +171,7 @@ test('the severity floor is left out when nothing is filtered by it', () => {
  * budget deliberating, that is the expensive half paid for a comment nobody reads.
  */
 test('the run names the cap on how many findings survive it', () => {
-  const p = prompt('off', 'review', { maxComments: 4 });
+  const p = prompt('review', { maxComments: 4 });
 
   assert.match(p, /At most 4 finding\(s\) are posted on this run/);
   assert.match(p, /taken in order of severity and then/);
@@ -172,8 +180,8 @@ test('the run names the cap on how many findings survive it', () => {
 });
 
 test('the issue cap is quoted to a run that opens issues, and to no other', () => {
-  assert.match(prompt('off', 'refactor', { maxIssues: 2 }), /At most\s+2 issue\(s\) are opened on this run/);
-  assert.ok(!prompt('off', 'review').includes('issue(s) are opened on this run'));
+  assert.match(prompt('refactor', { maxIssues: 2 }), /At most\s+2 issue\(s\) are opened on this run/);
+  assert.ok(!prompt('review').includes('issue(s) are opened on this run'));
 });
 
 const target = { owner: 'o', repo: 'r', headSha: 'sha', title: 'T', description: 'D' } as Target;
@@ -215,7 +223,7 @@ test('nothing is said about withheld files when the whole change was reviewed', 
 });
 
 test('the no-restating rule exempts the summary field it does not govern', () => {
-  const p = prompt('off');
+  const p = prompt();
   // The schema requires `summary` to describe the change, so an unqualified "no
   // summary of what the code does" contradicted a mandatory field.
   assert.match(p, /Inside a finding/);

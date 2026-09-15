@@ -181,7 +181,6 @@ function renderBugReport(cfg: Config): string[] {
     `mode ${cfg.mode}`,
     `fail-on-severity ${cfg.failOnSeverity}`,
     `dismissals ${cfg.dismissals}`,
-    `ponytail ${cfg.ponytail}`,
   ].join(', ');
   // Field ids from .github/ISSUE_TEMPLATE/bug-report.yml, which GitHub pre-fills
   // from the query. A literal '+' is already escaped, so every '+' is a space.

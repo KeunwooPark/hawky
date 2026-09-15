@@ -86,7 +86,6 @@ async function run(): Promise<void> {
 
   core.info(
     `Hawky: mode=${cfg.mode} provider=${cfg.provider} model=${cfg.model}` +
-      (cfg.ponytail === 'off' ? '' : ` ponytail=${cfg.ponytail}`) +
       (target.pullNumber ? ` pr=#${target.pullNumber}` : ` commit=${target.headSha.slice(0, 7)}`),
   );
 

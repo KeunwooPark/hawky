@@ -6,7 +6,7 @@ Works with the Anthropic API and with any OpenAI-compatible endpoint.
 - Inline review comments anchored to the exact changed line, with one-click `suggestion` blocks
 - A sticky summary comment that is updated in place instead of piling up
 - Refactoring opportunities filed as labelled issues, deduplicated across runs
-- An over-engineering pass that asks what the change could simply not have, on by default
+- Reuse and simplification findings alongside the defects: what the change could simply not have
 - Nothing is reposted when you push again — findings are fingerprinted
 - Provider-agnostic: Anthropic, OpenAI, Azure, OpenRouter, Together, Groq, vLLM, Ollama
 
@@ -288,7 +288,6 @@ Every input is optional except `api-key`.
 | `fail-on-severity` | `none` | Fail the check at or above this severity. |
 | `fail-on-incomplete` | `false` | Fail the check if part of the diff could not be reviewed. |
 | `dismissals` | `all` | How a reviewer waives a false positive: `all`, `command`, or `off`. See [Waiving a false positive](#waiving-a-false-positive). |
-| `ponytail` | `full` | How hard to review for over-engineering: `full`, `lite`, `ultra`, or `off`. See [Reviewing for over-engineering](#reviewing-for-over-engineering). |
 | `bug-report-footer` | `true` | End the summary comment with a collapsed section on reporting a bug in Hawky. See [Reporting Hawky bugs](#reporting-hawky-bugs). |
 | `max-issues` | `3` | Cap on refactoring issues per run. |
 | `issue-labels` | `hawky,refactor` | Labels applied to refactoring issues. |
@@ -410,38 +409,24 @@ outputs instead. They are written even when the step fails, so pair them with `i
 ### Reviewing for over-engineering
 
 Hawky asks two questions of every added block. The first is whether it is wrong. The
-second — *does this need to exist at all?* — follows the
-[ponytail](https://github.com/DietrichGebert/ponytail) skill's ladder:
+second — *could the change simply not have this?* — is part of every review rather than a
+mode you switch on, and it comes down to two checks:
 
-1. Does this need to exist at all? A speculative need is not a need.
-2. Is it already in this codebase?
-3. Does the standard library do it?
-4. Does a native platform feature cover it?
-5. Does an already-installed dependency solve it?
-6. Can it be one line?
-7. Only then: the minimum code that works.
+- **Is it already in this repository?** A helper, type, or pattern that already lives here
+  should be reused rather than written a second time.
+- **Could it be smaller?** The same logic in fewer lines, sometimes in one.
 
-`ponytail` sets how hard it presses:
-
-| Value | The reviewer |
-| --- | --- |
-| `full` (default) | Enforces the ladder — anything that fails a rung is a finding |
-| `lite` | Names the lazier alternative once per file and leaves the choice to the author |
-| `ultra` | Argues the added code should not exist, not merely that it could be shorter |
-| `off` | Looks for defects only |
-
-```yaml
-# .github/hawky.yml
-ponytail: lite   # or: ultra, off
-```
+The reviewer reads the diff, not a checkout, so it is told to point at the code it claims
+already exists and to drop the finding when it cannot. That keeps "this is probably
+somewhere in here already" out of your comments.
 
 These arrive as ordinary inline comments, tagged in the title so they are skimmable and
 categorised `over-engineering`:
 
-> **Medium · over-engineering** — `stdlib:` hand-rolled 27-line email validator
+> **Medium · over-engineering** — `reuse:` second implementation of `parseCard`
 >
-> `zod`'s `z.string().email()` is already a dependency here, and the real validation is
-> the confirmation mail. net: -27 lines.
+> `apps/console/src/lib/cards.ts` already parses this shape; import it rather than
+> re-deriving the field order here. net: -24 lines.
 
 Two things keep the pass from turning into noise:
 
@@ -509,10 +494,6 @@ exclude_defaults: true
 # reply only), or "off" (nothing waives a finding).
 dismissals: all
 
-# How hard to hunt over-engineering: "full" (default), "lite", "ultra", or "off".
-# These findings are capped at medium severity so they cannot fail a merge gate.
-ponytail: full
-
 # End the summary comment with a collapsed "Is Hawky itself broken?" section.
 bug_report_footer: true
 
@@ -536,8 +517,8 @@ The defaults are tuned so a reviewer reads the comments rather than muting the b
 - **No style opinions.** The prompt explicitly excludes formatting, naming, and comment
   density — your linter already covers those, and the model is worse at them.
 - **Complexity does not block merges.** An over-engineering finding is capped at
-  `medium` severity, so the ponytail pass runs while `fail-on-severity` still means
-  "there is a bug in this".
+  `medium` severity, so the reuse and shrink checks run while `fail-on-severity` still
+  means "there is a bug in this".
 - **No repeats.** Every comment carries a fingerprint derived from the path, category,
   and title, but not the line number, so a finding that scrolls down when you edit the
   file above it is still recognised as the same finding on the next push.

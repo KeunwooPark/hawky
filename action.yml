@@ -81,10 +81,6 @@ inputs:
     description: 'How a reviewer may waive a false positive so it stops blocking the merge: "all" (an `@hawky ignore` reply, or resolving the review thread), "command" (the reply only), or "off" (nothing waives a finding). Default: all.'
     required: false
     default: ''
-  ponytail:
-    description: 'How hard to review for over-engineering, applying the ponytail skill: "full" (default, the ladder enforced), "lite" (name the lazier alternative and leave the choice to the author), "ultra" (question whether the code needs to exist), or "off" (defects only). These findings are capped at medium severity so they cannot fail a merge gate meant for defects.'
-    required: false
-    default: ''
   bug-report-footer:
     description: 'End the summary comment with a collapsed "Is Hawky itself broken?" section that tells people and coding agents how to report a bug in Hawky to its public issue tracker, without copying anything from this repository. Default: true.'
     required: false

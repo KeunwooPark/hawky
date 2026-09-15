@@ -504,7 +504,7 @@ test('a review GitHub rejects wholesale keeps its findings, with ids to waive th
   assert.match(body, new RegExp(findingFingerprint(f.path, f.category, f.title)));
 });
 
-const withBugReport: Partial<Config> = { bugReportFooter: true, mode: 'review', ponytail: 'full' };
+const withBugReport: Partial<Config> = { bugReportFooter: true, mode: 'review' };
 
 test('the summary tells a coding agent where to report a Hawky bug, and to ask first', async () => {
   const body = await postWith(withBugReport, [finding('high', 'a')]);

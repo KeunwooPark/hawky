@@ -8,12 +8,6 @@ max_comments: 15
 min_severity: medium
 min_confidence: 0.6
 
-# Hunt over-engineering as well as defects, applying the ponytail skill's ladder:
-# stdlib and native platform features before hand-rolled code, no abstraction with
-# one implementation, no dependency for what a few lines do. This is the default;
-# spelled out here because the rest of this file spells its defaults out too.
-ponytail: full
-
 max_issues: 2
 issue_labels:
   - hawky
