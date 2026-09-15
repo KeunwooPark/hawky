@@ -8,7 +8,15 @@ import type { DiffFile } from '../src/types.js';
 
 const prompt = (ponytail: Ponytail, mode: Mode = 'review', over: Partial<Config> = {}) =>
   buildSystemPrompt(
-    { guidelines: '', ponytail, minConfidence: 0.6, minSeverity: 'medium', ...over } as Config,
+    {
+      guidelines: '',
+      ponytail,
+      minConfidence: 0.6,
+      minSeverity: 'medium',
+      maxComments: 15,
+      maxIssues: 3,
+      ...over,
+    } as Config,
     mode,
   );
 
@@ -146,6 +154,26 @@ test('the discard thresholds quoted to the model are the ones the run filters on
 
 test('the severity floor is left out when nothing is filtered by it', () => {
   assert.ok(!prompt('off', 'review', { minSeverity: 'low' }).includes('severity are discarded'));
+});
+
+/**
+ * The thresholds above say what is too weak to send. This is the other end of the
+ * same argument: a finding that clears every threshold and is then dropped by the
+ * cap was still worked up in full first. On a model that spends most of its output
+ * budget deliberating, that is the expensive half paid for a comment nobody reads.
+ */
+test('the run names the cap on how many findings survive it', () => {
+  const p = prompt('off', 'review', { maxComments: 4 });
+
+  assert.match(p, /At most 4 finding\(s\) are posted on this run/);
+  assert.match(p, /taken in order of severity and then/);
+  // The number has to follow the config, the way the thresholds above do.
+  assert.ok(!p.includes('At most 15 finding(s)'));
+});
+
+test('the issue cap is quoted to a run that opens issues, and to no other', () => {
+  assert.match(prompt('off', 'refactor', { maxIssues: 2 }), /At most\s+2 issue\(s\) are opened on this run/);
+  assert.ok(!prompt('off', 'review').includes('issue(s) are opened on this run'));
 });
 
 const target = { owner: 'o', repo: 'r', headSha: 'sha', title: 'T', description: 'D' } as Target;

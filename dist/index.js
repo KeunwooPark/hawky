@@ -42918,7 +42918,7 @@ function buildSystemPrompt(cfg, mode) {
         parts.push(`Report defects in the added lines: logic errors, unhandled failure modes, race conditions, resource leaks,`, `security problems, off-by-one and boundary mistakes, incorrect error handling, API misuse, and changes that`, `silently break existing callers. Anchor each one to the exact line that has to change.`, ``);
     }
     if (wantsRefactors) {
-        parts.push(`Report structural problems the change exposes: duplicated logic, a function or module that has outgrown its`, `responsibility, an abstraction that is leaking, a pattern being copied for the third time. These become`, `tracked issues, not inline comments, so only raise ones worth a separate piece of work.`, ``);
+        parts.push(`Report structural problems the change exposes: duplicated logic, a function or module that has outgrown its`, `responsibility, an abstraction that is leaking, a pattern being copied for the third time. These become`, `tracked issues, not inline comments, so only raise ones worth a separate piece of work. At most`, `${cfg.maxIssues} issue(s) are opened on this run and the rest are discarded unread, so send the ones`, `that earn a separate piece of work rather than everything the change suggests.`, ``);
         if (cfg.ponytail !== 'off') {
             parts.push(`Prefer the ones that end with less code than they started with. A refactor that deletes a layer beats one`, `that adds a better layer.`, ``);
         }
@@ -42953,6 +42953,10 @@ function buildSystemPrompt(cfg, mode) {
         if (cfg.minSeverity !== 'low') {
             parts.push(`- Findings below \`${cfg.minSeverity}\` severity are discarded on this run. Do not spend output on them.`);
         }
+        // The ceiling, for the same reason the floor above is named: a finding the cap
+        // drops was still deliberated over in full, and on a model that spends most of
+        // its budget thinking, that is the expensive half paid for output nobody reads.
+        parts.push(`- At most ${cfg.maxComments} finding(s) are posted on this run, taken in order of severity and then`, `  confidence. The rest are discarded unread, so decide which ${cfg.maxComments} matter and stop there`, `  rather than working up everything you noticed.`);
     }
     else {
         // The schema requires `findings` in every mode, and this one posts no inline
