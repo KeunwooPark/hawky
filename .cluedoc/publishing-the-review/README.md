@@ -59,6 +59,8 @@ The fourth problem is subtler and arrived from a real run: the description field
 
 A multi-line anchor is accepted only when every line in its span is part of the change, which also keeps it inside a single fragment; a span far longer than a handful of lines is almost always a mis-anchor and is narrowed to its first line.
 
+The one-click block is the part of a comment the system is most careful about, because it is the part a reader can accept without reading. A replacement that cannot change the lines it would replace is dropped from the comment while the finding itself is published — see [Screening the Answer](../screening-the-answer/README.md) — since the alternative is a button that edits nothing, closes the thread, and leaves whatever the finding was right about in place.
+
 **When the host rejects the review as a whole**, which one bad anchor is enough to cause, the comments are not lost: every one of them is folded into the summary instead, and the run says in the log why they are not inline. Those have no thread to reply in, so the summary prints each one's identifier — the only handle a reviewer has for waiving one.
 
 **The standing summary is the run's own report.** Exactly one exists per proposal: it is found by its marker and edited, or created if absent. Its order is the argument of this paper made concrete.
@@ -74,6 +76,10 @@ flowchart TD
 ```
 
 The verdict line is written where the reviewer already is, rather than only in the run's outputs, because a gate that was never switched on otherwise looks exactly like a gate that was switched on and found nothing. It distinguishes three states that used to blur together: nothing found, nothing above the reporting bar with a count of what was filtered, and a highest severity that did clear it. When a check is green only because somebody waived something, the verdict says so.
+
+**A fourth state is said out loud on a large change: reviewed once.** One pass asks the model once per batch, and on a big change that samples the defects rather than enumerating them — measured on one proposal that converged over twelve runs, most of each run's findings being new rather than repeats of the last, on code earlier runs had read and passed over. So a clean verdict on a change above a handful of files qualifies itself as "nothing found this time" rather than an all-clear. It is said only where it changes what the verdict means: a run that found something is already telling the author to push again, and the next push buys another pass for free.
+
+The waived section names how each waiver was reached, including when a finding was held back as a rewording of one — that one was never waived on a thread of its own, so the summary prints the waived finding it was matched to and how to reverse the match.
 
 **Two voices, visibly separated.** The verdict and the counts are assembled from values the run computed and read as the system's own words. The description is quoted under an explicit attribution naming the provider and model that wrote it — every line of it prefixed, blank lines included, so the whole block stays inside the quotation instead of ending it partway down. Quoting does not make the content safe; nothing can. It makes the provenance legible, which is the part the system can actually be responsible for. And when a description was withheld, the summary says so and why, rather than passing over it in silence and leaving a reader to wonder.
 

@@ -20,6 +20,8 @@ interface ReviewCommentStub {
   in_reply_to_id?: number;
   author_association?: string;
   user?: { login: string };
+  /** The file the comment sits on, which is how a waiver is scoped to one file. */
+  path?: string;
 }
 
 /** Minimal Octokit stand-in: only the calls postReview actually makes. */
@@ -307,6 +309,123 @@ test('the summary names who waived a finding and why', async () => {
   assert.match(body, /@alice waived it: the caller already checks this/);
 });
 
+/** The wording a claim was waived under, and the wording it came back as. */
+const WAIVED_TITLE = '`useDelete` sends the id as a body, but the route reads it from the query string';
+const REWORDED = '`useDelete` sends `{ id }` as a request payload while the route reads it from the query string';
+
+/** Hawky's comment as it is really rendered — the header is where the title survives. */
+function waivedAndRendered(title = WAIVED_TITLE, reason = 'the route accepts both'): ReviewCommentStub[] {
+  const fingerprint = findingFingerprint('src/a.ts', 'correctness', title);
+  return [
+    {
+      id: 10,
+      path: 'src/a.ts',
+      body: `**Medium · correctness** — ${title}\n\nwhat is wrong\n\n${marker('finding', fingerprint)}`,
+    },
+    {
+      id: 11,
+      in_reply_to_id: 10,
+      body: `@hawky ignore ${reason}`,
+      author_association: 'COLLABORATOR',
+      user: { login: 'alice' },
+    },
+  ];
+}
+
+test('a waived finding the model rewords is held back rather than posted again', async () => {
+  // Reported: one claim came back seven times under seven wordings, each a fresh
+  // thread that gated the merge and cost the same argument again. The fingerprint
+  // is keyed on the title, and the title is the field rewritten every run.
+  const result = await post([finding('critical', REWORDED)], waivedAndRendered());
+
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.highestSeverity, null);
+  assert.equal(result.dismissed.length, 1);
+  assert.equal(result.dismissed[0].rewordingOf, WAIVED_TITLE);
+});
+
+test('a rewording is held back however the model recategorised it', async () => {
+  // The same claim was refiled under `api-design` on one run and `correctness` on
+  // the next, which alone was enough for a new identity.
+  const recategorised = { ...finding('high', REWORDED), category: 'api-design' };
+
+  const result = await post([recategorised], waivedAndRendered());
+
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.dismissed.length, 1);
+});
+
+test('a different finding on the same file is still posted', async () => {
+  // The finding this check must never eat: same file, unrelated defect.
+  const result = await post([finding('high', 'the retry loop never terminates on a timeout')], waivedAndRendered());
+
+  assert.equal(result.posted.length, 1);
+  assert.equal(result.highestSeverity, 'high');
+});
+
+test('a waiver on one file does not reach a rewording on another', async () => {
+  const elsewhere = { ...finding('high', REWORDED), path: 'src/b.ts' };
+  const { octokit } = capturingOctokit(waivedAndRendered());
+
+  const result = await postReview(
+    octokit,
+    'o',
+    'r',
+    1,
+    'sha',
+    SUMMARY,
+    [elsewhere],
+    [file('src/a.ts'), file('src/b.ts')],
+    cfg,
+  );
+
+  assert.equal(result.posted.length, 1);
+});
+
+test('a finding held back by wording is reported as a match, not silently dropped', async () => {
+  // A match nobody can see is a match nobody can disagree with.
+  const { octokit, bodies } = capturingOctokit(waivedAndRendered());
+  await postReview(octokit, 'o', 'r', 1, 'sha', SUMMARY, [finding('critical', REWORDED)], [file('src/a.ts')], {
+    ...cfg,
+    failOnSeverity: 'high',
+  } as Config);
+
+  const body = bodies[0] ?? '';
+  assert.match(body, /\*\*Passed\.\*\*/);
+  assert.match(body, /Held back as a rewording of a finding waived here/);
+  assert.ok(body.includes(WAIVED_TITLE));
+  assert.match(body, /reversed the same way, by the waiver it was matched to/);
+});
+
+/** The summary body for a run over this many files, with these findings. */
+const postFiles = async (files: DiffFile[], findings: Finding[] = []) => {
+  const { octokit, bodies } = capturingOctokit();
+  await captureWarnings(() => postReview(octokit, 'o', 'r', 1, 'sha', SUMMARY, findings, files, cfg));
+  return bodies[0] ?? '';
+};
+
+test('a clean pass on a large diff says it is a sample rather than an all-clear', async () => {
+  // Measured: one large pull request converged over twelve runs, most of each
+  // run's findings being new rather than repeats. A first-run pass and a
+  // twelfth-run pass read identically, and they are not the same evidence.
+  const body = await postFiles(Array.from({ length: 10 }, (_, i) => file(`src/f${i}.ts`)));
+
+  assert.match(body, /Reviewed in one pass/);
+  assert.match(body, /nothing found this time/);
+});
+
+test('a clean pass on a small diff makes no such qualification', async () => {
+  assert.doesNotMatch(await postFiles([file('src/a.ts')]), /Reviewed in one pass/);
+});
+
+test('a large diff that found something does not qualify its verdict', async () => {
+  // The author is already being told to push again, and the next push re-reviews.
+  const files = [file('src/a.ts'), ...Array.from({ length: 9 }, (_, i) => file(`src/f${i}.ts`))];
+  const body = await postFiles(files, [finding('high', 'unchecked index')]);
+
+  assert.doesNotMatch(body, /Reviewed in one pass/);
+});
+
 test('a finding on a line that is not in the diff is discarded, not published', async () => {
   // The strongest evidence of a hallucination there is: the model read a partial
   // view of the file and invented the location. Publishing it is the review
@@ -457,6 +576,102 @@ test('a degenerate finding does not suppress the ones that say something', async
   assert.equal(result.highestSeverity, 'high');
 });
 
+test('a finding whose body withdraws it does not gate the merge', async () => {
+  // Reported: the model claimed a value could be null, worked through the guard
+  // that prevents it, and ended "Drop this finding". The title is plausible and
+  // well anchored, so nothing else screens it — and at High it failed the merge.
+  const retracted = {
+    ...finding('critical', '`TransientRetries` is never reset between batches'),
+    body: 'It is shared across batches. Wait — the constructor runs per batch, so it cannot be. Drop this finding.',
+  };
+
+  const { result } = await postAgainst([retracted], withPatch(PATCH));
+
+  assert.equal(result.posted.length, 0);
+  assert.equal(result.unanchored.length, 0);
+  assert.equal(result.highestSeverity, null);
+});
+
+test('discarding a self-retracted finding says so in the log without repeating it', async () => {
+  const { warnings } = await postAgainst(
+    [{ ...finding('critical', '`TransientRetries` is never reset between batches'), body: 'Drop this finding.' }],
+    withPatch(PATCH),
+  );
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /withdraws the finding/);
+  assert.doesNotMatch(warnings[0], /Drop this finding/);
+});
+
+/** Same stand-in, but keeps the inline comments the review carried. */
+function reviewCapturingOctokit() {
+  const comments: Array<{ path: string; body: string }> = [];
+  const octokit = {
+    paginate: async (route: unknown) => {
+      if (route === LIST_REVIEW_COMMENTS) return [];
+      if (route === LIST_ISSUE_COMMENTS) return [];
+      throw new Error('unexpected paginate route');
+    },
+    rest: {
+      pulls: {
+        listReviewComments: LIST_REVIEW_COMMENTS,
+        createReview: async ({ comments: posted }: { comments: Array<{ path: string; body: string }> }) => {
+          comments.push(...posted);
+          return {};
+        },
+      },
+      issues: {
+        listComments: LIST_ISSUE_COMMENTS,
+        createComment: async () => ({}),
+        updateComment: async () => ({}),
+      },
+    },
+  } as never;
+  return { octokit, comments };
+}
+
+const SUGGESTION_PATCH = '@@ -1,1 +1,1 @@\n+  const retries = new TransientRetries();';
+
+/** The rendered body of the one inline comment a finding with this suggestion produces. */
+const postSuggesting = async (suggestion: string) => {
+  const { octokit, comments } = reviewCapturingOctokit();
+  const f = { ...finding('high', '`TransientRetries` is never reset between batches'), suggestion };
+
+  await captureWarnings(() =>
+    postReview(octokit, 'o', 'r', 1, 'sha', SUMMARY, [f], [{ ...file('src/a.ts'), patch: SUGGESTION_PATCH }], cfg),
+  );
+  return comments[0]?.body ?? '';
+};
+
+test('a suggestion that would change nothing is not offered, and the finding still is', async () => {
+  // Reported: a correct security finding shipped a patch that resolved to the
+  // original. One click would have closed the thread and left the hole — and the
+  // fingerprint is keyed on the title, so the next run does not raise it again.
+  const body = await postSuggesting('  const retries = new TransientRetries();');
+
+  assert.doesNotMatch(body, /```suggestion/);
+  assert.match(body, /`TransientRetries` is never reset between batches/);
+});
+
+test('a suggestion that really replaces the line is still rendered', async () => {
+  const body = await postSuggesting('  const retries = new TransientRetries(cfg.retries);');
+
+  assert.match(body, /```suggestion\n  const retries = new TransientRetries\(cfg\.retries\);\n```/);
+});
+
+test('withholding a suggestion says so in the log', async () => {
+  const { octokit } = reviewCapturingOctokit();
+  const f = { ...finding('high', '`TransientRetries` is never reset between batches'), suggestion: 'N/A' };
+
+  const { warnings } = await captureWarnings(() =>
+    postReview(octokit, 'o', 'r', 1, 'sha', SUMMARY, [f], [{ ...file('src/a.ts'), patch: SUGGESTION_PATCH }], cfg),
+  );
+
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /Withheld the suggestion on src\/a\.ts:1/);
+  assert.match(warnings[0], /The finding itself is posted as written/);
+});
+
 /** Octokit whose review POST fails, as GitHub's does when it rejects one anchor. */
 function rejectingOctokit() {
   const bodies: string[] = [];
@@ -544,6 +759,52 @@ test('the bug-report section does not point at a waiver that is switched off', a
 test('the bug-report section can be switched off', async () => {
   const body = await postWith({ ...withBugReport, bugReportFooter: false }, [finding('high', 'a')]);
   assert.doesNotMatch(body, /Is Hawky itself broken\?/);
+});
+
+test('one run posting the same finding twice leaves one comment', async () => {
+  // Reported: two inline comments on one file whose headers were byte-identical,
+  // created in the same second, anchored a few lines apart. Batching is
+  // per-request, so one file's lines can be answered on twice — and the only
+  // duplicate check compared this run against the pull request, never against
+  // itself.
+  const result = await post([finding('medium', 'the retry loop never terminates'), finding('medium', 'the retry loop never terminates')]);
+
+  assert.equal(result.posted.length, 1);
+  assert.equal(result.highestSeverity, 'medium');
+});
+
+test('a repeat is recognised through the same rewording the cross-run check forgives', async () => {
+  // The fingerprint folds case and punctuation, so these are one finding on both
+  // sides of the run boundary. The two checks have to agree, or a claim suppressed
+  // on the next push is posted twice on this one.
+  const result = await post([finding('high', 'Null deref on empty list'), finding('high', 'null deref on empty LIST!')]);
+
+  assert.equal(result.posted.length, 1);
+});
+
+test('two different findings on one file are both posted', async () => {
+  // The check must not collapse a file's findings into one comment.
+  const result = await post([finding('high', 'unchecked index'), finding('high', 'the retry loop never terminates')]);
+  assert.equal(result.posted.length, 2);
+});
+
+test('a suppressed repeat is counted as filtered, and named as a repeat', async () => {
+  // Invisible in the counts was half the reported problem: the summary said it
+  // left two comments and both were real as far as the gate was concerned.
+  const body = await postWith({}, [finding('high', 'unchecked index'), finding('high', 'unchecked index')]);
+
+  assert.match(body, /Left 1 inline comment \(1 high\)/);
+  assert.match(body, /1 the model reported twice in one run/);
+});
+
+test('a repeat of a waived finding is waived once, not listed twice', async () => {
+  // Deduplicating before the waiver lookup is what keeps one waiver from being
+  // reported as two.
+  const f = finding('critical', 'b');
+  const result = await post([f, { ...f }], waived(f));
+
+  assert.equal(result.dismissed.length, 1);
+  assert.equal(result.highestSeverity, null);
 });
 
 test('an over-engineering finding cannot gate the merge, however the model graded it', () => {

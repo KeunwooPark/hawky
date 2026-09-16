@@ -39775,6 +39775,9 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.workspaceRoot = workspaceRoot;
+exports.configFilePath = configFilePath;
+exports.githubToken = githubToken;
+exports.workspaceConfigExists = workspaceConfigExists;
 exports.loadConfig = loadConfig;
 const fs = __importStar(__nccwpck_require__(3024));
 const path = __importStar(__nccwpck_require__(6760));
@@ -39948,16 +39951,29 @@ function pickSeverity(value, fallback, label) {
 function workspaceRoot() {
     return process.env.GITHUB_WORKSPACE ?? process.cwd();
 }
-function readFileConfig(configPath) {
-    const abs = path.resolve(workspaceRoot(), configPath);
-    if (!fs.existsSync(abs)) {
-        core.debug(`No config file at ${abs}; using inputs and defaults.`);
-        return {};
-    }
+/** The config file this run reads, as a repository-relative path. */
+function configFilePath() {
+    return core.getInput('config-path') || '.github/hawky.yml';
+}
+/**
+ * The token used to read the diff and write comments.
+ *
+ * Exported because it is needed before the rest of the configuration exists: the
+ * config file may have to be fetched from the repository, which takes a client,
+ * which takes a token.
+ */
+function githubToken() {
+    return core.getInput('github-token').trim() || process.env.GITHUB_TOKEN || '';
+}
+/** True when the job has checked the repository out and the config file is in it. */
+function workspaceConfigExists() {
+    return fs.existsSync(path.resolve(workspaceRoot(), configFilePath()));
+}
+function parseFileConfig(text, configPath, source) {
     try {
-        const parsed = yaml.load(fs.readFileSync(abs, 'utf8'));
+        const parsed = yaml.load(text);
         if (parsed && typeof parsed === 'object') {
-            core.info(`Loaded config from ${configPath}`);
+            core.info(`Loaded config from ${configPath} (${source}).`);
             return parsed;
         }
     }
@@ -39967,12 +39983,37 @@ function readFileConfig(configPath) {
     return {};
 }
 /**
+ * The config file's contents, from the checkout or from whatever the caller
+ * fetched in its place.
+ *
+ * A file that was never found used to say so at debug level only, which is
+ * invisible in an ordinary run — and the state it was silent about is one a
+ * workflow reaches by following the README: no `actions/checkout` step, because
+ * none is needed to review a diff, and therefore no file on disk to read. Every
+ * setting in it was ignored without a word, which is indistinguishable from the
+ * setting not working. One `exclude` glob ignored that way sent a documentation
+ * change to the model and posted a finding on it.
+ */
+function readFileConfig(configPath, fetched) {
+    if (fetched !== undefined)
+        return parseFileConfig(fetched, configPath, 'fetched from the repository');
+    const abs = path.resolve(workspaceRoot(), configPath);
+    if (!fs.existsSync(abs)) {
+        core.info(`No config file at ${configPath}; using inputs and defaults.`);
+        return {};
+    }
+    return parseFileConfig(fs.readFileSync(abs, 'utf8'), configPath, 'the checkout');
+}
+/**
  * Precedence: action input (when non-empty) > config file > built-in default.
  * Action inputs default to '' in action.yml precisely so this ordering works.
+ *
+ * `fetched` is the config file's text when the caller read it from the repository
+ * rather than from a checkout; omitted, the checkout is read as before.
  */
-function loadConfig() {
-    const configPath = core.getInput('config-path') || '.github/hawky.yml';
-    const file = readFileConfig(configPath);
+function loadConfig(fetched) {
+    const configPath = configFilePath();
+    const file = readFileConfig(configPath, fetched);
     warnUnknownFileKeys(file, configPath);
     const input = (name) => core.getInput(name).trim();
     const pick = (inputName, fileKey) => {
@@ -40015,7 +40056,7 @@ function loadConfig() {
         model: pick('model', 'model') ?? DEFAULT_MODELS[provider],
         baseUrl: pick('base-url', 'base_url'),
         apiKey: core.getInput('api-key', { required: true }),
-        githubToken: input('github-token') || process.env.GITHUB_TOKEN || '',
+        githubToken: githubToken(),
         mode,
         maxComments: num('max-comments', 'max_comments', 15),
         minSeverity: pickSeverity(pick('min-severity', 'min_severity'), 'medium', 'min-severity'),
@@ -40101,13 +40142,59 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.makeOctokit = makeOctokit;
+exports.fetchConfigFile = fetchConfigFile;
 exports.resolveTarget = resolveTarget;
+const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
 function makeOctokit(token) {
     if (!token) {
         throw new Error('No GitHub token available. Pass `github-token` or make sure `${{ github.token }}` is available to the job.');
     }
     return github.getOctokit(token);
+}
+/**
+ * Read the config file out of the repository itself.
+ *
+ * Reviewing a diff needs no checkout — that is the first promise the README makes
+ * — but the config file was only ever read from one, so a workflow that followed
+ * that advice had every setting in its file silently ignored. The file is part of
+ * the repository, and the repository is already being read over the API, so it is
+ * fetched the same way.
+ *
+ * At the head revision, which is what a checkout in the same job would have given
+ * the run: a change to the review policy takes effect on the pull request that
+ * makes it, rather than one merge later.
+ *
+ * Best-effort. A missing file is the ordinary case for a repository that
+ * configures everything from the workflow, and an endpoint or token that refuses
+ * the read costs the file, not the run.
+ */
+async function fetchConfigFile(octokit, owner, repo, path, ref) {
+    try {
+        const { data } = await octokit.rest.repos.getContent({ owner, repo, path, ref });
+        if (Array.isArray(data) || data.type !== 'file') {
+            core.warning(`${path} in this repository is not a file, so no configuration was read from it.`);
+            return undefined;
+        }
+        // Over a megabyte, the API sends metadata and no content. A config file that
+        // large is not a config file, so this is reported rather than worked around.
+        if (data.encoding !== 'base64') {
+            core.warning(`${path} was too large for the API to return; configure this run from action inputs instead.`);
+            return undefined;
+        }
+        return Buffer.from(data.content, 'base64').toString('utf8');
+    }
+    catch (err) {
+        const status = err.status;
+        if (status === 404) {
+            core.debug(`No ${path} in ${owner}/${repo} at ${ref}.`);
+        }
+        else {
+            core.warning(`Could not read ${path} from the repository (${err.message}); ` +
+                'this run uses action inputs and defaults only.');
+        }
+        return undefined;
+    }
 }
 /**
  * Work out what to review from whatever event fired the workflow. Consumers wire
@@ -40245,9 +40332,15 @@ const minimatch_1 = __nccwpck_require__(6507);
  * GitHub rejects an entire review with 422 if any comment anchors to a line
  * that is not part of the diff, so we record exactly which head lines are
  * addressable (added and context lines) and validate against that set later.
+ *
+ * `lines` carries the text of each of those lines, keyed the same way. It is what
+ * lets a later check compare a proposed replacement with the code it would
+ * replace — the same walk already has both, and deriving it a second time
+ * elsewhere would be the same hunk arithmetic written twice.
  */
 function parsePatch(patch) {
     const commentableLines = new Set();
+    const lines = new Map();
     const out = [];
     let headLine = 0;
     for (const raw of patch.split('\n')) {
@@ -40259,6 +40352,7 @@ function parsePatch(patch) {
         }
         if (raw.startsWith('+')) {
             commentableLines.add(headLine);
+            lines.set(headLine, raw.slice(1));
             out.push(`${String(headLine).padStart(5)} +${raw.slice(1)}`);
             headLine++;
         }
@@ -40271,17 +40365,26 @@ function parsePatch(patch) {
         else {
             // Context line: addressable, but we tell the model not to comment on it.
             commentableLines.add(headLine);
+            lines.set(headLine, raw.slice(1));
             out.push(`${String(headLine).padStart(5)}  ${raw.slice(1)}`);
             headLine++;
         }
     }
-    return { commentableLines, annotated: out.join('\n') };
+    return { commentableLines, annotated: out.join('\n'), lines };
 }
-function isExcluded(path, cfg) {
+/**
+ * Why this path is not being reviewed, or null when it is.
+ *
+ * The reason rather than a boolean so the run log can answer the question a
+ * filtered — or an unexpectedly unfiltered — file raises: which glob did this,
+ * and did the configuration carrying it reach the run at all.
+ */
+function skipReason(path, cfg) {
     if (cfg.include.length && !cfg.include.some((g) => (0, minimatch_1.minimatch)(path, g, { dot: true }))) {
-        return true;
+        return 'no include glob matches it';
     }
-    return cfg.exclude.some((g) => (0, minimatch_1.minimatch)(path, g, { dot: true }));
+    const glob = cfg.exclude.find((g) => (0, minimatch_1.minimatch)(path, g, { dot: true }));
+    return glob ? `it matches exclude "${glob}"` : null;
 }
 function toDiffFiles(files, cfg) {
     const kept = [];
@@ -40292,7 +40395,9 @@ function toDiffFiles(files, cfg) {
             omitted.push(f.filename);
             continue;
         }
-        if (isExcluded(f.filename, cfg)) {
+        const skipped = skipReason(f.filename, cfg);
+        if (skipped) {
+            core.debug(`Not reviewing ${f.filename}: ${skipped}.`);
             omitted.push(f.filename);
             continue;
         }
@@ -40448,6 +40553,16 @@ const COMMAND = /^[ \t>]*[@/]hawky[ \t]+(?:ignore|dismiss|false[- ]?positive)\b[
 /** The 16-hex finding id, when the command names one instead of replying in a thread. */
 const EXPLICIT_ID = /^([0-9a-f]{16})\b[ \t:,-]*(.*)$/;
 const NO_REASON = 'no reason given';
+/**
+ * The header line `renderComment` writes, which is where a posted finding's title
+ * survives. Matching our own rendering is the point: a comment without this shape
+ * is not one of ours, whatever else it contains.
+ */
+const FINDING_HEADER = /^\*\*(?:Critical|High|Medium|Low) · [\w-]+\*\* — (.+)$/m;
+function postedTitle(body) {
+    const title = FINDING_HEADER.exec(body ?? '')?.[1]?.trim();
+    return title || null;
+}
 function parseCommand(body) {
     if (!body)
         return null;
@@ -40558,17 +40673,25 @@ async function readThreadState(octokit, owner, repo, pullNumber, issueComments, 
     }));
     const seen = new Set();
     const byComment = new Map();
+    const prior = [];
     for (const c of reviewComments) {
         const fingerprints = (0, fingerprint_js_1.extractFingerprints)(c.body, 'finding');
         if (fingerprints.length)
             byComment.set(c.id, fingerprints);
         for (const fp of fingerprints)
             seen.add(fp);
+        const title = postedTitle(c.body);
+        if (title && c.path && fingerprints.length) {
+            prior.push({ fingerprint: fingerprints[0], path: c.path, title });
+        }
     }
     core.debug(`Found ${seen.size} finding(s) already commented on this PR.`);
     const dismissed = new Map();
+    // Attached at the end of each branch below, so a prior finding always carries
+    // whatever verdict this run's dismissal mode allows it to have.
+    const withDispositions = () => prior.map((p) => ({ ...p, dismissal: dismissed.get(p.fingerprint) }));
     if (mode === 'off')
-        return { seen, dismissed };
+        return { seen, dismissed, prior: withDispositions() };
     const record = (fingerprints, dismissal) => {
         for (const fp of fingerprints)
             if (!dismissed.has(fp))
@@ -40631,7 +40754,7 @@ async function readThreadState(octokit, owner, repo, pullNumber, issueComments, 
     }
     if (dismissed.size)
         core.info(`${dismissed.size} finding(s) waived by a reviewer.`);
-    return { seen, dismissed };
+    return { seen, dismissed, prior: withDispositions() };
 }
 
 
@@ -40845,11 +40968,13 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.resolveAnchor = resolveAnchor;
+exports.readReviewContext = readReviewContext;
 exports.postReview = postReview;
 const core = __importStar(__nccwpck_require__(7484));
 const package_json_1 = __importDefault(__nccwpck_require__(8330));
 const types_js_1 = __nccwpck_require__(8522);
 const finding_js_1 = __nccwpck_require__(1649);
+const diff_js_1 = __nccwpck_require__(164);
 const fingerprint_js_1 = __nccwpck_require__(7284);
 const dismissals_js_1 = __nccwpck_require__(3069);
 const SEVERITY_LABEL = {
@@ -40860,6 +40985,18 @@ const SEVERITY_LABEL = {
 };
 /** A multi-line anchor spanning more than this is almost always a mis-anchor. */
 const MAX_ANCHOR_SPAN = 20;
+/**
+ * Past this many files, one pass over the diff is a sample of its defects rather
+ * than a list of them.
+ *
+ * Measured rather than assumed: on one large pull request the review converged
+ * over twelve runs, each posting between one and five findings that were mostly
+ * new rather than repeats — several of them on code earlier runs had read and said
+ * nothing about. Nothing was being truncated and the batches did not change. That
+ * is what sampling a model once per batch does, and the cost of not saying so is
+ * that a first-run pass and a twelfth-run pass read identically.
+ */
+const SAMPLED_FROM_FILES = 10;
 /** Where Hawky's own bugs are filed. Public, unlike many repositories it reviews. */
 const HAWKY_REPO = 'KeunwooPark/hawky';
 function severityAtLeast(value, floor) {
@@ -40927,6 +41064,35 @@ function resolveAnchor(finding, file) {
             return { line: start };
     }
     return { line: end, startLine: start };
+}
+/**
+ * The finding as it will be published, with a suggestion that cannot change the
+ * lines it replaces taken off it.
+ *
+ * Judged here because this is where both halves are in hand: the anchor has just
+ * been resolved, and the file's patch carries the text of the lines it points at.
+ * The finding itself is published either way — what the screen withholds is the
+ * one-click answer, not the argument.
+ */
+function withoutNoOpSuggestion(finding, file, anchor) {
+    if (!finding.suggestion?.trim())
+        return finding;
+    const { lines } = (0, diff_js_1.parsePatch)(file.patch);
+    const anchored = [];
+    for (let line = anchor.startLine ?? anchor.line; line <= anchor.line; line++) {
+        const text = lines.get(line);
+        // The patch does not render this line, so there is nothing to compare the
+        // replacement against and nothing is claimed about it.
+        if (text === undefined)
+            return finding;
+        anchored.push(text);
+    }
+    const reason = (0, finding_js_1.screenSuggestion)(finding.suggestion, anchored);
+    if (!reason)
+        return finding;
+    core.warning(`Withheld the suggestion on ${finding.path}:${finding.line}: ${reason}. ` +
+        'The finding itself is posted as written.');
+    return { ...finding, suggestion: null };
 }
 function renderComment(finding) {
     const parts = [
@@ -41057,13 +41223,10 @@ function renderModelSummary(summary, cfg) {
     }
     return lines;
 }
-function renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, 
-/** How many of `dropped` went because their line was not in the diff at all. */
-misanchored, 
-/** How many of `dropped` went because the model wrote nothing in them. */
-textless, 
-/** How many of `dropped` went because their text could not describe the diff. */
-degenerate, highest, incomplete) {
+function renderSummary(summary, posted, unanchored, dismissed, cfg, counts, highest, incomplete, 
+/** True when the diff is large enough that one pass is a sample of it. */
+sampled) {
+    const { dropped, misanchored, textless, degenerate, duplicates } = counts;
     const lines = [
         fingerprint_js_1.SUMMARY_MARKER,
         '## Hawky review',
@@ -41071,6 +41234,13 @@ degenerate, highest, incomplete) {
         renderVerdict(highest, cfg, incomplete, dismissed, dropped),
         '',
     ];
+    // Only where it changes what the verdict means. A run that found something is
+    // already telling the author to push again, and the next push re-reviews.
+    if (sampled && highest === null) {
+        lines.push('_Reviewed in one pass. On a diff this size a single pass samples the defects rather than enumerating ' +
+            'them, and a later run over the same code may still find something — so this is "nothing found this ' +
+            'time" rather than an all-clear._', '');
+    }
     if (posted.length) {
         const counts = new Map();
         for (const f of posted)
@@ -41097,13 +41267,19 @@ degenerate, highest, incomplete) {
     }
     if (dismissed.length) {
         lines.push(`<details><summary>${dismissed.length} finding${dismissed.length === 1 ? '' : 's'} waived by a reviewer</summary>`, '');
-        for (const { finding: f, dismissal: d } of dismissed) {
+        for (const { finding: f, dismissal: d, rewordingOf } of dismissed) {
             const how = d.via === 'resolved' ? 'resolved the thread' : 'waived it';
             lines.push(`- **${f.path}:${f.line}** — ${SEVERITY_LABEL[f.severity]} · ${f.title}` +
-                ` — @${d.by} ${how}: ${d.reason}`);
+                ` — @${d.by} ${how}: ${d.reason}` +
+                // Said outright rather than folded in silently: this one was not waived
+                // on its own thread, and a reader has to be able to disagree with the match.
+                (rewordingOf ? `\n  <sub>Held back as a rewording of a finding waived here: “${rewordingOf}”.</sub>` : ''));
         }
         lines.push('', 'These do not gate the merge. Reverse one by deleting the comment that waived it ' +
-            '(or unresolving its thread) and re-running this check.', '', '</details>', '');
+            '(or unresolving its thread) and re-running this check.' +
+            (dismissed.some((d) => d.rewordingOf)
+                ? ' One held back as a rewording is reversed the same way, by the waiver it was matched to.'
+                : ''), '', '</details>', '');
     }
     if (dropped) {
         // Named apart from the rest: these went as unreliable or as empty, which is
@@ -41112,6 +41288,7 @@ degenerate, highest, incomplete) {
             misanchored ? `${misanchored} that did not anchor to a changed line` : '',
             textless ? `${textless} the model left empty` : '',
             degenerate ? `${degenerate} whose text could not describe this diff` : '',
+            duplicates ? `${duplicates} the model reported twice in one run` : '',
         ].filter(Boolean);
         const list = named.length <= 2
             ? named.join(' and ')
@@ -41150,14 +41327,32 @@ async function upsertSummary(octokit, owner, repo, issue_number, comments, body)
         core.info('Posted summary comment.');
     }
 }
+/**
+ * Read the conversation so far.
+ *
+ * Split out of the posting step because it is needed at both ends of a run: the
+ * prompt has to be told what has already been decided here, which happens before
+ * the model is called, and the same answer decides what gets posted afterwards.
+ * Reading it twice would mean two rounds of API calls and two copies of every
+ * warning about a malformed waiver.
+ */
+async function readReviewContext(octokit, owner, repo, pull_number, cfg) {
+    // Nothing is posted on a rehearsal, so there is nothing to deduplicate against.
+    if (cfg.dryRun) {
+        return { issueComments: [], state: { seen: new Set(), dismissed: new Map(), prior: [] } };
+    }
+    const issueComments = await listIssueComments(octokit, owner, repo, pull_number);
+    const state = await (0, dismissals_js_1.readThreadState)(octokit, owner, repo, pull_number, issueComments, cfg.dismissals);
+    return { issueComments, state };
+}
 async function postReview(octokit, owner, repo, pull_number, commit_id, summary, findings, files, cfg, 
 /** Some of the diff could not be reviewed and the run is configured to fail on that. */
-incomplete = false) {
+incomplete = false, 
+/** The conversation as the run already read it; read here when not supplied. */
+context) {
     const byPath = new Map(files.map((f) => [f.path, f]));
-    const issueComments = cfg.dryRun ? [] : await listIssueComments(octokit, owner, repo, pull_number);
-    const { seen: alreadyPosted, dismissed: waived } = cfg.dryRun
-        ? { seen: new Set(), dismissed: new Map() }
-        : await (0, dismissals_js_1.readThreadState)(octokit, owner, repo, pull_number, issueComments, cfg.dismissals);
+    const { issueComments, state } = context ?? (await readReviewContext(octokit, owner, repo, pull_number, cfg));
+    const { seen: alreadyPosted, dismissed: waived, prior } = state;
     const before = findings.length;
     // Judged before anything else looks at these: a finding with no text cannot be
     // read, cannot be acted on, and cannot honestly be waived, so it must not reach
@@ -41196,16 +41391,61 @@ incomplete = false) {
         .filter((f) => severityAtLeast(f.severity, cfg.minSeverity))
         .filter((f) => (f.confidence ?? 0) >= cfg.minConfidence)
         .sort((a, b) => types_js_1.SEVERITY_ORDER[b.severity] - types_js_1.SEVERITY_ORDER[a.severity] || (b.confidence ?? 0) - (a.confidence ?? 0));
+    // A run can report the same finding twice. Batching is per-request, so one
+    // file's lines can be read in two calls — a file split across a batch boundary,
+    // or a name that two batches both have reason to comment on — and each call
+    // answers on its own. Both copies carried the same fingerprint, the same hidden
+    // marker, and the same severity, and both were posted a few lines apart, because
+    // the only duplicate check there was compared this run against the *pull
+    // request* rather than against itself.
+    //
+    // Same key as that cross-run check, so the two agree by construction: same path,
+    // same category, same title is the same finding. The first copy is kept — the
+    // list is already sorted by severity and then confidence, so it is the strongest
+    // statement of the claim.
+    const unique = [];
+    const saidThisRun = new Set();
+    for (const f of qualified) {
+        const fingerprint = (0, fingerprint_js_1.findingFingerprint)(f.path, f.category, f.title);
+        if (saidThisRun.has(fingerprint)) {
+            core.info(`Suppressed a second copy of ${f.path}:${f.line} ${fingerprint}: this run already reported it.`);
+            continue;
+        }
+        saidThisRun.add(fingerprint);
+        unique.push(f);
+    }
+    const duplicates = qualified.length - unique.length;
     // A waived finding leaves the run entirely: it does not gate, and it is not
     // reposted either, so re-reviewing does not resurrect the argument.
+    //
+    // Recognised by fingerprint first and by wording second. The fingerprint is keyed
+    // on the title, and the title is model prose written afresh on every run, so the
+    // exact match alone let a rejected claim return under a new id as often as the
+    // model cared to rephrase itself: one claim came back seven times on a single
+    // pull request, gating the merge each time. The wording match is confined to
+    // findings waived on the same file, and what it catches is reported as a match
+    // rather than quietly swallowed.
+    const waivedHere = prior.filter((p) => p.dismissal);
+    const waiverFor = (f) => {
+        const exact = waived.get((0, fingerprint_js_1.findingFingerprint)(f.path, f.category, f.title));
+        if (exact)
+            return { dismissal: exact };
+        const near = waivedHere.find((p) => p.path === f.path && (0, fingerprint_js_1.sameClaim)(p.title, f.title));
+        return near?.dismissal ? { dismissal: near.dismissal, rewordingOf: near.title } : null;
+    };
     const dismissed = [];
     const active = [];
-    for (const f of qualified) {
-        const d = waived.get((0, fingerprint_js_1.findingFingerprint)(f.path, f.category, f.title));
-        if (d)
-            dismissed.push({ finding: f, dismissal: d });
-        else
+    for (const f of unique) {
+        const waiver = waiverFor(f);
+        if (!waiver) {
             active.push(f);
+            continue;
+        }
+        if (waiver.rewordingOf) {
+            core.info(`Held back ${f.severity} ${f.path}:${f.line} — ${f.title}: it restates a finding ` +
+                `@${waiver.dismissal.by} already waived on this file.`);
+        }
+        dismissed.push({ finding: f, dismissal: waiver.dismissal, rewordingOf: waiver.rewordingOf });
     }
     // A finding whose line is nowhere in the diff is the strongest evidence there is
     // that the model misread its partial view of the file and invented the location.
@@ -41230,12 +41470,14 @@ incomplete = false) {
     const unanchored = [];
     const comments = [];
     for (const finding of kept) {
+        const file = byPath.get(finding.path);
         // Cannot be null: everything in `kept` came through the anchorable filter above.
-        const anchor = resolveAnchor(finding, byPath.get(finding.path));
-        posted.push(finding);
+        const anchor = resolveAnchor(finding, file);
+        const published = withoutNoOpSuggestion(finding, file, anchor);
+        posted.push(published);
         comments.push({
-            path: finding.path,
-            body: renderComment(finding),
+            path: published.path,
+            body: renderComment(published),
             side: 'RIGHT',
             line: anchor.line,
             ...(anchor.startLine ? { start_line: anchor.startLine, start_side: 'RIGHT' } : {}),
@@ -41249,7 +41491,9 @@ incomplete = false) {
     // comment and whether or not an earlier run already commented on it: an
     // unresolved critical finding is still critical on the second push.
     const highestSeverity = anchorable.reduce((acc, f) => (acc === null || types_js_1.SEVERITY_ORDER[f.severity] > types_js_1.SEVERITY_ORDER[acc] ? f.severity : acc), null);
-    const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, dropped, misanchored, textless, degenerate, highestSeverity, incomplete);
+    const counts = { dropped, misanchored, textless, degenerate, duplicates };
+    const sampled = files.length >= SAMPLED_FROM_FILES;
+    const summaryBody = renderSummary(summary, posted, unanchored, dismissed, cfg, counts, highestSeverity, incomplete, sampled);
     if (cfg.dryRun) {
         core.info('[dry-run] Would post the following review:');
         core.info(summaryBody);
@@ -41276,7 +41520,7 @@ incomplete = false) {
             core.warning(`Could not post inline comments (${err.message}). Including them in the summary instead.`);
             unanchored.push(...posted);
             posted.length = 0;
-            await upsertSummary(octokit, owner, repo, pull_number, issueComments, renderSummary(summary, [], unanchored, dismissed, cfg, dropped, misanchored, textless, degenerate, highestSeverity, incomplete));
+            await upsertSummary(octokit, owner, repo, pull_number, issueComments, renderSummary(summary, [], unanchored, dismissed, cfg, counts, highestSeverity, incomplete, sampled));
             return { posted, unanchored, dismissed, highestSeverity };
         }
     }
@@ -42751,9 +42995,16 @@ async function run() {
         setVerdict(true, null);
         return;
     }
-    const cfg = (0, config_js_1.loadConfig)();
-    const octokit = (0, client_js_1.makeOctokit)(cfg.githubToken);
+    // The client and the target come first because the configuration may have to be
+    // fetched with them: a job with no `actions/checkout` — which is how the README
+    // says to run this — has no config file on disk, and everything in it used to be
+    // dropped in silence.
+    const octokit = (0, client_js_1.makeOctokit)((0, config_js_1.githubToken)());
     const target = await (0, client_js_1.resolveTarget)(octokit);
+    const configPath = (0, config_js_1.configFilePath)();
+    const cfg = (0, config_js_1.loadConfig)((0, config_js_1.workspaceConfigExists)()
+        ? undefined
+        : await (0, client_js_1.fetchConfigFile)(octokit, target.owner, target.repo, configPath, target.headSha));
     core.info(`Hawky: mode=${cfg.mode} provider=${cfg.provider} model=${cfg.model}` +
         (target.pullNumber ? ` pr=#${target.pullNumber}` : ` commit=${target.headSha.slice(0, 7)}`));
     const { files, omitted } = target.pullNumber
@@ -42777,6 +43028,20 @@ async function run() {
         (0, symbols_js_1.warnNoCheckout)();
     else if (repoIndex)
         core.info((0, symbols_js_1.describeIndex)(repoIndex));
+    // Read before the model is called rather than after it. What this pull request
+    // has already decided — which findings were waived, and which are still open —
+    // belongs in the prompt: a waiver is recognised by a finding's title, so a claim
+    // reworded on the next run arrives as a new finding and costs the same argument
+    // again. Asking the reviewer not to re-file is the half of that a check after the
+    // fact cannot do. The same read serves the posting step at the end of the run.
+    const reviewContext = cfg.mode !== 'refactor' && target.pullNumber
+        ? await (0, review_js_1.readReviewContext)(octokit, target.owner, target.repo, target.pullNumber, cfg)
+        : null;
+    const decided = reviewContext?.state.prior ?? [];
+    if (decided.length) {
+        const waived = decided.filter((d) => d.dismissal).length;
+        core.info(`${decided.length} finding(s) already reported on this pull request (${waived} waived).`);
+    }
     const provider = (0, index_js_1.makeProvider)(cfg);
     const system = (0, prompts_js_1.buildSystemPrompt)(cfg, cfg.mode);
     const batches = (0, diff_js_1.batchFiles)(files, cfg.maxCharsPerBatch);
@@ -42796,7 +43061,7 @@ async function run() {
             }
             const { data, usage } = await provider.complete({
                 system,
-                user: (0, prompts_js_1.buildUserPrompt)(target, batch, index, batches.length, omitted, priors),
+                user: (0, prompts_js_1.buildUserPrompt)(target, batch, index, batches.length, omitted, priors, decided),
                 schema: schema_js_1.REVIEW_SCHEMA,
                 schemaName: 'code_review',
                 // The system prompt is identical for every batch, so cache it once.
@@ -42863,15 +43128,16 @@ async function run() {
     // A run that only reviewed part of the diff cannot honestly report a pass.
     const incomplete = failedBatches > 0 && cfg.failOnIncomplete;
     if (cfg.mode !== 'refactor' && target.pullNumber) {
-        const result = await (0, review_js_1.postReview)(octokit, target.owner, target.repo, target.pullNumber, target.headSha, summary, findings, files, cfg, incomplete);
+        const result = await (0, review_js_1.postReview)(octokit, target.owner, target.repo, target.pullNumber, target.headSha, summary, findings, files, cfg, incomplete, reviewContext ?? undefined);
         findingsPosted = result.posted.length + result.unanchored.length;
         dismissedCount = result.dismissed.length;
         highest = result.highestSeverity;
-        for (const { finding, dismissal } of result.dismissed) {
+        for (const { finding, dismissal, rewordingOf } of result.dismissed) {
             // In the log as well as on the pull request: a check that went green on a
             // waiver should be answerable from the run alone.
             core.info(`Waived by @${dismissal.by} (${dismissal.via}): ${finding.severity} ${finding.path}:${finding.line} ` +
-                `— ${finding.title} — ${dismissal.reason}`);
+                `— ${finding.title} — ${dismissal.reason}` +
+                (rewordingOf ? ` (matched by wording to "${rewordingOf}")` : ''));
         }
     }
     else if (cfg.mode !== 'refactor') {
@@ -42985,7 +43251,7 @@ function buildSystemPrompt(cfg, mode) {
             `  that exposes nothing structural.`,
         ]));
     if (wantsFindings) {
-        parts.push(`- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`, `  keeping the surrounding indentation, so it can be applied directly.`);
+        parts.push(`- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`, `  keeping the surrounding indentation, so it can be applied directly.`, `- A suggestion whose effect is to leave those lines as they are is not a suggestion. Do not restate the`, `  original, and do not write a description of the change there — it is committed verbatim, so prose in`, `  that field goes into the file. Where you cannot write the replacement, \`suggestion\` is \`null\`; that`, `  is the correct answer, not a shortcoming.`);
         // The floor the run actually filters on. Left unsaid, the model spends output on
         // findings that are discarded before anyone reads them.
         if (cfg.minSeverity !== 'low') {
@@ -43021,11 +43287,26 @@ const MAX_OMITTED_LISTED = 20;
  */
 const MAX_PRIORS_LISTED = 20;
 const MAX_PRIOR_CHARS = 4_000;
+/**
+ * Caps on the record of what has already been decided here. A long-lived pull
+ * request accumulates these, and the diff is what the batch is for.
+ */
+const MAX_DECIDED_LISTED = 20;
+const MAX_DECIDED_CHARS = 3_000;
+/** A waiver's reason, cut to what fits a list entry. */
+const MAX_REASON_CHARS = 160;
+/** One line, with any shape the rendered comment had flattened out of it. */
+function oneLine(text, max) {
+    const flat = text.replace(/\s+/g, ' ').trim();
+    return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
 function buildUserPrompt(target, files, batchIndex, batchCount, 
 /** Paths this change touched that are not in `files`; see `Diff.omitted`. */
 omitted, 
 /** What this batch defines that the repository already defines elsewhere. */
-priors = []) {
+priors = [], 
+/** Findings earlier runs left on this pull request, and what became of them. */
+decided = []) {
     const header = [
         `# Pull request`,
         ``,
@@ -43057,6 +43338,31 @@ priors = []) {
         }
         if (listed < priors.length)
             header.push(`- ... and ${priors.length - listed} more`);
+        header.push(``);
+    }
+    // Waived first: they are the ones re-filing costs a reviewer something, and the
+    // ones the cap should not drop. This is text from comments on this pull request
+    // — the same provenance as its title and description above.
+    const waived = decided.filter((d) => d.dismissal);
+    const open = decided.filter((d) => !d.dismissal);
+    if (waived.length || open.length) {
+        header.push(`# Already reported on this pull request`, ``, `Earlier runs left the findings below here. A waived one was read by somebody who can merge this and`, `rejected: do not report it again — not in other words, not under a different category, and not at a`, `higher severity. Rewording is the thing to avoid deliberately, because a waiver is recognised by the`, `title: the same claim in new words arrives as a new finding and costs the reviewer the same argument`, `a second time. An open one is already on the pull request and does not need saying again. If the same`, `code is wrong for a reason nobody has answered yet, report that reason and say what is new about it.`, ``);
+        let used = 0;
+        let listed = 0;
+        for (const entry of [...waived, ...open]) {
+            const line = entry.dismissal
+                ? `- waived by @${entry.dismissal.by} (${oneLine(entry.dismissal.reason, MAX_REASON_CHARS)}) — ` +
+                    `${entry.path}: ${oneLine(entry.title, 200)}`
+                : `- open — ${entry.path}: ${oneLine(entry.title, 200)}`;
+            if (listed >= MAX_DECIDED_LISTED || used + line.length + 1 > MAX_DECIDED_CHARS)
+                break;
+            header.push(line);
+            used += line.length + 1;
+            listed++;
+        }
+        if (listed < waived.length + open.length) {
+            header.push(`- ... and ${waived.length + open.length - listed} more`);
+        }
         header.push(``);
     }
     header.push(`# Changed files`, ``);
@@ -43479,11 +43785,23 @@ exports.SEVERITY_ORDER = {
  * of itself, and where it names code in backticks, at least some of that code is
  * in the file it is pointing at.
  *
- * Only the title is screened. It is where the reported damage was, it is what
- * the fingerprint is keyed on, and it is the one line a reader sees in the
- * collapsed view. A body legitimately names things outside the diff — a standard
- * library call, a type from another module, a replacement being proposed — so
- * the same rules there would fire on well-formed findings.
+ * The identifier rules read the title only. It is where the reported damage was,
+ * it is what the fingerprint is keyed on, and it is the one line a reader sees in
+ * the collapsed view. A body legitimately names things outside the diff — a
+ * standard library call, a type from another module, a replacement being
+ * proposed — so the same rules there would fire on well-formed findings.
+ *
+ * One rule does read the body, because one failure only ever appears there: a
+ * finding that argues itself out of existence and says so. Reported bodies
+ * claimed a value could be null, worked through the guard that prevents it, and
+ * ended `Drop this finding`; another concluded that the comparison it was
+ * objecting to is correct, and ended the same way. The title of each was
+ * plausible and well anchored, so nothing above catches them, and at a blocking
+ * severity that text fails a merge on a defect its own author had retracted.
+ *
+ * That check matches a withdrawal, not an argument. Whether a body's reasoning is
+ * sound is exactly the judgement this module refuses to make; whether it ends by
+ * telling the reader to drop the finding is a property of the text.
  *
  * The reasons returned below are assembled from the rule that fired and never
  * quote the text they rejected, for the reason the summary module does not: a
@@ -43492,6 +43810,7 @@ exports.SEVERITY_ORDER = {
  */
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.screenFinding = screenFinding;
+exports.screenSuggestion = screenSuggestion;
 /** Code the model named explicitly. Two characters is the shortest worth matching. */
 const BACKTICKED = /`([^`\n]{2,})`/g;
 /**
@@ -43570,6 +43889,34 @@ function namesNothingInTheFile(title, patch) {
     return !ids.some((id) => patch.includes(id));
 }
 /**
+ * A short withdrawal of the finding the text is inside — `drop this finding`,
+ * `discard this report`, and the handful of verbs that mean the same.
+ *
+ * Deliberately this narrow. A body that merely sounds hesitant is still a finding
+ * a reader can weigh, and prose is full of ways to express doubt; the sentence
+ * this matches is not doubt but a verdict, and it is the model's own.
+ */
+const RETRACTION = /\b(?:drop|discard|disregard|withdraw|retract|remove|ignore)\s+(?:this|the|that)\s+(?:finding|report)\b/gi;
+/**
+ * What turns a withdrawal into its opposite, looked for immediately before it.
+ *
+ * "Do not drop this finding even though the caller looks safe" is an instruction
+ * to keep it. Without this the phrase inside would withhold the finding that says
+ * it most emphatically.
+ */
+const NEGATED = /\b(?:not|never|n't|cannot|without|avoid|rather than|instead of)\s*$/i;
+/** How much text before a match to read for a negation. Long enough for "should not". */
+const NEGATION_WINDOW = 24;
+/** True when the body tells the reader to drop the finding it belongs to. */
+function withdrawsItself(body) {
+    for (const match of body.matchAll(RETRACTION)) {
+        const at = match.index ?? 0;
+        if (!NEGATED.test(body.slice(Math.max(0, at - NEGATION_WINDOW), at)))
+            return true;
+    }
+    return false;
+}
+/**
  * Why this finding should not be published, or null when it should.
  *
  * Phrased to follow "Discarded …: ", and never quoting the finding.
@@ -43579,11 +43926,86 @@ function screenFinding(finding, patch) {
     // An empty finding is dropped before this, by the check that reads both fields.
     if (!title)
         return null;
+    // First: it is the model's own answer about its own finding, and it settles the
+    // question the other two rules can only infer at.
+    if (withdrawsItself(finding.body)) {
+        return 'its own body withdraws the finding, so the analysis it reports did not end in a defect';
+    }
     if (assertsRelationToItself(title)) {
         return 'its title asserts that something is a duplicate of itself, which cannot be true of any diff';
     }
     if (namesNothingInTheFile(title, patch)) {
         return 'every identifier its title names is absent from the file it points at';
+    }
+    return null;
+}
+/**
+ * A suggestion that is not replacement source but a note where one should have
+ * been. The schema already has a way to say there is no suggestion — `null` — so
+ * these are what a model writes when it wants to say so in words instead.
+ */
+const PLACEHOLDER = /^(?:n\/?a|none|nil|null|todo|tbd|no suggestion(?: needed)?)[.!]?$/i;
+/**
+ * A rendered arrow, which turns a replacement into a description of one.
+ *
+ * Reported on a one-line manifest change: a suggestion reading `<field> → <field>`
+ * with the same text on both sides. Committed as written it would have replaced a
+ * valid line with prose about it. Whatever stands either side of one of these, a
+ * line carrying it is not the text to put in the file. `->` and `=>` are operators
+ * in ordinary languages and are deliberately not matched; these two are not.
+ */
+const DESCRIBED = /[→⇒]/;
+/**
+ * Strip a block down to what applying it would actually change: trailing
+ * whitespace gone, surrounding blank lines gone, and the indentation the whole
+ * block shares removed, since a model quoting code out of a file routinely loses
+ * or gains a level of it uniformly.
+ *
+ * The cost of that last one is a genuine whole-block re-indentation — real in
+ * Python — no longer being offered as a one-click fix. The finding still says it
+ * in words, which is the right trade for a check whose other outcome is a button
+ * that edits nothing.
+ */
+function outdent(lines) {
+    const trimmed = lines.map((line) => line.replace(/\s+$/, ''));
+    while (trimmed.length && !trimmed[0])
+        trimmed.shift();
+    while (trimmed.length && !trimmed[trimmed.length - 1])
+        trimmed.pop();
+    const indents = trimmed.filter(Boolean).map((line) => line.length - line.trimStart().length);
+    const common = indents.length ? Math.min(...indents) : 0;
+    return trimmed.map((line) => line.slice(common));
+}
+/**
+ * Why this suggestion should not be offered, or null when it should.
+ *
+ * GitHub renders a suggestion with a **Commit suggestion** button, which makes it
+ * the cheapest way out of a finding. A replacement that cannot change the lines it
+ * replaces turns that into one click that edits nothing and closes the thread —
+ * and since identity is keyed on the title, the finding is not raised again
+ * afterwards. One reported case was a correct security finding whose patch
+ * resolved to the original: applying it would have left the hole and settled the
+ * argument.
+ *
+ * Only the suggestion is judged here, never the finding carrying it. In every
+ * reported case the body was worth reading and one of them was worth acting on;
+ * what was wrong was the one-click answer offered alongside it.
+ *
+ * Phrased to follow "Withheld the suggestion …: ", and never quoting it.
+ */
+function screenSuggestion(suggestion, anchored) {
+    const text = suggestion.replace(/\s+$/, '');
+    // Nothing to publish; the renderer already leaves an empty suggestion out.
+    if (!text.trim())
+        return null;
+    if (PLACEHOLDER.test(text.trim()))
+        return 'it is a placeholder rather than replacement source';
+    if (DESCRIBED.test(text))
+        return 'it describes a replacement rather than being one';
+    const proposed = outdent(text.split('\n'));
+    const current = outdent(anchored);
+    if (proposed.length === current.length && proposed.every((line, i) => line === current[i])) {
+        return 'applying it would leave the anchored lines exactly as they are';
     }
     return null;
 }
@@ -43599,6 +44021,7 @@ function screenFinding(finding, patch) {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.SUMMARY_MARKER = void 0;
 exports.findingFingerprint = findingFingerprint;
+exports.sameClaim = sameClaim;
 exports.refactorFingerprint = refactorFingerprint;
 exports.marker = marker;
 exports.extractFingerprints = extractFingerprints;
@@ -43619,6 +44042,49 @@ function hash(parts) {
  */
 function findingFingerprint(path, category, title) {
     return hash([path, category, normalize(title)]);
+}
+/**
+ * Words too common in a review title to say anything about which claim it is.
+ * Dropped before two titles are compared, so the comparison is about the nouns
+ * and verbs that carry the finding rather than about English.
+ */
+const COMMON = new Set([
+    'the', 'this', 'that', 'these', 'those', 'and', 'but', 'not', 'for', 'from', 'with', 'without', 'into',
+    'onto', 'over', 'under', 'via', 'when', 'while', 'where', 'then', 'than', 'because', 'its', 'are', 'was',
+    'were', 'been', 'being', 'has', 'have', 'had', 'can', 'could', 'should', 'would', 'may', 'might', 'will',
+    'does', 'did', 'done', 'each', 'other', 'same', 'only', 'still', 'also', 'any', 'all', 'here', 'there',
+]);
+/** Below this many significant words, a title is too thin to judge by its wording. */
+const MIN_CLAIM_WORDS = 4;
+/** How much of two titles' vocabulary must coincide before they are one claim. */
+const SAME_CLAIM_RATIO = 0.6;
+function claimWords(title) {
+    return new Set(normalize(title).split(' ').filter((word) => word.length > 2 && !COMMON.has(word)));
+}
+/**
+ * True when two titles are the same claim written twice.
+ *
+ * The fingerprint is keyed on the title, and the title is free model prose
+ * regenerated from scratch on every run — the one field guaranteed not to be
+ * stable. So a waiver could be voided by the model rephrasing itself: one claim
+ * came back seven times under seven wordings, each arriving as a new finding that
+ * gated the merge again and cost the same argument again.
+ *
+ * Deliberately blunt: shared vocabulary, ignoring word order and the words every
+ * review title contains. It recognises a claim reworded, which is what the reports
+ * show; it does not recognise one restated in synonyms, and it is not meant to.
+ * The threshold is set where a false match costs the least — this only ever
+ * compares against findings a maintainer has already waived on the same file, the
+ * match is reported in the summary as a match rather than silently swallowed, and
+ * the remedy for a wrong one is the remedy for any wrong waiver.
+ */
+function sameClaim(a, b) {
+    const left = claimWords(a);
+    const right = claimWords(b);
+    if (left.size < MIN_CLAIM_WORDS || right.size < MIN_CLAIM_WORDS)
+        return false;
+    const shared = [...left].filter((word) => right.has(word)).length;
+    return shared / (left.size + right.size - shared) >= SAME_CLAIM_RATIO;
 }
 function refactorFingerprint(title, files) {
     return hash([normalize(title), [...files].sort().join(',')]);

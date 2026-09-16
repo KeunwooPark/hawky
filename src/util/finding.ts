@@ -19,11 +19,23 @@
  * of itself, and where it names code in backticks, at least some of that code is
  * in the file it is pointing at.
  *
- * Only the title is screened. It is where the reported damage was, it is what
- * the fingerprint is keyed on, and it is the one line a reader sees in the
- * collapsed view. A body legitimately names things outside the diff — a standard
- * library call, a type from another module, a replacement being proposed — so
- * the same rules there would fire on well-formed findings.
+ * The identifier rules read the title only. It is where the reported damage was,
+ * it is what the fingerprint is keyed on, and it is the one line a reader sees in
+ * the collapsed view. A body legitimately names things outside the diff — a
+ * standard library call, a type from another module, a replacement being
+ * proposed — so the same rules there would fire on well-formed findings.
+ *
+ * One rule does read the body, because one failure only ever appears there: a
+ * finding that argues itself out of existence and says so. Reported bodies
+ * claimed a value could be null, worked through the guard that prevents it, and
+ * ended `Drop this finding`; another concluded that the comparison it was
+ * objecting to is correct, and ended the same way. The title of each was
+ * plausible and well anchored, so nothing above catches them, and at a blocking
+ * severity that text fails a merge on a defect its own author had retracted.
+ *
+ * That check matches a withdrawal, not an argument. Whether a body's reasoning is
+ * sound is exactly the judgement this module refuses to make; whether it ends by
+ * telling the reader to drop the finding is a property of the text.
  *
  * The reasons returned below are assembled from the rule that fired and never
  * quote the text they rejected, for the reason the summary module does not: a
@@ -113,6 +125,37 @@ function namesNothingInTheFile(title: string, patch: string): boolean {
 }
 
 /**
+ * A short withdrawal of the finding the text is inside — `drop this finding`,
+ * `discard this report`, and the handful of verbs that mean the same.
+ *
+ * Deliberately this narrow. A body that merely sounds hesitant is still a finding
+ * a reader can weigh, and prose is full of ways to express doubt; the sentence
+ * this matches is not doubt but a verdict, and it is the model's own.
+ */
+const RETRACTION = /\b(?:drop|discard|disregard|withdraw|retract|remove|ignore)\s+(?:this|the|that)\s+(?:finding|report)\b/gi;
+
+/**
+ * What turns a withdrawal into its opposite, looked for immediately before it.
+ *
+ * "Do not drop this finding even though the caller looks safe" is an instruction
+ * to keep it. Without this the phrase inside would withhold the finding that says
+ * it most emphatically.
+ */
+const NEGATED = /\b(?:not|never|n't|cannot|without|avoid|rather than|instead of)\s*$/i;
+
+/** How much text before a match to read for a negation. Long enough for "should not". */
+const NEGATION_WINDOW = 24;
+
+/** True when the body tells the reader to drop the finding it belongs to. */
+function withdrawsItself(body: string): boolean {
+  for (const match of body.matchAll(RETRACTION)) {
+    const at = match.index ?? 0;
+    if (!NEGATED.test(body.slice(Math.max(0, at - NEGATION_WINDOW), at))) return true;
+  }
+  return false;
+}
+
+/**
  * Why this finding should not be published, or null when it should.
  *
  * Phrased to follow "Discarded …: ", and never quoting the finding.
@@ -122,11 +165,87 @@ export function screenFinding(finding: Finding, patch: string): string | null {
   // An empty finding is dropped before this, by the check that reads both fields.
   if (!title) return null;
 
+  // First: it is the model's own answer about its own finding, and it settles the
+  // question the other two rules can only infer at.
+  if (withdrawsItself(finding.body)) {
+    return 'its own body withdraws the finding, so the analysis it reports did not end in a defect';
+  }
   if (assertsRelationToItself(title)) {
     return 'its title asserts that something is a duplicate of itself, which cannot be true of any diff';
   }
   if (namesNothingInTheFile(title, patch)) {
     return 'every identifier its title names is absent from the file it points at';
+  }
+  return null;
+}
+
+/**
+ * A suggestion that is not replacement source but a note where one should have
+ * been. The schema already has a way to say there is no suggestion — `null` — so
+ * these are what a model writes when it wants to say so in words instead.
+ */
+const PLACEHOLDER = /^(?:n\/?a|none|nil|null|todo|tbd|no suggestion(?: needed)?)[.!]?$/i;
+
+/**
+ * A rendered arrow, which turns a replacement into a description of one.
+ *
+ * Reported on a one-line manifest change: a suggestion reading `<field> → <field>`
+ * with the same text on both sides. Committed as written it would have replaced a
+ * valid line with prose about it. Whatever stands either side of one of these, a
+ * line carrying it is not the text to put in the file. `->` and `=>` are operators
+ * in ordinary languages and are deliberately not matched; these two are not.
+ */
+const DESCRIBED = /[→⇒]/;
+
+/**
+ * Strip a block down to what applying it would actually change: trailing
+ * whitespace gone, surrounding blank lines gone, and the indentation the whole
+ * block shares removed, since a model quoting code out of a file routinely loses
+ * or gains a level of it uniformly.
+ *
+ * The cost of that last one is a genuine whole-block re-indentation — real in
+ * Python — no longer being offered as a one-click fix. The finding still says it
+ * in words, which is the right trade for a check whose other outcome is a button
+ * that edits nothing.
+ */
+function outdent(lines: string[]): string[] {
+  const trimmed = lines.map((line) => line.replace(/\s+$/, ''));
+  while (trimmed.length && !trimmed[0]) trimmed.shift();
+  while (trimmed.length && !trimmed[trimmed.length - 1]) trimmed.pop();
+  const indents = trimmed.filter(Boolean).map((line) => line.length - line.trimStart().length);
+  const common = indents.length ? Math.min(...indents) : 0;
+  return trimmed.map((line) => line.slice(common));
+}
+
+/**
+ * Why this suggestion should not be offered, or null when it should.
+ *
+ * GitHub renders a suggestion with a **Commit suggestion** button, which makes it
+ * the cheapest way out of a finding. A replacement that cannot change the lines it
+ * replaces turns that into one click that edits nothing and closes the thread —
+ * and since identity is keyed on the title, the finding is not raised again
+ * afterwards. One reported case was a correct security finding whose patch
+ * resolved to the original: applying it would have left the hole and settled the
+ * argument.
+ *
+ * Only the suggestion is judged here, never the finding carrying it. In every
+ * reported case the body was worth reading and one of them was worth acting on;
+ * what was wrong was the one-click answer offered alongside it.
+ *
+ * Phrased to follow "Withheld the suggestion …: ", and never quoting it.
+ */
+export function screenSuggestion(suggestion: string, anchored: string[]): string | null {
+  const text = suggestion.replace(/\s+$/, '');
+  // Nothing to publish; the renderer already leaves an empty suggestion out.
+  if (!text.trim()) return null;
+
+  if (PLACEHOLDER.test(text.trim())) return 'it is a placeholder rather than replacement source';
+  if (DESCRIBED.test(text)) return 'it describes a replacement rather than being one';
+
+  const proposed = outdent(text.split('\n'));
+  const current = outdent(anchored);
+  if (proposed.length === current.length && proposed.every((line, i) => line === current[i])) {
+    return 'applying it would leave the anchored lines exactly as they are';
   }
   return null;
 }

@@ -1,3 +1,4 @@
+import * as core from '@actions/core';
 import * as github from '@actions/github';
 
 export type Octokit = ReturnType<typeof github.getOctokit>;
@@ -9,6 +10,57 @@ export function makeOctokit(token: string): Octokit {
     );
   }
   return github.getOctokit(token);
+}
+
+/**
+ * Read the config file out of the repository itself.
+ *
+ * Reviewing a diff needs no checkout — that is the first promise the README makes
+ * — but the config file was only ever read from one, so a workflow that followed
+ * that advice had every setting in its file silently ignored. The file is part of
+ * the repository, and the repository is already being read over the API, so it is
+ * fetched the same way.
+ *
+ * At the head revision, which is what a checkout in the same job would have given
+ * the run: a change to the review policy takes effect on the pull request that
+ * makes it, rather than one merge later.
+ *
+ * Best-effort. A missing file is the ordinary case for a repository that
+ * configures everything from the workflow, and an endpoint or token that refuses
+ * the read costs the file, not the run.
+ */
+export async function fetchConfigFile(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  path: string,
+  ref: string,
+): Promise<string | undefined> {
+  try {
+    const { data } = await octokit.rest.repos.getContent({ owner, repo, path, ref });
+    if (Array.isArray(data) || data.type !== 'file') {
+      core.warning(`${path} in this repository is not a file, so no configuration was read from it.`);
+      return undefined;
+    }
+    // Over a megabyte, the API sends metadata and no content. A config file that
+    // large is not a config file, so this is reported rather than worked around.
+    if (data.encoding !== 'base64') {
+      core.warning(`${path} was too large for the API to return; configure this run from action inputs instead.`);
+      return undefined;
+    }
+    return Buffer.from(data.content, 'base64').toString('utf8');
+  } catch (err) {
+    const status = (err as { status?: number }).status;
+    if (status === 404) {
+      core.debug(`No ${path} in ${owner}/${repo} at ${ref}.`);
+    } else {
+      core.warning(
+        `Could not read ${path} from the repository (${(err as Error).message}); ` +
+          'this run uses action inputs and defaults only.',
+      );
+    }
+    return undefined;
+  }
 }
 
 export interface Target {

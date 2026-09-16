@@ -33,6 +33,8 @@ jobs:
 ```
 
 That is the whole setup — the diff comes from the API, so no checkout is required.
+`.github/hawky.yml` is read the same way: with no checkout in the job, Hawky fetches it
+from the repository at the commit under review, so a config file works either way.
 
 Add `actions/checkout` to the job if you want the reuse check: Hawky searches the working
 tree for code the change is re-implementing and shows it to the reviewer. Without one it
@@ -323,7 +325,7 @@ Then make it required: **Settings → Branches → Branch protection rules →
 Require status checks to pass**, and select the job (`review` above). Merging is blocked
 until a push produces a run with no finding at or above the threshold.
 
-Three details matter if you rely on this:
+Four details matter if you rely on this:
 
 - The gate looks at every finding that clears `min-severity` and `min-confidence` and
   anchors to a line this pull request changed, including ones an earlier run already
@@ -332,6 +334,12 @@ Three details matter if you rely on this:
 - `fail-on-incomplete: true` also fails the check when an LLM call errors out and part of
   the diff went unreviewed. Without it, a partly-reviewed diff can report a pass.
 - The step still posts its comments before failing, so authors see what to fix.
+- **A pass on a large diff is a sample, not an enumeration.** One review pass asks the
+  model once per batch, and on a big change it finds a fraction of what is there: one
+  measured pull request converged over twelve runs, most of each run's findings being new
+  rather than repeats of the last. So on a diff of ten files or more, a clean verdict says
+  so in as many words — "nothing found this time" rather than an all-clear. Pushing fixes
+  buys you the further passes for free; there is no way to buy them without pushing.
 
 **The gate is off until you set `fail-on-severity`.** Without it the default is `none`:
 Hawky leaves its High and Critical comments and the check still passes. Every run now says
@@ -360,6 +368,17 @@ So a maintainer can waive a finding. Reply in its thread:
 
 Or resolve the review thread, which means the same thing. Either way the next run drops
 that finding: it stops gating, and it is not reposted.
+
+**A waiver survives the model rewording itself.** A finding is recognised by its path,
+category, and title — and the title is model prose, written from scratch on every run, so
+a waiver keyed on it alone could be voided by a rephrasing. On one pull request that
+happened seven times to one claim, each rewording arriving as a fresh thread that gated
+the merge and cost the same argument again. So two things now stand behind a waiver: the
+run is told in its prompt which findings were waived here and with what reason, and a new
+finding whose title is a rewording of one already waived on the same file is held back
+rather than posted. A held-back finding is listed in the summary as a rewording, naming
+the waived finding it matched, because a match you cannot see is one you cannot disagree
+with. Reverse it the same way as any waiver: undo the waiver it was matched to.
 
 A finding can also end up in the summary comment rather than in a thread of its own: when
 GitHub rejects the review as a whole, every comment in it falls back there rather than
@@ -501,7 +520,13 @@ Turn the section off with `bug-report-footer: false`.
 
 Anything in the table can live in `.github/hawky.yml` instead, in snake_case. Action
 inputs win over the file, and the file wins over the defaults. This is the better place
-for `guidelines`, which are usually long:
+for `guidelines`, which are usually long.
+
+The file is read from the job's checkout when there is one, and fetched from the
+repository at the commit under review when there is not — so it works in the checkout-free
+setup from Quick start, and a change to your review policy takes effect on the pull
+request that makes it. Either way the run log names where it came from, and says when
+there was no file to read at all:
 
 ```yaml
 model: claude-opus-5
@@ -552,11 +577,18 @@ The defaults are tuned so a reviewer reads the comments rather than muting the b
   means "there is a bug in this".
 - **No repeats.** Every comment carries a fingerprint derived from the path, category,
   and title, but not the line number, so a finding that scrolls down when you edit the
-  file above it is still recognised as the same finding on the next push.
+  file above it is still recognised as the same finding on the next push. A run does not
+  repeat itself either: a file's lines can be read in two batches, and a second copy of a
+  finding is suppressed by the same fingerprint before anything is posted.
+- **No suggestion that changes nothing.** A `suggestion` block carries a one-click
+  **Commit suggestion** button, so a replacement identical to the code it replaces makes
+  the cheapest way out of a finding a click that edits nothing. Those are withheld — the
+  finding is posted without them, and the run log says why.
 - **Closed issues stay closed.** A refactoring issue you close is a decision; it is never
   reopened or refiled.
-- **A waived finding stays waived.** `@hawky ignore` in a thread is a decision too; the
-  finding stops gating and is not reposted. See
+- **A waived finding stays waived**, including when the model rewords it. `@hawky ignore`
+  in a thread is a decision too; the finding stops gating, is not reposted, and a
+  rephrasing of it on a later run is held back as well. See
   [Waiving a false positive](#waiving-a-false-positive).
 
 If the reviews are still too chatty, raise `min_severity` to `high` before lowering
@@ -691,6 +723,26 @@ endpoint's floor reduces it at the source — `none` is not the remedy, for the 
 
 **The same comments keep reappearing on every push.** Fingerprints live in a hidden HTML
 comment on each posted comment. Deleting or editing those comments loses the record.
+
+**A setting in `.github/hawky.yml` did nothing — an `exclude` glob was ignored.** Older
+versions read that file only from the job's checkout, and the README tells you no checkout
+is needed, so a workflow that followed it had the whole file dropped in silence. Hawky now
+fetches the file from the repository when it is not on disk, and the run log says where
+the configuration came from (`Loaded config from .github/hawky.yml (fetched from the
+repository)`) or that there was none. If a path you excluded is still being reviewed, turn
+on step debug logging: every skipped file names the glob that skipped it.
+
+**A finding argued itself out of existence and was posted anyway.** A body that works
+through the problem and ends "Drop this finding" is deliberation, not a review, and at a
+blocking severity it failed merges on defects its own author had retracted. A finding
+whose body withdraws it is now discarded before comments and the gate are computed, and
+named in the run log without the text being repeated.
+
+**A suggestion would not have changed anything if I had committed it.** A replacement
+identical to the lines it replaces — or a description of a replacement rather than the
+replacement itself, arrows and all — is withheld now, and the finding is posted without
+it. One reported case was a correct security finding whose patch resolved to the original:
+one click would have closed the thread and left the hole.
 
 **Nothing happens on draft pull requests.** By design in the example workflow — remove the
 `if: github.event.pull_request.draft == false` guard if you want them reviewed.

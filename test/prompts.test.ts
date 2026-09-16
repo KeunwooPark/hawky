@@ -5,6 +5,7 @@ import { parsePatch } from '../src/gh/diff.js';
 import type { Config, Mode } from '../src/config.js';
 import type { Target } from '../src/gh/client.js';
 import type { DiffFile, PriorDefinition } from '../src/types.js';
+import type { PriorFinding } from '../src/gh/dismissals.js';
 
 const prompt = (mode: Mode = 'review', over: Partial<Config> = {}) =>
   buildSystemPrompt(
@@ -198,8 +199,18 @@ const reviewed: DiffFile[] = [
   },
 ];
 
-const userPrompt = (omitted: string[], priors: PriorDefinition[] = []) =>
-  buildUserPrompt(target, reviewed, 0, 1, omitted, priors);
+const userPrompt = (omitted: string[], priors: PriorDefinition[] = [], decided: PriorFinding[] = []) =>
+  buildUserPrompt(target, reviewed, 0, 1, omitted, priors, decided);
+
+const WAIVED_TITLE = '`useDelete` sends the id as a body, but the route reads it from the query string';
+
+const decidedFinding = (over: Partial<PriorFinding> = {}): PriorFinding => ({
+  fingerprint: '0123456789abcdef',
+  path: 'src/a.ts',
+  title: WAIVED_TITLE,
+  dismissal: { by: 'alice', reason: 'the route accepts both', via: 'command' },
+  ...over,
+});
 
 const prior = (over: Partial<PriorDefinition> = {}): PriorDefinition => ({
   name: 'parseCard',
@@ -274,6 +285,52 @@ test('the retrieved list is capped by size as well as by count', () => {
   assert.ok(p.includes('`name0`'));
   assert.ok(!p.includes('`name19`'), 'the character cap did not bite');
   assert.match(p, /- \.\.\. and \d+ more/);
+});
+
+test('the run is told which findings this pull request already waived, and why', () => {
+  // The half a check after the fact cannot do: a waiver is recognised by a title,
+  // so asking the reviewer not to re-file is what stops a rewording arriving as a
+  // new finding and costing the same argument a second time.
+  const p = userPrompt([], [], [decidedFinding()]);
+
+  assert.match(p, /# Already reported on this pull request/);
+  assert.ok(p.includes(WAIVED_TITLE));
+  assert.ok(p.includes('waived by @alice (the route accepts both)'));
+  assert.match(p, /not in other words, not under a different category, and not at a\nhigher severity/);
+});
+
+test('findings still open are named as open rather than as waived', () => {
+  const p = userPrompt([], [], [decidedFinding({ dismissal: undefined, title: 'unchecked index on the retry path' })]);
+
+  assert.ok(p.includes('- open — src/a.ts: unchecked index on the retry path'));
+  assert.ok(!p.includes('waived by'));
+});
+
+test('waived findings are listed before open ones, so the cap cannot drop them', () => {
+  // Re-filing a waived finding costs a reviewer an argument; re-filing an open one
+  // costs nothing, because it is already on the pull request.
+  const p = userPrompt(
+    [],
+    [],
+    [decidedFinding({ dismissal: undefined, title: 'an open finding' }), decidedFinding()],
+  );
+
+  assert.ok(p.indexOf(WAIVED_TITLE) < p.indexOf('an open finding'));
+});
+
+test('the record of what was decided is capped like every other list', () => {
+  const many = Array.from({ length: 40 }, (_, i) =>
+    decidedFinding({ dismissal: undefined, title: `finding number ${i} on this pull request` }),
+  );
+  const p = userPrompt([], [], many);
+
+  assert.ok(p.includes('finding number 0 '));
+  assert.ok(!p.includes('finding number 39 '), 'the list ran past its cap');
+  assert.match(p, /- \.\.\. and \d+ more/);
+});
+
+test('nothing is said about earlier runs on a pull request that has had none', () => {
+  assert.ok(!userPrompt([]).includes('Already reported on this pull request'));
 });
 
 test('the no-restating rule exempts the summary field it does not govern', () => {

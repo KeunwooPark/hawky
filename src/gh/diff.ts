@@ -10,9 +10,19 @@ import type { Octokit } from './client.js';
  * GitHub rejects an entire review with 422 if any comment anchors to a line
  * that is not part of the diff, so we record exactly which head lines are
  * addressable (added and context lines) and validate against that set later.
+ *
+ * `lines` carries the text of each of those lines, keyed the same way. It is what
+ * lets a later check compare a proposed replacement with the code it would
+ * replace — the same walk already has both, and deriving it a second time
+ * elsewhere would be the same hunk arithmetic written twice.
  */
-export function parsePatch(patch: string): { commentableLines: Set<number>; annotated: string } {
+export function parsePatch(patch: string): {
+  commentableLines: Set<number>;
+  annotated: string;
+  lines: Map<number, string>;
+} {
   const commentableLines = new Set<number>();
+  const lines = new Map<number, string>();
   const out: string[] = [];
   let headLine = 0;
 
@@ -25,6 +35,7 @@ export function parsePatch(patch: string): { commentableLines: Set<number>; anno
     }
     if (raw.startsWith('+')) {
       commentableLines.add(headLine);
+      lines.set(headLine, raw.slice(1));
       out.push(`${String(headLine).padStart(5)} +${raw.slice(1)}`);
       headLine++;
     } else if (raw.startsWith('-')) {
@@ -34,19 +45,28 @@ export function parsePatch(patch: string): { commentableLines: Set<number>; anno
     } else {
       // Context line: addressable, but we tell the model not to comment on it.
       commentableLines.add(headLine);
+      lines.set(headLine, raw.slice(1));
       out.push(`${String(headLine).padStart(5)}  ${raw.slice(1)}`);
       headLine++;
     }
   }
 
-  return { commentableLines, annotated: out.join('\n') };
+  return { commentableLines, annotated: out.join('\n'), lines };
 }
 
-function isExcluded(path: string, cfg: Config): boolean {
+/**
+ * Why this path is not being reviewed, or null when it is.
+ *
+ * The reason rather than a boolean so the run log can answer the question a
+ * filtered — or an unexpectedly unfiltered — file raises: which glob did this,
+ * and did the configuration carrying it reach the run at all.
+ */
+function skipReason(path: string, cfg: Config): string | null {
   if (cfg.include.length && !cfg.include.some((g) => minimatch(path, g, { dot: true }))) {
-    return true;
+    return 'no include glob matches it';
   }
-  return cfg.exclude.some((g) => minimatch(path, g, { dot: true }));
+  const glob = cfg.exclude.find((g) => minimatch(path, g, { dot: true }));
+  return glob ? `it matches exclude "${glob}"` : null;
 }
 
 function toDiffFiles(
@@ -69,7 +89,9 @@ function toDiffFiles(
       omitted.push(f.filename);
       continue;
     }
-    if (isExcluded(f.filename, cfg)) {
+    const skipped = skipReason(f.filename, cfg);
+    if (skipped) {
+      core.debug(`Not reviewing ${f.filename}: ${skipped}.`);
       omitted.push(f.filename);
       continue;
     }

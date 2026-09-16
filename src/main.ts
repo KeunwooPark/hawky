@@ -1,13 +1,13 @@
 import * as core from '@actions/core';
 import * as github from '@actions/github';
-import { loadConfig, workspaceRoot } from './config.js';
+import { configFilePath, githubToken, loadConfig, workspaceConfigExists, workspaceRoot } from './config.js';
 import { makeProvider } from './llm/index.js';
 import { buildSystemPrompt, buildUserPrompt } from './prompts.js';
 import { REVIEW_SCHEMA } from './schema.js';
 import { SEVERITY_ORDER, type Finding, type ModelResult, type Refactor, type Severity, type Usage } from './types.js';
-import { makeOctokit, resolveTarget } from './gh/client.js';
+import { fetchConfigFile, makeOctokit, resolveTarget } from './gh/client.js';
 import { batchFiles, getCompareDiff, getPullRequestDiff } from './gh/diff.js';
-import { postReview } from './gh/review.js';
+import { postReview, readReviewContext } from './gh/review.js';
 import { postRefactorIssues } from './gh/issues.js';
 import { buildRepoIndex, describeIndex, findPriorDefinitions, warnNoCheckout } from './repo/symbols.js';
 import { isHawkyComment } from './util/fingerprint.js';
@@ -81,9 +81,18 @@ async function run(): Promise<void> {
     setVerdict(true, null);
     return;
   }
-  const cfg = loadConfig();
-  const octokit = makeOctokit(cfg.githubToken);
+  // The client and the target come first because the configuration may have to be
+  // fetched with them: a job with no `actions/checkout` — which is how the README
+  // says to run this — has no config file on disk, and everything in it used to be
+  // dropped in silence.
+  const octokit = makeOctokit(githubToken());
   const target = await resolveTarget(octokit);
+  const configPath = configFilePath();
+  const cfg = loadConfig(
+    workspaceConfigExists()
+      ? undefined
+      : await fetchConfigFile(octokit, target.owner, target.repo, configPath, target.headSha),
+  );
 
   core.info(
     `Hawky: mode=${cfg.mode} provider=${cfg.provider} model=${cfg.model}` +
@@ -112,6 +121,22 @@ async function run(): Promise<void> {
   if (cfg.codebaseContext && !repoIndex) warnNoCheckout();
   else if (repoIndex) core.info(describeIndex(repoIndex));
 
+  // Read before the model is called rather than after it. What this pull request
+  // has already decided — which findings were waived, and which are still open —
+  // belongs in the prompt: a waiver is recognised by a finding's title, so a claim
+  // reworded on the next run arrives as a new finding and costs the same argument
+  // again. Asking the reviewer not to re-file is the half of that a check after the
+  // fact cannot do. The same read serves the posting step at the end of the run.
+  const reviewContext =
+    cfg.mode !== 'refactor' && target.pullNumber
+      ? await readReviewContext(octokit, target.owner, target.repo, target.pullNumber, cfg)
+      : null;
+  const decided = reviewContext?.state.prior ?? [];
+  if (decided.length) {
+    const waived = decided.filter((d) => d.dismissal).length;
+    core.info(`${decided.length} finding(s) already reported on this pull request (${waived} waived).`);
+  }
+
   const provider = makeProvider(cfg);
   const system = buildSystemPrompt(cfg, cfg.mode);
   const batches = batchFiles(files, cfg.maxCharsPerBatch);
@@ -133,7 +158,7 @@ async function run(): Promise<void> {
       }
       const { data, usage } = await provider.complete<ModelResult>({
         system,
-        user: buildUserPrompt(target, batch, index, batches.length, omitted, priors),
+        user: buildUserPrompt(target, batch, index, batches.length, omitted, priors, decided),
         schema: REVIEW_SCHEMA,
         schemaName: 'code_review',
         // The system prompt is identical for every batch, so cache it once.
@@ -218,16 +243,18 @@ async function run(): Promise<void> {
       files,
       cfg,
       incomplete,
+      reviewContext ?? undefined,
     );
     findingsPosted = result.posted.length + result.unanchored.length;
     dismissedCount = result.dismissed.length;
     highest = result.highestSeverity;
-    for (const { finding, dismissal } of result.dismissed) {
+    for (const { finding, dismissal, rewordingOf } of result.dismissed) {
       // In the log as well as on the pull request: a check that went green on a
       // waiver should be answerable from the run alone.
       core.info(
         `Waived by @${dismissal.by} (${dismissal.via}): ${finding.severity} ${finding.path}:${finding.line} ` +
-          `— ${finding.title} — ${dismissal.reason}`,
+          `— ${finding.title} — ${dismissal.reason}` +
+          (rewordingOf ? ` (matched by wording to "${rewordingOf}")` : ''),
       );
     }
   } else if (cfg.mode !== 'refactor') {

@@ -52,6 +52,8 @@ There is a third thing a reader needs, and it shapes several decisions below: **
         └── everything else ────────► reviewed
 ```
 
+Each skip names its own reason in the run log — which glob matched, or that an inclusion list excluded everything else — so a file that was filtered when it should not have been, or reviewed when it should not have been, is a question the log can answer rather than one that needs a re-run to investigate.
+
 Every omission is recorded rather than forgotten, and the list travels with the files all the way into the question. This is the single most load-bearing detail in this paper. A definition living in a skipped file is invisible to the reviewer, and a reviewer that cannot see a definition reports it as missing. Being told "these paths changed and you were not shown them" is what turns that into silence.
 
 **Re-rendering so a comment can land.** A fragment as the host supplies it marks lines as added, removed, or unchanged, but numbers none of them. The system walks each fragment, tracks the line number each line will have in the finished file, and re-renders with that number in a left gutter:

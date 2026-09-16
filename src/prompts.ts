@@ -1,6 +1,7 @@
 import type { Config, Mode } from './config.js';
 import type { DiffFile, PriorDefinition } from './types.js';
 import type { Target } from './gh/client.js';
+import type { PriorFinding } from './gh/dismissals.js';
 
 /**
  * The system prompt is deliberately identical across every batch in a run so it
@@ -131,6 +132,10 @@ export function buildSystemPrompt(cfg: Config, mode: Mode): string {
     parts.push(
       `- When you provide a \`suggestion\`, it must be the complete replacement text for the lines you anchored to,`,
       `  keeping the surrounding indentation, so it can be applied directly.`,
+      `- A suggestion whose effect is to leave those lines as they are is not a suggestion. Do not restate the`,
+      `  original, and do not write a description of the change there — it is committed verbatim, so prose in`,
+      `  that field goes into the file. Where you cannot write the replacement, \`suggestion\` is \`null\`; that`,
+      `  is the correct answer, not a shortcoming.`,
     );
     // The floor the run actually filters on. Left unsaid, the model spends output on
     // findings that are discarded before anyone reads them.
@@ -210,6 +215,22 @@ const MAX_OMITTED_LISTED = 20;
 const MAX_PRIORS_LISTED = 20;
 const MAX_PRIOR_CHARS = 4_000;
 
+/**
+ * Caps on the record of what has already been decided here. A long-lived pull
+ * request accumulates these, and the diff is what the batch is for.
+ */
+const MAX_DECIDED_LISTED = 20;
+const MAX_DECIDED_CHARS = 3_000;
+
+/** A waiver's reason, cut to what fits a list entry. */
+const MAX_REASON_CHARS = 160;
+
+/** One line, with any shape the rendered comment had flattened out of it. */
+function oneLine(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
 export function buildUserPrompt(
   target: Target,
   files: DiffFile[],
@@ -219,6 +240,8 @@ export function buildUserPrompt(
   omitted: string[],
   /** What this batch defines that the repository already defines elsewhere. */
   priors: PriorDefinition[] = [],
+  /** Findings earlier runs left on this pull request, and what became of them. */
+  decided: PriorFinding[] = [],
 ): string {
   const header = [
     `# Pull request`,
@@ -274,6 +297,43 @@ export function buildUserPrompt(
       listed++;
     }
     if (listed < priors.length) header.push(`- ... and ${priors.length - listed} more`);
+    header.push(``);
+  }
+
+  // Waived first: they are the ones re-filing costs a reviewer something, and the
+  // ones the cap should not drop. This is text from comments on this pull request
+  // — the same provenance as its title and description above.
+  const waived = decided.filter((d) => d.dismissal);
+  const open = decided.filter((d) => !d.dismissal);
+
+  if (waived.length || open.length) {
+    header.push(
+      `# Already reported on this pull request`,
+      ``,
+      `Earlier runs left the findings below here. A waived one was read by somebody who can merge this and`,
+      `rejected: do not report it again — not in other words, not under a different category, and not at a`,
+      `higher severity. Rewording is the thing to avoid deliberately, because a waiver is recognised by the`,
+      `title: the same claim in new words arrives as a new finding and costs the reviewer the same argument`,
+      `a second time. An open one is already on the pull request and does not need saying again. If the same`,
+      `code is wrong for a reason nobody has answered yet, report that reason and say what is new about it.`,
+      ``,
+    );
+
+    let used = 0;
+    let listed = 0;
+    for (const entry of [...waived, ...open]) {
+      const line = entry.dismissal
+        ? `- waived by @${entry.dismissal.by} (${oneLine(entry.dismissal.reason, MAX_REASON_CHARS)}) — ` +
+          `${entry.path}: ${oneLine(entry.title, 200)}`
+        : `- open — ${entry.path}: ${oneLine(entry.title, 200)}`;
+      if (listed >= MAX_DECIDED_LISTED || used + line.length + 1 > MAX_DECIDED_CHARS) break;
+      header.push(line);
+      used += line.length + 1;
+      listed++;
+    }
+    if (listed < waived.length + open.length) {
+      header.push(`- ... and ${waived.length + open.length - listed} more`);
+    }
     header.push(``);
   }
 

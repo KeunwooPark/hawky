@@ -25,11 +25,43 @@ export interface Dismissal {
   via: 'command' | 'resolved';
 }
 
+/**
+ * A finding this pull request has already been told, recovered from the comment
+ * that told it.
+ *
+ * Read back out of the rendered comment rather than stored anywhere: the comment
+ * is the record, and it survives re-runs, new commits, and the job that wrote it
+ * being long gone. The title is what the next run needs — it is what the model
+ * rewrites, and therefore what a waiver cannot be keyed on alone.
+ */
+export interface PriorFinding {
+  fingerprint: string;
+  /** The file the comment sits on. */
+  path: string;
+  title: string;
+  /** Set when a reviewer waived it; absent while it is still open. */
+  dismissal?: Dismissal;
+}
+
 export interface ThreadState {
   /** Fingerprints already commented on, so an earlier finding is not reposted. */
   seen: Set<string>;
   /** Fingerprints a reviewer has waived. Excluded from the gate and from reposting. */
   dismissed: Map<string, Dismissal>;
+  /** Every finding already reported here, with what became of it. */
+  prior: PriorFinding[];
+}
+
+/**
+ * The header line `renderComment` writes, which is where a posted finding's title
+ * survives. Matching our own rendering is the point: a comment without this shape
+ * is not one of ours, whatever else it contains.
+ */
+const FINDING_HEADER = /^\*\*(?:Critical|High|Medium|Low) · [\w-]+\*\* — (.+)$/m;
+
+function postedTitle(body: string | null | undefined): string | null {
+  const title = FINDING_HEADER.exec(body ?? '')?.[1]?.trim();
+  return title || null;
 }
 
 interface CommentLike {
@@ -41,6 +73,8 @@ interface CommentLike {
 interface ReviewCommentLike extends CommentLike {
   id: number;
   in_reply_to_id?: number;
+  /** The file this comment is anchored to. */
+  path?: string;
 }
 
 function parseCommand(body: string | null | undefined): { id?: string; reason: string } | null {
@@ -186,15 +220,26 @@ export async function readThreadState(
 
   const seen = new Set<string>();
   const byComment = new Map<number, string[]>();
+  const prior: PriorFinding[] = [];
   for (const c of reviewComments) {
     const fingerprints = extractFingerprints(c.body, 'finding');
     if (fingerprints.length) byComment.set(c.id, fingerprints);
     for (const fp of fingerprints) seen.add(fp);
+
+    const title = postedTitle(c.body);
+    if (title && c.path && fingerprints.length) {
+      prior.push({ fingerprint: fingerprints[0], path: c.path, title });
+    }
   }
   core.debug(`Found ${seen.size} finding(s) already commented on this PR.`);
 
   const dismissed = new Map<string, Dismissal>();
-  if (mode === 'off') return { seen, dismissed };
+  // Attached at the end of each branch below, so a prior finding always carries
+  // whatever verdict this run's dismissal mode allows it to have.
+  const withDispositions = (): PriorFinding[] =>
+    prior.map((p) => ({ ...p, dismissal: dismissed.get(p.fingerprint) }));
+
+  if (mode === 'off') return { seen, dismissed, prior: withDispositions() };
 
   const record = (fingerprints: string[], dismissal: Dismissal): void => {
     for (const fp of fingerprints) if (!dismissed.has(fp)) dismissed.set(fp, dismissal);
@@ -263,5 +308,5 @@ export async function readThreadState(
   }
 
   if (dismissed.size) core.info(`${dismissed.size} finding(s) waived by a reviewer.`);
-  return { seen, dismissed };
+  return { seen, dismissed, prior: withDispositions() };
 }

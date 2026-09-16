@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { batchFiles, getCompareDiff, parsePatch } from '../src/gh/diff.js';
 import { resolveAnchor } from '../src/gh/review.js';
 import { parseJsonObject } from '../src/llm/json.js';
-import { extractFingerprints, findingFingerprint, marker } from '../src/util/fingerprint.js';
+import { extractFingerprints, findingFingerprint, marker, sameClaim } from '../src/util/fingerprint.js';
 import { captureWarnings } from './warnings.js';
 import type { Config } from '../src/config.js';
 import type { DiffFile, Finding } from '../src/types.js';
@@ -192,6 +192,33 @@ test('fingerprints survive a line move but distinguish different findings', () =
   const c = findingFingerprint('a.ts', 'security', 'Null deref on empty list');
   assert.equal(a, b);
   assert.notEqual(a, c);
+});
+
+/** The three wordings one waived claim came back under on a single pull request. */
+const REWORDINGS = [
+  '`useDelete` sends the id as a body, but the route reads it from the query string',
+  '`useDelete` sends `{ id }` as a request payload while the route reads it from the query string',
+  '`useDelete` sends the id as a body, but the delete route reads it from the query string',
+];
+
+test('one claim reworded is recognised as the same claim', () => {
+  // Each of these arrived as a fresh finding with a fresh id, gated the merge
+  // again, and cost the same argument again — the title is the fingerprint, and
+  // the title is the field the model rewrites on every run.
+  assert.ok(sameClaim(REWORDINGS[0], REWORDINGS[1]));
+  assert.ok(sameClaim(REWORDINGS[0], REWORDINGS[2]));
+  assert.ok(sameClaim(REWORDINGS[1], REWORDINGS[2]));
+});
+
+test('two different findings are not folded into one claim', () => {
+  assert.ok(!sameClaim('`sleep` is never awaited on the retry path', REWORDINGS[0]));
+  // The check that matters most: same subject, different defect.
+  assert.ok(!sameClaim('the retry loop never terminates on a timeout', 'the retry loop is entered twice on a reconnect'));
+});
+
+test('a title too thin to judge is never matched by its wording', () => {
+  // Three words carry too little to tell a rewording from a different claim.
+  assert.ok(!sameClaim('`parse` returns null', '`parse` returns nothing'));
 });
 
 test('fingerprints round-trip through a rendered comment body', () => {

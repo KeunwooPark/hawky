@@ -71,6 +71,8 @@ The permission check degrades closed: a token that cannot answer whether someone
 
 A waived finding leaves the run entirely — it does not gate, and it is not re-posted either, so re-reviewing does not resurrect a settled argument.
 
+**A waiver has to survive the reviewer rephrasing itself**, or it is not a decision at all. A finding is recognised by its title, and the title is model prose written afresh on every run: on one proposal a single rejected claim returned seven times under seven wordings, each one a new identity that blocked the merge again. So the waiver is enforced at both ends of a run. Before the model is asked anything it is told which findings were waived here and with what reason, and not to re-file them reworded, recategorised, or at a higher severity. Afterwards, a finding whose wording matches one already waived on the same file is held back and reported as a match rather than posted. The first is advisory and fixes the cause; the second is deterministic and catches what advice does not.
+
 **The check does not go green on its own.** A required check belongs to a commit, and a comment does not produce a new one, so after waiving, the job is re-run. That is the same number of clicks as an administrative override and, unlike an override, it leaves a record.
 
 **The verdict is written before anything that can throw**, so a downstream job reading it gets a definite answer even when the run dies early, and the run's outputs are written even on a failing run so they can be read alongside one.

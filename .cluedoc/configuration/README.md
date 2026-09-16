@@ -39,6 +39,8 @@ The hazard with two sources is silence. A value written in the wrong place, or s
 
 **One order of precedence, everywhere.** A setting given at the trigger wins; otherwise the file in the repository; otherwise the built-in default. Values at the trigger default to empty precisely so that ordering works — an unset one falls through rather than overriding the file with a blank.
 
+**The file is found whether or not the repository was checked out.** This is the second silence the capability had, and a worse one than a misspelled key, because nothing was misspelled: reviewing a change needs no checkout — that is the first promise the system makes — but the settings file was only ever read from one, so a workflow that took that advice had its whole file ignored without a word. It is read from the checkout when there is one and fetched from the repository over the same API that supplies the change when there is not, at the revision under review, so a change to the review policy takes effect on the proposal that makes it. Either way the run states where the settings came from, or that there were none to read.
+
 **Unrecognised keys are reported.** Every key the file may contain is known, and anything else produces a warning. The common mistake gets its own message: a key written with hyphens where the file expects underscores is named along with the spelling that would have worked. That specific confusion is what once disabled a gate in silence.
 
 **Fallbacks are chosen by consequence, not by symmetry.** This is the most transferable idea in this paper:

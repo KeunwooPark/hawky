@@ -245,16 +245,32 @@ export function workspaceRoot(): string {
   return process.env.GITHUB_WORKSPACE ?? process.cwd();
 }
 
-function readFileConfig(configPath: string): Record<string, unknown> {
-  const abs = path.resolve(workspaceRoot(), configPath);
-  if (!fs.existsSync(abs)) {
-    core.debug(`No config file at ${abs}; using inputs and defaults.`);
-    return {};
-  }
+/** The config file this run reads, as a repository-relative path. */
+export function configFilePath(): string {
+  return core.getInput('config-path') || '.github/hawky.yml';
+}
+
+/**
+ * The token used to read the diff and write comments.
+ *
+ * Exported because it is needed before the rest of the configuration exists: the
+ * config file may have to be fetched from the repository, which takes a client,
+ * which takes a token.
+ */
+export function githubToken(): string {
+  return core.getInput('github-token').trim() || process.env.GITHUB_TOKEN || '';
+}
+
+/** True when the job has checked the repository out and the config file is in it. */
+export function workspaceConfigExists(): boolean {
+  return fs.existsSync(path.resolve(workspaceRoot(), configFilePath()));
+}
+
+function parseFileConfig(text: string, configPath: string, source: string): Record<string, unknown> {
   try {
-    const parsed = yaml.load(fs.readFileSync(abs, 'utf8'));
+    const parsed = yaml.load(text);
     if (parsed && typeof parsed === 'object') {
-      core.info(`Loaded config from ${configPath}`);
+      core.info(`Loaded config from ${configPath} (${source}).`);
       return parsed as Record<string, unknown>;
     }
   } catch (err) {
@@ -264,12 +280,38 @@ function readFileConfig(configPath: string): Record<string, unknown> {
 }
 
 /**
+ * The config file's contents, from the checkout or from whatever the caller
+ * fetched in its place.
+ *
+ * A file that was never found used to say so at debug level only, which is
+ * invisible in an ordinary run — and the state it was silent about is one a
+ * workflow reaches by following the README: no `actions/checkout` step, because
+ * none is needed to review a diff, and therefore no file on disk to read. Every
+ * setting in it was ignored without a word, which is indistinguishable from the
+ * setting not working. One `exclude` glob ignored that way sent a documentation
+ * change to the model and posted a finding on it.
+ */
+function readFileConfig(configPath: string, fetched?: string): Record<string, unknown> {
+  if (fetched !== undefined) return parseFileConfig(fetched, configPath, 'fetched from the repository');
+
+  const abs = path.resolve(workspaceRoot(), configPath);
+  if (!fs.existsSync(abs)) {
+    core.info(`No config file at ${configPath}; using inputs and defaults.`);
+    return {};
+  }
+  return parseFileConfig(fs.readFileSync(abs, 'utf8'), configPath, 'the checkout');
+}
+
+/**
  * Precedence: action input (when non-empty) > config file > built-in default.
  * Action inputs default to '' in action.yml precisely so this ordering works.
+ *
+ * `fetched` is the config file's text when the caller read it from the repository
+ * rather than from a checkout; omitted, the checkout is read as before.
  */
-export function loadConfig(): Config {
-  const configPath = core.getInput('config-path') || '.github/hawky.yml';
-  const file = readFileConfig(configPath);
+export function loadConfig(fetched?: string): Config {
+  const configPath = configFilePath();
+  const file = readFileConfig(configPath, fetched);
   warnUnknownFileKeys(file, configPath);
   const input = (name: string) => core.getInput(name).trim();
   const pick = (inputName: string, fileKey: string): string | undefined => {
@@ -317,7 +359,7 @@ export function loadConfig(): Config {
     model: pick('model', 'model') ?? DEFAULT_MODELS[provider],
     baseUrl: pick('base-url', 'base_url'),
     apiKey: core.getInput('api-key', { required: true }),
-    githubToken: input('github-token') || process.env.GITHUB_TOKEN || '',
+    githubToken: githubToken(),
     mode,
     maxComments: num('max-comments', 'max_comments', 15),
     minSeverity: pickSeverity(pick('min-severity', 'min_severity'), 'medium', 'min-severity'),

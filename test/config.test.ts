@@ -3,14 +3,14 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, test } from 'node:test';
-import { loadConfig } from '../src/config.js';
+import { loadConfig, workspaceConfigExists } from '../src/config.js';
 import { captureWarningsSync } from './warnings.js';
 
 /**
  * `loadConfig` reads action inputs from the environment and warns on stdout, so
  * both sides are driven through those rather than through injected fakes.
  */
-function withInputs(inputs: Record<string, string>, fileBody?: string) {
+function withInputs(inputs: Record<string, string>, fileBody?: string, fetched?: string) {
   const saved = { ...process.env };
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'hawky-cfg-'));
 
@@ -29,8 +29,13 @@ function withInputs(inputs: Record<string, string>, fileBody?: string) {
   }
 
   try {
-    const { result: cfg, warnings } = captureWarningsSync(loadConfig);
-    return { cfg, warnings };
+    const { result, warnings } = captureWarningsSync(() => ({
+      cfg: loadConfig(fetched),
+      // Read inside the scaffolding, because it is what decides whether the run
+      // goes to the API for the file at all.
+      onDisk: workspaceConfigExists(),
+    }));
+    return { cfg: result.cfg, onDisk: result.onDisk, warnings };
   } finally {
     process.env = saved;
     fs.rmSync(workspace, { recursive: true, force: true });
@@ -181,6 +186,43 @@ test('dismissals can be narrowed to the command, or switched off', () => {
   assert.equal(withInputs({ dismissals: 'command' }).cfg.dismissals, 'command');
   assert.equal(withInputs({ dismissals: 'off' }).cfg.dismissals, 'off');
   assert.equal(withInputs({}, 'dismissals: off\n').cfg.dismissals, 'off');
+});
+
+test('the checkout is where the config file is looked for first', () => {
+  // What decides whether the run fetches the file over the API instead.
+  assert.equal(withInputs({}, 'min_severity: high\n').onDisk, true);
+  assert.equal(withInputs({}).onDisk, false);
+});
+
+test('a config file fetched from the repository configures the run', () => {
+  // The reported bug: no `actions/checkout`, which is how the README says to run
+  // this, so no file on disk — and every setting in it was dropped without a
+  // word, including the exclude glob that should have kept a documentation
+  // change out of the review entirely.
+  const { cfg, warnings } = withInputs({}, undefined, 'exclude:\n  - "docs/**"\nfail_on_severity: high\n');
+
+  assert.ok(cfg.exclude.includes('docs/**'));
+  assert.equal(cfg.failOnSeverity, 'high');
+  assert.deepEqual(warnings, []);
+});
+
+test('a fetched config file is screened for bad keys like any other', () => {
+  const { cfg, warnings } = withInputs({}, undefined, 'fail-on-severity: high\n');
+
+  assert.equal(cfg.failOnSeverity, 'none');
+  assert.match(warnings[0], /Did you mean "fail_on_severity"/);
+});
+
+test('an action input still wins over a fetched config file', () => {
+  const { cfg } = withInputs({ 'fail-on-severity': 'critical' }, undefined, 'fail_on_severity: low\n');
+  assert.equal(cfg.failOnSeverity, 'critical');
+});
+
+test('unparseable fetched YAML falls back to defaults and says so', () => {
+  const { cfg, warnings } = withInputs({}, undefined, 'exclude: [unterminated\n');
+
+  assert.equal(cfg.failOnSeverity, 'none');
+  assert.match(warnings[0], /Could not parse .github\/hawky\.yml/);
 });
 
 test('an unknown dismissals mode shuts the route off rather than opening it', () => {

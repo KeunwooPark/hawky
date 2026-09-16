@@ -15,6 +15,7 @@ interface Stub {
   in_reply_to_id?: number;
   login?: string;
   association?: string;
+  path?: string;
 }
 
 function reviewComment(c: Stub) {
@@ -22,10 +23,17 @@ function reviewComment(c: Stub) {
     id: c.id ?? 1,
     in_reply_to_id: c.in_reply_to_id,
     body: c.body,
+    path: c.path ?? 'src/a.ts',
     user: { login: c.login ?? 'alice' },
     author_association: c.association ?? 'COLLABORATOR',
   };
 }
+
+const TITLE = 'Off-by-one in the loop bound';
+
+/** A finding comment as `renderComment` actually writes one, header and all. */
+const rendered = (title = TITLE, id = FP) =>
+  reviewComment({ id: 10, body: `**High · correctness** — ${title}\n\nwhat is wrong\n\n${marker('finding', id)}` });
 
 /** The finding comment hawky itself left, which replies attach to. */
 const hawkyComment = reviewComment({ id: 10, body: `Off-by-one\n\n${marker('finding', FP)}` });
@@ -146,6 +154,47 @@ test('dismissals: off ignores every waiver', async () => {
   );
   assert.deepEqual([...seen], [FP]);
   assert.equal(dismissed.size, 0);
+});
+
+test('a finding already reported here is read back out of its own comment', async () => {
+  // The next run has to be told what this pull request already decided, and the
+  // comment is the only record of it — the job that wrote it is long gone.
+  const { prior } = await read([rendered()]);
+
+  assert.equal(prior.length, 1);
+  assert.equal(prior[0].title, TITLE);
+  assert.equal(prior[0].path, 'src/a.ts');
+  assert.equal(prior[0].fingerprint, FP);
+  assert.equal(prior[0].dismissal, undefined);
+});
+
+test('a prior finding carries the waiver that settled it', async () => {
+  const { prior } = await read([
+    rendered(),
+    reviewComment({ id: 11, in_reply_to_id: 10, body: '@hawky ignore the route accepts both' }),
+  ]);
+
+  assert.equal(prior[0].dismissal?.by, 'alice');
+  assert.equal(prior[0].dismissal?.reason, 'the route accepts both');
+});
+
+test('a comment that is not one of ours contributes no prior finding', async () => {
+  // Matching our own rendering is the point: anything else on the pull request is
+  // conversation, and putting it in the next run's prompt as a finding would be a
+  // claim nobody made.
+  const { prior } = await read([reviewComment({ id: 12, body: 'I think this is fine, actually.' })]);
+  assert.deepEqual(prior, []);
+});
+
+test('dismissals: off still reports what was already said, waiving none of it', async () => {
+  const { prior } = await read(
+    [rendered(), reviewComment({ id: 11, in_reply_to_id: 10, body: '@hawky ignore' })],
+    [],
+    'off',
+  );
+
+  assert.equal(prior.length, 1);
+  assert.equal(prior[0].dismissal, undefined);
 });
 
 const resolvedThread = (by: string) => ({

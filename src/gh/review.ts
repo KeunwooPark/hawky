@@ -2,11 +2,12 @@ import * as core from '@actions/core';
 import pkg from '../../package.json';
 import type { Config } from '../config.js';
 import { SEVERITY_ORDER, type DiffFile, type Finding, type Severity } from '../types.js';
-import { screenFinding } from '../util/finding.js';
-import { findingFingerprint, marker, SUMMARY_MARKER } from '../util/fingerprint.js';
+import { screenFinding, screenSuggestion } from '../util/finding.js';
+import { parsePatch } from './diff.js';
+import { findingFingerprint, marker, sameClaim, SUMMARY_MARKER } from '../util/fingerprint.js';
 import type { ReviewSummary } from '../util/summary.js';
 import type { Octokit } from './client.js';
-import { type Dismissal, readThreadState } from './dismissals.js';
+import { type Dismissal, type ThreadState, readThreadState } from './dismissals.js';
 
 const SEVERITY_LABEL: Record<Severity, string> = {
   critical: 'Critical',
@@ -18,6 +19,19 @@ const SEVERITY_LABEL: Record<Severity, string> = {
 /** A multi-line anchor spanning more than this is almost always a mis-anchor. */
 const MAX_ANCHOR_SPAN = 20;
 
+/**
+ * Past this many files, one pass over the diff is a sample of its defects rather
+ * than a list of them.
+ *
+ * Measured rather than assumed: on one large pull request the review converged
+ * over twelve runs, each posting between one and five findings that were mostly
+ * new rather than repeats — several of them on code earlier runs had read and said
+ * nothing about. Nothing was being truncated and the batches did not change. That
+ * is what sampling a model once per batch does, and the cost of not saying so is
+ * that a first-run pass and a twelfth-run pass read identically.
+ */
+const SAMPLED_FROM_FILES = 10;
+
 /** Where Hawky's own bugs are filed. Public, unlike many repositories it reviews. */
 const HAWKY_REPO = 'KeunwooPark/hawky';
 
@@ -25,6 +39,11 @@ const HAWKY_REPO = 'KeunwooPark/hawky';
 export interface DismissedFinding {
   finding: Finding;
   dismissal: Dismissal;
+  /**
+   * The waived title this one was matched to, when the match was on wording rather
+   * than on an identical fingerprint. Reported, so a match is visible as a match.
+   */
+  rewordingOf?: string;
 }
 
 export interface PostedReview {
@@ -109,6 +128,42 @@ export function resolveAnchor(finding: Finding, file: DiffFile): { line: number;
     if (!file.commentableLines.has(l)) return { line: start };
   }
   return { line: end, startLine: start };
+}
+
+/**
+ * The finding as it will be published, with a suggestion that cannot change the
+ * lines it replaces taken off it.
+ *
+ * Judged here because this is where both halves are in hand: the anchor has just
+ * been resolved, and the file's patch carries the text of the lines it points at.
+ * The finding itself is published either way — what the screen withholds is the
+ * one-click answer, not the argument.
+ */
+function withoutNoOpSuggestion(
+  finding: Finding,
+  file: DiffFile,
+  anchor: { line: number; startLine?: number },
+): Finding {
+  if (!finding.suggestion?.trim()) return finding;
+
+  const { lines } = parsePatch(file.patch);
+  const anchored: string[] = [];
+  for (let line = anchor.startLine ?? anchor.line; line <= anchor.line; line++) {
+    const text = lines.get(line);
+    // The patch does not render this line, so there is nothing to compare the
+    // replacement against and nothing is claimed about it.
+    if (text === undefined) return finding;
+    anchored.push(text);
+  }
+
+  const reason = screenSuggestion(finding.suggestion, anchored);
+  if (!reason) return finding;
+
+  core.warning(
+    `Withheld the suggestion on ${finding.path}:${finding.line}: ${reason}. ` +
+      'The finding itself is posted as written.',
+  );
+  return { ...finding, suggestion: null };
 }
 
 function renderComment(finding: Finding): string {
@@ -258,22 +313,33 @@ function renderModelSummary(summary: ReviewSummary, cfg: Config): string[] {
   return lines;
 }
 
+/** What this run held back, for the tally at the foot of the summary. */
+interface FilteredCounts {
+  /** How many findings the model returned that nothing in the review will report. */
+  dropped: number;
+  /** How many of `dropped` went because their line was not in the diff at all. */
+  misanchored: number;
+  /** How many of `dropped` went because the model wrote nothing in them. */
+  textless: number;
+  /** How many of `dropped` went because their text could not describe the diff. */
+  degenerate: number;
+  /** How many of `dropped` were a claim this same run had already made. */
+  duplicates: number;
+}
+
 function renderSummary(
   summary: ReviewSummary,
   posted: Finding[],
   unanchored: Finding[],
   dismissed: DismissedFinding[],
   cfg: Config,
-  dropped: number,
-  /** How many of `dropped` went because their line was not in the diff at all. */
-  misanchored: number,
-  /** How many of `dropped` went because the model wrote nothing in them. */
-  textless: number,
-  /** How many of `dropped` went because their text could not describe the diff. */
-  degenerate: number,
+  counts: FilteredCounts,
   highest: Severity | null,
   incomplete: boolean,
+  /** True when the diff is large enough that one pass is a sample of it. */
+  sampled: boolean,
 ): string {
+  const { dropped, misanchored, textless, degenerate, duplicates } = counts;
   const lines = [
     SUMMARY_MARKER,
     '## Hawky review',
@@ -281,6 +347,17 @@ function renderSummary(
     renderVerdict(highest, cfg, incomplete, dismissed, dropped),
     '',
   ];
+
+  // Only where it changes what the verdict means. A run that found something is
+  // already telling the author to push again, and the next push re-reviews.
+  if (sampled && highest === null) {
+    lines.push(
+      '_Reviewed in one pass. On a diff this size a single pass samples the defects rather than enumerating ' +
+        'them, and a later run over the same code may still find something — so this is "nothing found this ' +
+        'time" rather than an all-clear._',
+      '',
+    );
+  }
 
   if (posted.length) {
     const counts = new Map<Severity, number>();
@@ -320,17 +397,23 @@ function renderSummary(
       `<details><summary>${dismissed.length} finding${dismissed.length === 1 ? '' : 's'} waived by a reviewer</summary>`,
       '',
     );
-    for (const { finding: f, dismissal: d } of dismissed) {
+    for (const { finding: f, dismissal: d, rewordingOf } of dismissed) {
       const how = d.via === 'resolved' ? 'resolved the thread' : 'waived it';
       lines.push(
         `- **${f.path}:${f.line}** — ${SEVERITY_LABEL[f.severity]} · ${f.title}` +
-          ` — @${d.by} ${how}: ${d.reason}`,
+          ` — @${d.by} ${how}: ${d.reason}` +
+          // Said outright rather than folded in silently: this one was not waived
+          // on its own thread, and a reader has to be able to disagree with the match.
+          (rewordingOf ? `\n  <sub>Held back as a rewording of a finding waived here: “${rewordingOf}”.</sub>` : ''),
       );
     }
     lines.push(
       '',
       'These do not gate the merge. Reverse one by deleting the comment that waived it ' +
-        '(or unresolving its thread) and re-running this check.',
+        '(or unresolving its thread) and re-running this check.' +
+        (dismissed.some((d) => d.rewordingOf)
+          ? ' One held back as a rewording is reversed the same way, by the waiver it was matched to.'
+          : ''),
       '',
       '</details>',
       '',
@@ -344,6 +427,7 @@ function renderSummary(
       misanchored ? `${misanchored} that did not anchor to a changed line` : '',
       textless ? `${textless} the model left empty` : '',
       degenerate ? `${degenerate} whose text could not describe this diff` : '',
+      duplicates ? `${duplicates} the model reported twice in one run` : '',
     ].filter(Boolean);
     const list =
       named.length <= 2
@@ -408,6 +492,37 @@ async function upsertSummary(
   }
 }
 
+/** What this pull request already says about earlier runs, read once per run. */
+export interface ReviewContext {
+  issueComments: IssueComment[];
+  state: ThreadState;
+}
+
+/**
+ * Read the conversation so far.
+ *
+ * Split out of the posting step because it is needed at both ends of a run: the
+ * prompt has to be told what has already been decided here, which happens before
+ * the model is called, and the same answer decides what gets posted afterwards.
+ * Reading it twice would mean two rounds of API calls and two copies of every
+ * warning about a malformed waiver.
+ */
+export async function readReviewContext(
+  octokit: Octokit,
+  owner: string,
+  repo: string,
+  pull_number: number,
+  cfg: Config,
+): Promise<ReviewContext> {
+  // Nothing is posted on a rehearsal, so there is nothing to deduplicate against.
+  if (cfg.dryRun) {
+    return { issueComments: [], state: { seen: new Set(), dismissed: new Map<string, Dismissal>(), prior: [] } };
+  }
+  const issueComments = await listIssueComments(octokit, owner, repo, pull_number);
+  const state = await readThreadState(octokit, owner, repo, pull_number, issueComments, cfg.dismissals);
+  return { issueComments, state };
+}
+
 export async function postReview(
   octokit: Octokit,
   owner: string,
@@ -420,12 +535,12 @@ export async function postReview(
   cfg: Config,
   /** Some of the diff could not be reviewed and the run is configured to fail on that. */
   incomplete = false,
+  /** The conversation as the run already read it; read here when not supplied. */
+  context?: ReviewContext,
 ): Promise<PostedReview> {
   const byPath = new Map(files.map((f) => [f.path, f]));
-  const issueComments = cfg.dryRun ? [] : await listIssueComments(octokit, owner, repo, pull_number);
-  const { seen: alreadyPosted, dismissed: waived } = cfg.dryRun
-    ? { seen: new Set<string>(), dismissed: new Map<string, Dismissal>() }
-    : await readThreadState(octokit, owner, repo, pull_number, issueComments, cfg.dismissals);
+  const { issueComments, state } = context ?? (await readReviewContext(octokit, owner, repo, pull_number, cfg));
+  const { seen: alreadyPosted, dismissed: waived, prior } = state;
 
   const before = findings.length;
 
@@ -476,14 +591,64 @@ export async function postReview(
         SEVERITY_ORDER[b.severity] - SEVERITY_ORDER[a.severity] || (b.confidence ?? 0) - (a.confidence ?? 0),
     );
 
+  // A run can report the same finding twice. Batching is per-request, so one
+  // file's lines can be read in two calls — a file split across a batch boundary,
+  // or a name that two batches both have reason to comment on — and each call
+  // answers on its own. Both copies carried the same fingerprint, the same hidden
+  // marker, and the same severity, and both were posted a few lines apart, because
+  // the only duplicate check there was compared this run against the *pull
+  // request* rather than against itself.
+  //
+  // Same key as that cross-run check, so the two agree by construction: same path,
+  // same category, same title is the same finding. The first copy is kept — the
+  // list is already sorted by severity and then confidence, so it is the strongest
+  // statement of the claim.
+  const unique: Finding[] = [];
+  const saidThisRun = new Set<string>();
+  for (const f of qualified) {
+    const fingerprint = findingFingerprint(f.path, f.category, f.title);
+    if (saidThisRun.has(fingerprint)) {
+      core.info(`Suppressed a second copy of ${f.path}:${f.line} ${fingerprint}: this run already reported it.`);
+      continue;
+    }
+    saidThisRun.add(fingerprint);
+    unique.push(f);
+  }
+  const duplicates = qualified.length - unique.length;
+
   // A waived finding leaves the run entirely: it does not gate, and it is not
   // reposted either, so re-reviewing does not resurrect the argument.
+  //
+  // Recognised by fingerprint first and by wording second. The fingerprint is keyed
+  // on the title, and the title is model prose written afresh on every run, so the
+  // exact match alone let a rejected claim return under a new id as often as the
+  // model cared to rephrase itself: one claim came back seven times on a single
+  // pull request, gating the merge each time. The wording match is confined to
+  // findings waived on the same file, and what it catches is reported as a match
+  // rather than quietly swallowed.
+  const waivedHere = prior.filter((p) => p.dismissal);
+  const waiverFor = (f: Finding): { dismissal: Dismissal; rewordingOf?: string } | null => {
+    const exact = waived.get(findingFingerprint(f.path, f.category, f.title));
+    if (exact) return { dismissal: exact };
+    const near = waivedHere.find((p) => p.path === f.path && sameClaim(p.title, f.title));
+    return near?.dismissal ? { dismissal: near.dismissal, rewordingOf: near.title } : null;
+  };
+
   const dismissed: DismissedFinding[] = [];
   const active: Finding[] = [];
-  for (const f of qualified) {
-    const d = waived.get(findingFingerprint(f.path, f.category, f.title));
-    if (d) dismissed.push({ finding: f, dismissal: d });
-    else active.push(f);
+  for (const f of unique) {
+    const waiver = waiverFor(f);
+    if (!waiver) {
+      active.push(f);
+      continue;
+    }
+    if (waiver.rewordingOf) {
+      core.info(
+        `Held back ${f.severity} ${f.path}:${f.line} — ${f.title}: it restates a finding ` +
+          `@${waiver.dismissal.by} already waived on this file.`,
+      );
+    }
+    dismissed.push({ finding: f, dismissal: waiver.dismissal, rewordingOf: waiver.rewordingOf });
   }
 
   // A finding whose line is nowhere in the diff is the strongest evidence there is
@@ -514,12 +679,14 @@ export async function postReview(
   const comments: Array<Record<string, unknown>> = [];
 
   for (const finding of kept) {
+    const file = byPath.get(finding.path)!;
     // Cannot be null: everything in `kept` came through the anchorable filter above.
-    const anchor = resolveAnchor(finding, byPath.get(finding.path)!)!;
-    posted.push(finding);
+    const anchor = resolveAnchor(finding, file)!;
+    const published = withoutNoOpSuggestion(finding, file, anchor);
+    posted.push(published);
     comments.push({
-      path: finding.path,
-      body: renderComment(finding),
+      path: published.path,
+      body: renderComment(published),
       side: 'RIGHT',
       line: anchor.line,
       ...(anchor.startLine ? { start_line: anchor.startLine, start_side: 'RIGHT' } : {}),
@@ -539,18 +706,18 @@ export async function postReview(
     null,
   );
 
+  const counts: FilteredCounts = { dropped, misanchored, textless, degenerate, duplicates };
+  const sampled = files.length >= SAMPLED_FROM_FILES;
   const summaryBody = renderSummary(
     summary,
     posted,
     unanchored,
     dismissed,
     cfg,
-    dropped,
-    misanchored,
-    textless,
-    degenerate,
+    counts,
     highestSeverity,
     incomplete,
+    sampled,
   );
 
   if (cfg.dryRun) {
@@ -586,19 +753,7 @@ export async function postReview(
         repo,
         pull_number,
         issueComments,
-        renderSummary(
-          summary,
-          [],
-          unanchored,
-          dismissed,
-          cfg,
-          dropped,
-          misanchored,
-          textless,
-          degenerate,
-          highestSeverity,
-          incomplete,
-        ),
+        renderSummary(summary, [], unanchored, dismissed, cfg, counts, highestSeverity, incomplete, sampled),
       );
       return { posted, unanchored, dismissed, highestSeverity };
     }
