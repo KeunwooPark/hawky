@@ -610,14 +610,21 @@ npm run build      # bundles src/ into dist/index.js — commit the result
 
 ### Releasing
 
-Bump `version` in `package.json` first. It is bundled into `dist/`, and it is the version
-the summary comment prints and bug reports quote.
-
 ```bash
-npm run build && git add dist && git commit -m "Build" && git push
-git tag v1.0.0 && git push origin v1.0.0
-gh release create v1.0.0 --generate-notes
+npm version 1.10.0 --no-git-tag-version
+git commit -am "Bump the version to 1.10.0"
+git push
+gh release create v1.10.0 --generate-notes
 ```
+
+Use `npm version` rather than editing `package.json` by hand: it writes the version to
+`package.json` and `package-lock.json` together, and the `version` lifecycle script then
+rebuilds `dist/` and stages it. All three have to move at once — the version is bundled
+into the executable, and it is what the summary comment prints and bug reports quote — and
+a hand edit moves only the first. That is how the lockfile came to sit four releases stale.
+
+`--no-git-tag-version` stops npm writing its own terse commit and tag, leaving the commit
+message and the release notes to be written properly.
 
 Publishing the release triggers `.github/workflows/release.yml`, which re-runs the tests,
 rebuilds the bundle to confirm `dist/` at that tag matches `src/`, and then force-moves
