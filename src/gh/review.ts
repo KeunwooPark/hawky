@@ -35,6 +35,12 @@ const SAMPLED_FROM_FILES = 10;
 /** Where Hawky's own bugs are filed. Public, unlike many repositories it reviews. */
 const HAWKY_REPO = 'KeunwooPark/hawky';
 
+/** Provider-qualified model name for the reader-facing review surfaces. */
+function displayModel(cfg: Config): string {
+  const prefix = `${cfg.provider}/`;
+  return cfg.model.startsWith(prefix) ? cfg.model : `${prefix}${cfg.model}`;
+}
+
 /** A finding a reviewer has waived, kept together with who waived it and why. */
 export interface DismissedFinding {
   finding: Finding;
@@ -231,7 +237,7 @@ function renderVerdict(
  * and the repository under review often is not.
  */
 function renderBugReport(cfg: Config): string[] {
-  const model = `${cfg.provider}/${cfg.model}`;
+  const model = displayModel(cfg);
   const settings = [
     `mode ${cfg.mode}`,
     `fail-on-severity ${cfg.failOnSeverity}`,
@@ -295,7 +301,7 @@ function renderModelSummary(summary: ReviewSummary, cfg: Config): string[] {
 
   if (text) {
     lines.push(
-      `**Summary** — \`${cfg.provider}/${cfg.model}\` wrote this, quoted as given:`,
+      `**Summary** — \`${displayModel(cfg)}\` wrote this, quoted as given:`,
       '',
       // Every line prefixed, blank ones included, so the whole block stays inside
       // the quote instead of ending it partway down.
@@ -453,7 +459,7 @@ function renderSummary(
 
   if (cfg.bugReportFooter) lines.push(...renderBugReport(cfg));
 
-  lines.push(`<sub>Reviewed by ${cfg.provider}/${cfg.model}. Re-run by pushing a commit.</sub>`);
+  lines.push(`<sub>Reviewed by ${displayModel(cfg)}. Re-run by pushing a commit.</sub>`);
   return lines.join('\n');
 }
 

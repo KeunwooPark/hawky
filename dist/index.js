@@ -40999,6 +40999,11 @@ const MAX_ANCHOR_SPAN = 20;
 const SAMPLED_FROM_FILES = 10;
 /** Where Hawky's own bugs are filed. Public, unlike many repositories it reviews. */
 const HAWKY_REPO = 'KeunwooPark/hawky';
+/** Provider-qualified model name for the reader-facing review surfaces. */
+function displayModel(cfg) {
+    const prefix = `${cfg.provider}/`;
+    return cfg.model.startsWith(prefix) ? cfg.model : `${prefix}${cfg.model}`;
+}
 function severityAtLeast(value, floor) {
     return types_js_1.SEVERITY_ORDER[value] >= types_js_1.SEVERITY_ORDER[floor];
 }
@@ -41151,7 +41156,7 @@ dropped) {
  * and the repository under review often is not.
  */
 function renderBugReport(cfg) {
-    const model = `${cfg.provider}/${cfg.model}`;
+    const model = displayModel(cfg);
     const settings = [
         `mode ${cfg.mode}`,
         `fail-on-severity ${cfg.failOnSeverity}`,
@@ -41211,7 +41216,7 @@ function renderModelSummary(summary, cfg) {
     const lines = [];
     const text = summary.text.trim();
     if (text) {
-        lines.push(`**Summary** — \`${cfg.provider}/${cfg.model}\` wrote this, quoted as given:`, '', 
+        lines.push(`**Summary** — \`${displayModel(cfg)}\` wrote this, quoted as given:`, '', 
         // Every line prefixed, blank ones included, so the whole block stays inside
         // the quote instead of ending it partway down.
         ...text.split('\n').map((line) => (line.trim() ? `> ${line}` : '>')), '');
@@ -41305,7 +41310,7 @@ sampled) {
     }
     if (cfg.bugReportFooter)
         lines.push(...renderBugReport(cfg));
-    lines.push(`<sub>Reviewed by ${cfg.provider}/${cfg.model}. Re-run by pushing a commit.</sub>`);
+    lines.push(`<sub>Reviewed by ${displayModel(cfg)}. Re-run by pushing a commit.</sub>`);
     return lines.join('\n');
 }
 async function listIssueComments(octokit, owner, repo, issue_number) {
