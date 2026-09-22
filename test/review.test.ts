@@ -750,6 +750,23 @@ test('the bug-report link pre-fills the issue form', async () => {
   assert.match(url.searchParams.get('settings') ?? '', /fail-on-severity none/);
 });
 
+test('a provider-qualified model is not qualified a second time in the summary', async () => {
+  const body = await postWith(
+    { ...withBugReport, provider: 'openai', model: 'openai/gpt-5.6-luna' },
+    [],
+    false,
+    wrote('No defects found.'),
+  );
+
+  assert.match(body, /`openai\/gpt-5\.6-luna` wrote this/);
+  assert.match(body, /Reviewed by openai\/gpt-5\.6-luna/);
+  assert.doesNotMatch(body, /openai\/openai\/gpt-5\.6-luna/);
+
+  const href = body.match(/\[Open a bug report\]\(([^)]+)\)/)?.[1];
+  assert.ok(href, 'no bug-report link in the summary');
+  assert.equal(new URL(href).searchParams.get('model'), 'openai/gpt-5.6-luna');
+});
+
 test('the bug-report section does not point at a waiver that is switched off', async () => {
   const body = await postWith({ ...withBugReport, dismissals: 'off' }, [finding('high', 'a')]);
   assert.match(body, /Is Hawky itself broken\?/);
